@@ -53,12 +53,13 @@ Choose one of the following methods:
    - Verify Python and Node.js.
    - Install required dependencies.
    - Extract your logged-in Google Antigravity OAuth session.
-   - Generate native desktop and Start Menu shortcuts with the Antigravity icon.
+   - Ask if you want to create optional Desktop and Start Menu shortcuts.
 4. Launch the application anytime using the **Antigravity API** shortcut on your Desktop or by running **`run.bat`**.
 
 #### 🍎 macOS / 🐧 Linux:
 ```bash
-chmod +x run.sh
+chmod +x install.sh run.sh
+./install.sh
 ./run.sh
 ```
 
@@ -85,8 +86,15 @@ chmod +x run.sh
    - Проверит установку Node.js и Python.
    - Установит недостающие библиотеки.
    - Автоматически найдет токен вашей авторизации Antigravity.
-   - Создаст красивый ярлык с иконкой на **Рабочем столе** и в **меню Пуск**.
+   - Предложит по желанию создать ярлык на **Рабочем столе** и в **меню Пуск** (y/N).
 4. В конце установщик предложит сразу запустить программу — нажмите **Enter** (или `Y`).
+
+Для **Linux / macOS**:
+```bash
+chmod +x install.sh run.sh
+./install.sh
+./run.sh
+```
 
 ### Шаг 4. Запуск и использование
 - В дальнейшем запускайте программу кликом по ярлыку **«Antigravity API»** на Рабочем столе или файлом `run.bat`.

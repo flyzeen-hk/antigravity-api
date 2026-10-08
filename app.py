@@ -155,15 +155,25 @@ def find_node():
 
 
 def pid_on_port():
-    try:
-        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=10).stdout
-        for line in out.splitlines():
-            if f":{PORT}" in line and "LISTENING" in line.upper() and "127.0.0.1" in line:
-                parts = line.split()
-                if parts[-1].isdigit():
-                    return int(parts[-1])
-    except Exception:
-        pass
+    if sys.platform == "win32":
+        try:
+            out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                if f":{PORT}" in line and "LISTENING" in line.upper() and "127.0.0.1" in line:
+                    parts = line.split()
+                    if parts[-1].isdigit():
+                        return int(parts[-1])
+        except Exception:
+            pass
+    else:
+        try:
+            out = subprocess.run(["lsof", f"-ti:{PORT}"], capture_output=True, text=True, timeout=5).stdout.strip()
+            if out:
+                first = out.split()[0]
+                if first.isdigit():
+                    return int(first)
+        except Exception:
+            pass
     return None
 
 
@@ -908,20 +918,31 @@ class App(tk.Tk):
                 return
 
         log = open(LOG_FILE, "ab")
-        self.proc = subprocess.Popen(
-            [node, "server.js"], cwd=BASE, stdout=log, stderr=subprocess.STDOUT,
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-        )
+        popen_kwargs = {"cwd": BASE, "stdout": log, "stderr": subprocess.STDOUT}
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        self.proc = subprocess.Popen([node, "server.js"], **popen_kwargs)
         self.status_text.configure(text="STARTING…", fg=WARNING)
 
     def stop_server(self):
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except Exception:
+                self.proc.kill()
             self.proc = None
         else:
             pid = pid_on_port()
             if pid:
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                try:
+                    if sys.platform == "win32":
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                    else:
+                        import signal
+                        os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
         self.status_text.configure(text="STOPPED", fg=DANGER)
 
     # ---------------- Windows Startup ----------------

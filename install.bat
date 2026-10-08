@@ -65,14 +65,19 @@ if %ERRORLEVEL% neq 0 (
     echo [OK] Antigravity credentials configured.
 )
 
-:: 6. Create Desktop & Start Menu Shortcuts
+:: 6. Optional Desktop & Start Menu Shortcuts
 echo.
-echo [6/6] Creating Desktop and Start Menu shortcuts...
-python scripts\create_shortcut.py
-if %ERRORLEVEL% neq 0 (
-    echo [WARNING] Could not create shortcuts automatically.
+set /p CREATE_SHORTCUTS="Create Desktop and Start Menu shortcuts? (y/N): "
+if /i "!CREATE_SHORTCUTS!"=="y" (
+    echo Creating shortcuts...
+    python scripts\create_shortcut.py
+    if %ERRORLEVEL% neq 0 (
+        echo [WARNING] Could not create shortcuts automatically.
+    ) else (
+        echo [OK] Shortcuts installed on Desktop and Start Menu.
+    )
 ) else (
-    echo [OK] Shortcuts installed on Desktop and Start Menu.
+    echo [SKIPPED] Shortcut creation skipped.
 )
 
 echo.
