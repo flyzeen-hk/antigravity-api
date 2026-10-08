@@ -1,0 +1,40 @@
+# Secrets & local authentication (CRITICAL: NEVER COMMIT)
+auth.json
+apikey.txt
+config.json
+usage.json
+.env
+*.env
+
+# Runtime logs & processes
+*.log
+antigravity-api.log
+
+# Dependencies
+node_modules/
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Windows shortcuts & artifacts
+*.lnk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# macOS & Linux artifacts
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE & Editor folders
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.zip
