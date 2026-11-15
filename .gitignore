@@ -3,8 +3,22 @@ auth.json
 apikey.txt
 config.json
 usage.json
+cookie.txt
 .env
 *.env
+ui_language.txt
+install_paths.json
+
+# Rolling backups of the files above (contain the same secrets)
+backups/
+# Interrupted atomic writes (.config.json.<pid>.tmp etc.)
+.*.tmp
+
+# Local agent sandbox, audit trail and tool state
+agent_workspace/
+agent_audit.jsonl
+agent_audit.jsonl.*
+.sharrowkin/
 
 # Runtime logs & processes
 *.log
@@ -38,3 +52,6 @@ Desktop.ini
 *.sublime-project
 *.sublime-workspace
 *.zip
+
+# Third-party reference source, not part of this project
+gemini_web2api_reference.py
