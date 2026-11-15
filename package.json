@@ -7,7 +7,7 @@
     "start": "node server.js",
     "key": "node server.js key",
     "models": "node server.js models",
-    "test": "node test/run-tests.js"
+    "test": "node test/all.js"
   },
   "engines": {
     "node": ">=18"

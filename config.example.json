@@ -7,6 +7,17 @@
   "includeThoughts": false,
   "requestTimeoutMs": 600000,
   "retries": 2,
+  "geminiWeb": {
+    "enabled": true,
+    "cookie": "",
+    "cookie_file": "",
+    "proxy": "",
+    "authUser": null,
+    "atToken": "",
+    "temporaryChats": false,
+    "thinkMode": "default",
+    "bl": "boq_assistant-bard-web-server_20260716.08_p0"
+  },
   "safeMode": {
     "enabled": false,
     "maxRequestsPerMinute": 60,
@@ -20,5 +31,26 @@
     "maxConcurrent": 4,
     "cooldownAfter429Ms": 30000,
     "maxCooldownMs": 300000
+  },
+  "agent": {
+    "enabled": true,
+    "allowWebAgent": false,
+    "workspaceRoot": "",
+    "maxIterations": 8,
+    "maxReadBytes": 20480,
+    "maxWriteBytes": 2097152,
+    "maxListEntries": 500,
+    "allowDelete": false,
+    "allowShell": false,
+    "allowAbsolutePaths": false,
+    "shellTimeoutMs": 60000,
+    "auditFile": "",
+    "auditRotateBytes": 5242880,
+    "planner": {
+      "enabled": true,
+      "model": "web/gemini-4-argon-thinking",
+      "maxCalls": 2,
+      "timeoutMs": 60000
+    }
   }
 }
