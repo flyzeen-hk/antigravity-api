@@ -29,13 +29,13 @@ Expose Google Antigravity's models — Gemini, Claude, GPT-OSS — as a local **
 
 **It is** a local HTTP server that relays requests to two different Google backends using credentials you already have on this machine:
 
-- **Cloud Code** (`cloud/<id>`) — the same backend the Antigravity IDE uses. Authentication is the OAuth session the IDE already created.
+- **Cloud Code** (`cloud/<id>`) — the same backend the Antigravity products use. Authentication is the OAuth session the Antigravity app or IDE already created on this machine.
 - **Gemini Web** (`web/<alias>`) — the same StreamGenerate RPC that `gemini.google.com` uses. Authentication is a browser cookie you copy in manually.
 
 **It is not:**
 
 - **Not an official Google API.** Nothing here is supported by Google. The web half relies on an internal protocol that can change without notice.
-- **Not free unlimited access.** Cloud models spend the quota of your own Antigravity account. The panel shows that quota in percent; when it runs out, requests fail exactly as they would in the IDE.
+- **Not free unlimited access.** Cloud models spend the quota of your own Antigravity account. The panel shows that quota in percent; when it runs out, requests fail exactly as they would inside Antigravity.
 - **Not a remote service.** The server binds `127.0.0.1` by default. It is reachable from the network only if you change `host` yourself, and there is no built-in TLS — do not expose it directly to the internet.
 - **Not a model host.** No model runs locally. Every request goes to Google.
 - **Not a client.** You still need Cursor, Cline, Open WebUI, a script, or `curl` to talk to it.
@@ -52,7 +52,7 @@ What it adds on top of the raw APIs:
 
 | Requirement | Why | Notes |
 |---|---|---|
-| **Google Antigravity IDE**, signed in | Source of the Cloud Code OAuth session | Without it `cloud/` models cannot authenticate. The IDE does not need to be running — only its stored session is used. |
+| **Antigravity desktop app or Antigravity IDE**, signed in | Source of the Cloud Code OAuth session | `scripts/extract_token.py` reads `state.vscdb` from `%APPDATA%\Antigravity IDE`, `%APPDATA%\Antigravity` or `%APPDATA%\antigravity` (macOS and Linux have the equivalent paths; `ANTIGRAVITY_STATE_DB` points it elsewhere). The app does not need to be running — only the stored session is used. **Antigravity CLI and the Antigravity extension for VS Code are detected by the panel but are not a token source.** |
 | **Node.js 18+** | Runs `server.js` | LTS is fine. |
 | **Python 3.10+** | Runs `app.py` (desktop panel), the installer, and the token extraction that fills `auth.json` | On Windows tick **"Add python.exe to PATH"** during install. Once `auth.json` exists, `node server.js` runs without Python — but the panel and re-extraction do need it. |
 
@@ -339,7 +339,7 @@ If your client needs a model list before it will connect, use `GET /v1/models`; 
 
 The panel is split by provider, because the two have nothing in common but the API:
 
-- **Cloud Code** — account, quotas, cloud model list, detected Antigravity installations.
+- **Cloud Code** — account, quotas, cloud model list, and the detected Antigravity products (Antigravity, Antigravity IDE, Antigravity CLI, Antigravity for VS Code). The list is informational: only the app/IDE storage provides the token.
 - **Gemini Web** — bridge state, cookie, web models, thinking depth, temporary chats.
 - **Connection** — base URL, key, cURL example, port, autostart.
 - **Settings & Limits** — **Cloud** (Safe Mode), **Web**, **Agent** (web agent permission, planner, workspace), **Network**, **Usage**.
@@ -430,13 +430,13 @@ python app.py --selftest
 
 **Это** локальный HTTP-сервер, который пересылает запросы к двум разным бэкендам Google, используя учётные данные, уже имеющиеся на этом компьютере:
 
-- **Cloud Code** (`cloud/<id>`) — тот же бэкенд, что использует IDE Antigravity. Авторизация — OAuth-сессия, которую IDE уже создала.
+- **Cloud Code** (`cloud/<id>`) — тот же бэкенд, что используют продукты Antigravity. Авторизация — OAuth-сессия, которую приложение Antigravity или IDE уже создали на этой машине.
 - **Gemini Web** (`web/<alias>`) — тот же StreamGenerate RPC, что использует `gemini.google.com`. Авторизация — куки браузера, которые вы копируете вручную.
 
 **Это не:**
 
 - **Не официальный API Google.** Google ничего из этого не поддерживает. Веб-часть держится на внутреннем протоколе, который может измениться без предупреждения.
-- **Не бесплатный безлимитный доступ.** Модели `cloud/` расходуют квоту вашего аккаунта Antigravity. Панель показывает её в процентах; когда квота кончится, запросы будут падать так же, как в IDE.
+- **Не бесплатный безлимитный доступ.** Модели `cloud/` расходуют квоту вашего аккаунта Antigravity. Панель показывает её в процентах; когда квота кончится, запросы будут падать так же, как внутри Antigravity.
 - **Не удалённый сервис.** По умолчанию сервер слушает `127.0.0.1`. В сеть он выходит, только если вы сами измените `host`, и TLS в нём нет — не выставляйте его напрямую в интернет.
 - **Не хостинг моделей.** Ни одна модель не работает локально. Каждый запрос уходит в Google.
 - **Не клиент.** Чтобы с ним работать, нужен Cursor, Cline, Open WebUI, скрипт или `curl`.
@@ -451,7 +451,7 @@ python app.py --selftest
 
 | Требование | Зачем | Замечание |
 |---|---|---|
-| **Google Antigravity IDE** с выполненным входом | Источник OAuth-сессии Cloud Code | Без неё модели `cloud/` не авторизуются. Сама IDE не обязательно должна быть запущена — используется только сохранённая сессия. |
+| **Antigravity (приложение) или Antigravity IDE** с выполненным входом | Источник OAuth-сессии Cloud Code | `scripts/extract_token.py` читает `state.vscdb` из `%APPDATA%\Antigravity IDE`, `%APPDATA%\Antigravity` или `%APPDATA%\antigravity` (на macOS и Linux пути аналогичные; `ANTIGRAVITY_STATE_DB` задаёт свой). Само приложение не обязательно должно быть запущено — используется только сохранённая сессия. **Antigravity CLI и расширение Antigravity для VS Code панель находит, но источником токена они не являются.** |
 | **Node.js 18+** | Запускает `server.js` | Подойдёт LTS. |
 | **Python 3.10+** | Запускает `app.py` (панель), установщик и извлечение токена в `auth.json` | На Windows отметьте **«Add python.exe to PATH»**. Когда `auth.json` уже есть, `node server.js` работает без Python — а панель и повторное извлечение токена без него нет. |
 
@@ -658,7 +658,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 
 Панель разделена по провайдерам, потому что общего у них только API:
 
-- **Cloud Code** — аккаунт, квоты, список облачных моделей, найденные установки Antigravity.
+- **Cloud Code** — аккаунт, квоты, список облачных моделей и найденные продукты Antigravity (Antigravity, Antigravity IDE, Antigravity CLI, Antigravity для VS Code). Список информационный: токен даёт только хранилище приложения или IDE.
 - **Gemini Web** — состояние моста, куки, веб-модели, глубина мышления, временные чаты.
 - **Connection** — Base URL, ключ, пример cURL, порт, автозапуск.
 - **Settings & Limits** — **Cloud** (Safe Mode), **Web**, **Agent** (разрешение веб-агенту, планировщик, workspace), **Network**, **Usage**.
