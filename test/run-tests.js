@@ -1113,12 +1113,10 @@ async function main() {
     fs.unlinkSync(sf);
   });
 
-  await ok('413: тело больше лимита -> понятный ответ, а не обрыв', async () => {
-    // 17 МБ строится виртуально; Content-Length честный (лимит шлюза — 16 МБ).
+  await ok('413: превышение Content-Length отбивается до чтения тела', async () => {
+    // Сервер обязан отдать 413 по одному заголовку, не вычитывая 17 МБ,
+    // и не рвать сокет так, чтобы клиент увидел «socket hang up».
     const total = 17 * 1024 * 1024;
-    const head = '{"model":"cloud/echo-model","messages":[{"role":"user","content":"';
-    const tail = '"}]}';
-    const filler = new ArrayBuffer(1024 * 1024);
     const r = await new Promise((resolve) => {
       let settled = false;
       const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
@@ -1131,31 +1129,48 @@ async function main() {
         res.on('end', () => finish({ status: res.statusCode, text: Buffer.concat(ch).toString('utf8') }));
         res.on('error', () => finish({ status: 0 }));
       });
-      // Ответ 413 сервер пишет сразу (content-length известен), но следом
-      // закрывает сокет — клиент может увидеть и «response», и «error».
-      // Даём ответу фору, чтобы тест не зависел от гонки: только потом -1.
-      req.on('error', () => setTimeout(() => finish({ status: -1 }), 1500));
-      const timer = setTimeout(() => { req.destroy(); }, 8000);
+      req.on('error', () => finish({ status: -1 }));
+      const timer = setTimeout(() => { req.destroy(); finish({ status: -2 }); }, 5000);
       req.on('close', () => clearTimeout(timer));
-      req.write(head);
-      let sent = head.length;
-      const pump = () => {
-        while (sent < total - tail.length) {
-          if (req.destroyed) return;
-          const chunk = Buffer.from(filler).subarray(0, Math.min(1024 * 1024, total - tail.length - sent));
-          sent += chunk.length;
-          if (!req.write(chunk)) { req.once('drain', pump); return; }
-        }
-        req.end(tail);
-      };
-      pump();
+      req.flushHeaders(); // тело не отправляем: проверяем именно проверку заголовка
     });
-    // Клиент обязан получить именно 413 с кодом body_too_large: раньше сервер
-    // уничтожал сокет, и клиент видел «socket hang up» (status 0/-1).
     assert.strictEqual(r.status, 413, 'ожидался 413, получено: ' + r.status);
     const j = JSON.parse(r.text);
     assert.strictEqual(j.error.code, 'body_too_large');
     assert.match(j.error.message, /МБ/);
+  });
+
+  await ok('413: потоковое тело без Content-Length тоже не вешает соединение', async () => {
+    const total = 17 * 1024 * 1024;
+    const r = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      const req = http.request({
+        host: '127.0.0.1', port: PORT_API, path: '/v1/chat/completions', method: 'POST',
+        headers: { ...AUTH(), 'content-type': 'application/json' }, // chunked
+      }, (res) => {
+        const ch = [];
+        res.on('data', (c) => ch.push(c));
+        res.on('end', () => finish({ status: res.statusCode }));
+        res.on('error', () => finish({ status: 0 }));
+      });
+      // Обрыв допустим (клиент не дочитал ответ), зависание — нет.
+      req.on('error', () => setTimeout(() => finish({ status: -1 }), 500));
+      const timer = setTimeout(() => { req.destroy(); finish({ status: -2 }); }, 8000);
+      req.on('close', () => clearTimeout(timer));
+      const chunk = Buffer.alloc(1024 * 1024, 97);
+      let sent = 0;
+      const pump = () => {
+        while (sent < total) {
+          if (req.destroyed) return;
+          sent += chunk.length;
+          if (!req.write(chunk)) { req.once('drain', pump); return; }
+        }
+        req.end();
+      };
+      pump();
+    });
+    assert.ok(r.status === 413 || r.status === 0 || r.status === -1, 'нет ответа и нет обрыва: ' + r.status);
   });
 
   await ok('отмена: клиент отключается во время стрима -> апстрим обрывается, в лог 499', async () => {
