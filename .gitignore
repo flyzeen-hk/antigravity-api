@@ -1,6 +1,7 @@
 # Secrets & local authentication (CRITICAL: NEVER COMMIT)
 auth.json
 apikey.txt
+admin.key
 config.json
 usage.json
 cookie.txt
