@@ -814,7 +814,7 @@ function start(config) {
           saw.push(parseUpstreamData(data));
         }
         const merged = mergeGeminiResponse(saw);
-        const out = geminiToOpenAIResponse({ response: merged }, model);
+        const out = geminiToOpenAIResponse({ response: merged }, model, { includeThoughts: !!config.includeThoughts });
         const m = out.choices?.[0]?.message || {};
         return { content: m.content || '', tool_calls: m.tool_calls || [], usage: out.usage, upstream_model: out.upstream_model };
       } finally {
@@ -969,9 +969,15 @@ function start(config) {
       if (!webBridge.isWebModel(parsed.baseId)) {
         return sendJson(res, 400, webBridgeDisabledError());
       }
+      // Web-модели тоже под Safe Mode: раньше лимиты запросов на них не
+      // действовали вообще (считались только токены).
+      return guarded(res, parsed.baseId, 'openai', async () => {
+      const ac = new AbortController();
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.once('close', onClose);
       try {
         const out = await webBridge.handleOpenAIChat(
-          { ...body, model: parsed.baseId, tools: undefined }, stream, res);
+          { ...body, model: parsed.baseId, tools: undefined }, stream, res, { signal: ac.signal });
         if (out) {
           guard.reportUsage(out.usage?.total_tokens);
           pushLog({ kind: 'openai', model: parsed.displayId, status: 200, ms: Date.now() - t0, stream, provider: providers.WEB });
@@ -987,14 +993,22 @@ function start(config) {
         const detail = redactSecrets(String(err && err.message || 'unknown error')).replace(/\s+/g, ' ').slice(0, 220);
         const message = regional ? normalizeDiagnosticError(err, { bridge: 'web' }).error.message
           : `Gemini Web request failed: ${detail} (проверьте VPN и свежесть куки; повторите попытку)`;
+        if (status === 429) guard.report429(parsed.baseId, parseResetMs(detail));
         pushLog({ kind: 'openai', status, ms: Date.now() - t0, error: regional ? code : 'web: ' + detail.slice(0, 140), provider: providers.WEB });
         sendApiError(res, status, { error: { message, type, code } }, stream);
         return;
+      } finally {
+        res.removeListener('close', onClose);
+        if (clientGone(res) && !ac.signal.aborted) ac.abort();
       }
+      });
     }
 
     const model = parsed.baseId;
     const requestObj = openAIToGeminiRequest(body);
+    // reasoning_effort/thinking -> generationConfig.thinkingConfig (только если
+    // config.thinking.mapReasoningEffort=true: поддержка зависит от апстрима).
+    applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
 
     return guarded(res, model, 'openai', async () => {
       const ac = new AbortController();
@@ -1090,7 +1104,7 @@ function start(config) {
       },
       traceId,
     };
-    return geminiToOpenAIResponse(resp, model);
+    return geminiToOpenAIResponse(resp, model, { includeThoughts: !!config.includeThoughts });
   }
 
   // ---- Gemini-нативный API ----
@@ -1132,6 +1146,12 @@ function start(config) {
       if (!webBridge.isWebModel(model)) {
         return sendJson(res, 400, webBridgeDisabledError());
       }
+      return guarded(res, model, 'gemini', async () => {
+      // Уход клиента обязан рвать веб-запрос: ответ Gemini идёт 10-30 c,
+      // и без отмены шлюз продолжает занимать квоту впустую.
+      const ac = new AbortController();
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.once('close', onClose);
       try {
         const prompt = webBridge.contentsToPrompt(requestObj);
         const meta = webBridge.getModelMeta(model);
@@ -1139,7 +1159,7 @@ function start(config) {
 
         if (stream) {
           const reqBody = webBridge.buildPayload(prompt, meta.modelId, meta.thinkMode, lang);
-          const upRes = await webBridge.sendStreamRequestResilient(reqBody, meta, lang);
+          const upRes = await webBridge.sendStreamRequestResilient(reqBody, meta, lang, { signal: ac.signal });
           const iterator = webBridge.streamResponse(upRes)[Symbol.asyncIterator]();
           const first = await iterator.next();
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -1166,7 +1186,7 @@ function start(config) {
           return;
         }
 
-        const text = await webBridge.generate(prompt, meta.modelId, meta.thinkMode, lang);
+        const text = await webBridge.generate(prompt, meta.modelId, meta.thinkMode, lang, { signal: ac.signal });
         const out = {
           candidates: [{
             content: { parts: [{ text }], role: 'model' },
@@ -1189,12 +1209,17 @@ function start(config) {
         const message = regional ? normalizeDiagnosticError(err, { bridge: 'web' }).error.message
           : `Gemini Web request failed: ${detail} (проверьте VPN и свежесть куки; повторите попытку)`;
         pushLog({ kind: 'gemini', status, ms: Date.now() - t0, error: regional ? 'region_not_supported' : 'web: ' + detail.slice(0, 140), provider: providers.WEB });
+        if (status === 429) guard.report429(model, parseResetMs(detail));
         return sendApiError(res, status, { error: {
           message,
           type: regional ? 'invalid_request_error' : 'api_error',
           code: regional ? 'region_not_supported' : status,
         } });
+      } finally {
+        res.removeListener('close', onClose);
+        if (clientGone(res) && !ac.signal.aborted) ac.abort();
       }
+      });
     }
 
     return guarded(res, model, 'gemini', async () => {
@@ -1719,7 +1744,7 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
   });
   server.listen(config.port, config.host);
 
-  return { server, tokens, catalog, upstream, config, network };
+  return { server, tokens, catalog, upstream, config, network, guard, webBridge };
 }
 
 // ---------------------------------------------------------------- CLI
@@ -1773,17 +1798,40 @@ function main() {
   ────────────────────────────────────────────────────────────────────────
   Base URL (OpenAI):   http://127.0.0.1:${config.port}/v1
   Base URL (Gemini):   http://127.0.0.1:${config.port}/v1beta
-  API Key File:        apikey.txt (Key: ${config.apiKey.slice(0, 10)}...)
+  API Key File:        apikey.txt${config.apiKey ? '' : ' (не создан)'}
   Upstream Gateway:    ${config.upstreamHost}
   Web Dashboard:       http://127.0.0.1:${config.port}/
 `);
 
   if (created) console.log('  Created config.json and apikey.txt (API key generated).\n');
-  start(config);
+  const runtime = start(config);
 
-  const stop = () => process.exit(0);
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
+  let stopping = false;
+  const stop = (signal) => {
+    if (stopping) return;
+    stopping = true;
+    console.log(`
+  ${signal}: останавливаюсь, дожидаюсь текущих запросов…`);
+    try { runtime.guard.flush(); } catch {}
+    try { runtime.webBridge.closeAllSockets?.(); } catch {}
+    const hard = setTimeout(() => {
+      console.log('  Активные соединения не закрылись за 8 c — завершаю принудительно.');
+      try { runtime.guard.flush(); } catch {}
+      try { runtime.server.closeAllConnections(); } catch {}
+      process.exit(0);
+    }, 8000);
+    if (hard.unref) hard.unref();
+    runtime.server.close(() => {
+      clearTimeout(hard);
+      try { runtime.guard.flush(); } catch {}
+      process.exit(0);
+    });
+    // новые соединения больше не принимаются, но keep-alive висящие сокеты
+    // нужно закрыть сами — иначе close() не дождётся.
+    setTimeout(() => { try { runtime.server.closeIdleConnections(); } catch {} }, 500).unref?.();
+  };
+  process.on('SIGINT', () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
 }
 
 if (require.main === module) main();
