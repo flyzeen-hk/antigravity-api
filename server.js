@@ -1616,6 +1616,9 @@ function start(config) {
         webKvs =
           `<div class="kv"><span class="k">Status</span><span><span class="badge ${enCls}">${ws.enabled ? 'Enabled' : 'Disabled'}</span></span></div>` +
           `<div class="kv"><span class="k">Cookie</span><span><span class="badge ${ckCls}">${ws.cookieSet ? 'set' : 'none (anonymous)'}</span></span></div>` +
+          (ws.accounts && ws.accounts.length
+            ? `<div class="kv"><span class="k">Accounts</span><span>${ws.accounts.map((a) => `<code>${esc(a.name)}</code>${a.active ? ' <span class="badge ok">active</span>' : ''}${a.cooldownUntil ? ' <span class="badge warn">cooldown</span>' : ''}${a.requests ? ' · ' + esc(a.requests) + ' req' : ''}`).join(' ')}</span></div>`
+            : '') +
           `<div class="kv"><span class="k">BL version</span><span><code>${esc(ws.bl)}</code></span></div>` +
           (ws.proxy ? `<div class="kv"><span class="k">Proxy</span><span><code>${esc(ws.proxy)}</code></span></div>` : '') +
           (ws.authUser !== null && ws.authUser !== undefined ? `<div class="kv"><span class="k">Google /u/</span><span><code>${esc(ws.authUser)}</code></span></div>` : '') +

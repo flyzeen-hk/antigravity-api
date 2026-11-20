@@ -712,7 +712,94 @@ function languageTests() {
   console.log('  ok  buildPayload: языковой маркер только для валидного кода языка');
 }
 
-runErrorRegressions().then(runRouteRegressions).then(() => {
+async function accountTests() {
+  const mk = (over = {}) => new GeminiWebBridge({
+    enabled: true,
+    cookie: 'SAPISID=main; __Secure-1PSID=main',
+    accounts: [
+      { name: 'one', cookie: 'SAPISID=a1; __Secure-1PSID=a1', label: 'личный', proxy: 'http://127.0.0.1:1111' },
+      { name: 'two', cookie: 'SAPISID=a2; __Secure-1PSID=a2', label: 'рабочий' },
+    ],
+    ...over,
+  });
+
+  const b = mk();
+  assert.strictEqual(b._activeAccount, 'one', 'по умолчанию первый аккаунт');
+  assert.ok(b.cookie.includes('SAPISID=a1'), 'cookie активного аккаунта подставлена');
+  assert.strictEqual(b.proxy, 'http://127.0.0.1:1111', 'прокси аккаунта применён');
+  assert.strictEqual(b.accountLabel, 'личный');
+
+  b.selectAccount('two');
+  assert.ok(b.cookie.includes('SAPISID=a2'), 'переключение меняет cookie');
+  assert.strictEqual(b.proxy, '', 'у второго аккаунта свой прокси (пусто = глобальный)');
+
+  assert.strictEqual(b.nextAccountName(), 'one', 'круг по аккаунтам');
+  b.markAccountFailure('one', '429', 60000);
+  assert.strictEqual(b.nextAccountName(), null, 'аккаунт в cooldown пропускается');
+
+  const sum = b.summary();
+  assert.ok(Array.isArray(sum.accounts) && sum.accounts.length === 2, 'summary отдаёт аккаунты');
+  const one = sum.accounts.find((a) => a.name === 'one');
+  assert.ok(one.cooldownUntil > Date.now(), 'cooldown виден в summary');
+  assert.strictEqual(one.lastError, '429');
+  assert.strictEqual(sum.activeAccount, 'two');
+
+  // Ротация на 429: первый аккаунт падает, запрос повторяется на втором.
+  const seen = [];
+  const b2 = mk({ autoRotateOn429: true });
+  b2.ensureBlFresh = async () => {};
+  b2.sendStreamRequest = async (body, meta, lang, opts) => {
+    seen.push(b2._activeAccount);
+    if (b2._activeAccount === 'one') {
+      const e = new Error('rate limited');
+      e.status = 429;
+      throw e;
+    }
+    return { ok: true, account: b2._activeAccount };
+  };
+  const out = await b2.sendStreamRequestResilient('{}', { modelId: 3, thinkMode: 0 }, 'en');
+  assert.deepStrictEqual(seen, ['one', 'two'], 'после 429 запрос ушёл с другого аккаунта');
+  assert.strictEqual(out.account, 'two');
+  assert.ok(b2.accountStat('one').cooldownUntil > Date.now(), 'упавший аккаунт остужается');
+
+  // Без autoRotateOn429 429 не переключает аккаунт.
+  const seen2 = [];
+  const b3 = mk({ autoRotateOn429: false });
+  b3.ensureBlFresh = async () => {};
+  b3.sendStreamRequest = async () => {
+    seen2.push(b3._activeAccount);
+    const e = new Error('rate limited');
+    e.status = 429;
+    throw e;
+  };
+  await assert.rejects(() => b3.sendStreamRequestResilient('{}', { modelId: 3, thinkMode: 0 }, 'en'), /rate limited/);
+  assert.deepStrictEqual(seen2, ['one'], 'без флага аккаунт не меняется');
+
+  // 401 (протухшая cookie) переключает всегда — это не лимит, а поломка.
+  const seen3 = [];
+  const b4 = mk();
+  b4.ensureBlFresh = async () => {};
+  b4.sendStreamRequest = async () => {
+    seen3.push(b4._activeAccount);
+    if (b4._activeAccount === 'one') {
+      const e = new Error('unauthorized');
+      e.status = 401;
+      throw e;
+    }
+    return { ok: true };
+  };
+  await b4.sendStreamRequestResilient('{}', { modelId: 3, thinkMode: 0 }, 'en');
+  assert.deepStrictEqual(seen3, ['one', 'two'], '401 переключает аккаунт');
+
+  // Одиночная cookie (без accounts) работает как раньше.
+  const b5 = new GeminiWebBridge({ enabled: true, cookie: 'SAPISID=solo' });
+  assert.deepStrictEqual(b5.accounts, []);
+  assert.strictEqual(b5.summary().accounts, undefined);
+  console.log('  ok  мультиаккаунт: выбор, cooldown, ротация на 429/401, совместимость');
+}
+
+runErrorRegressions().then(runRouteRegressions).then(async () => {
+  await accountTests();
   languageTests();
   console.log('ALL GEMINI 4 WEB BRIDGE UNIT TESTS PASSED!');
 }).catch(error => {
