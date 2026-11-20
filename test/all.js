@@ -13,7 +13,8 @@ const ROOT = path.join(__dirname, '..');
 
 const NODE_TESTS = [
   ['server: интеграционные тесты шлюза', 'test/run-tests.js'],
-  ['http_helpers/translate/web_bridge: быстрые регрессии', 'lib/server_regression_check.js'],
+  ['http_helpers/translate/web_bridge: быстрые регрессии', 'test/server_regression_check.js'],
+  ['каталог моделей: кэш и stale-while-revalidate', 'test/test_models.js'],
   ['провайдеры моделей', 'test/test_providers.js'],
   ['planner', 'test/test_planner.js'],
   ['сетевой слой', 'test/test_net.js'],

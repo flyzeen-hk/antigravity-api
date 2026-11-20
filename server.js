@@ -949,17 +949,56 @@ function start(config) {
 
     const chat = useWeb ? chatWeb : chatCloud;
 
+    // SSE открывается ДО цикла: иначе клиент минуту видит пустоту (агент ходит
+    // в апстрим несколько раз), а прокси рвут соединение по таймауту.
+    let sseBase = null;
+    let pingTimer = null;
+    const openSse = () => {
+      if (sseBase || !stream) return;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      sseBase = {
+        id: 'chatcmpl-' + crypto.randomUUID(),
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: requestedModel,
+      };
+      res.write(`data: ${JSON.stringify({ ...sseBase, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}\n\n`);
+      pingTimer = setInterval(() => {
+        if (res.writableEnded) return;
+        res.write(': keep-alive\n\n'); // SSE-комментарий, клиенты его игнорируют
+      }, 10000);
+      if (pingTimer.unref) pingTimer.unref();
+    };
+    const stopSse = () => {
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    };
+    const onAgentEvent = (evt) => {
+      if (!sseBase || res.writableEnded) return;
+      const payload = evt.type === 'iteration' ? { type: 'iteration', iteration: evt.iteration }
+        : evt.type === 'tool_start' ? { type: 'tool_start', tool: evt.tool }
+          : { type: 'tool_end', tool: evt.tool, ok: evt.ok, ms: evt.ms };
+      res.write(`data: ${JSON.stringify({ ...sseBase, agent_event: payload, choices: [{ index: 0, delta: {}, finish_reason: null }] })}\n\n`);
+    };
+
     const run = async () => {
-      const result = await agent.runAgentLoop({
-        chat,
-        messages: body.messages || [],
-        executor: loopExecutor,
-        maxIterations: acfg.maxIterations,
-        systemPrompt,
-      });
-      if (result.usage && result.usage.total_tokens) guard.reportUsage(result.usage.total_tokens);
-      pushLog({ kind: 'openai', model: requestedModel, status: 200, ms: Date.now() - t0, agentActions: result.trace.length, provider: parsed.namespace });
-      return result;
+      openSse();
+      res.once('close', stopSse);
+      try {
+        const result = await agent.runAgentLoop({
+          chat,
+          messages: body.messages || [],
+          executor: loopExecutor,
+          maxIterations: acfg.maxIterations,
+          systemPrompt,
+          onEvent: onAgentEvent,
+        });
+        if (result.usage && result.usage.total_tokens) guard.reportUsage(result.usage.total_tokens);
+        pushLog({ kind: 'openai', model: requestedModel, status: 200, ms: Date.now() - t0, agentActions: result.trace.length, provider: parsed.namespace });
+        return result;
+      } finally {
+        stopSse();
+        res.removeListener('close', stopSse);
+      }
     };
 
     const agentMeta = () => useWeb
@@ -986,18 +1025,11 @@ function start(config) {
           },
         });
       }
-      // SSE: прогресс инструментов — события agent_event, затем контент одним дельта-чанком.
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      const base = {
-        id: 'chatcmpl-' + crypto.randomUUID(),
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: requestedModel,
-      };
-      res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}\n\n`);
-      for (const a of result.trace) {
-        res.write(`data: ${JSON.stringify({ ...base, agent_event: { tool: a.tool, ok: a.ok }, choices: [{ index: 0, delta: {}, finish_reason: null }] })}\n\n`);
-      }
+      // Стрим уже открыт в openSse(): прогресс ушёл живыми событиями,
+      // здесь только финальный контент и закрытие.
+      stopSse();
+      if (!sseBase) openSse();
+      const base = sseBase;
       if (result.content) {
         res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: result.content }, finish_reason: null }] })}\n\n`);
       }

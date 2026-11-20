@@ -1088,6 +1088,34 @@ async function main() {
     }
   });
 
+  await ok('cloud -agent stream: прогресс инструментов приходит до финального контента', async () => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-agent-sse-'));
+    try {
+      const t0 = Date.now();
+      const r = await A('/v1/chat/completions', 'POST', {
+        model: 'cloud/echo-model-agent',
+        stream: true,
+        messages: [{ role: 'user', content: 'AGENT_WRITE' }],
+        agent: { workspaceRoot: ws, maxIterations: 3 },
+      });
+      assert.strictEqual(r.status, 200, r.text);
+      assert.ok(Date.now() - t0 < 5000, 'агент не ждёт конца работы в тишине');
+      const frames = r.text.split('\n\n').filter((x) => x.startsWith('data: '));
+      const parsed = frames.map((f) => f.slice(6)).filter((d) => d !== '[DONE]').map((d) => JSON.parse(d));
+      const events = parsed.filter((c) => c.agent_event).map((c) => c.agent_event);
+      assert.ok(events.some((e) => e.type === 'tool_start' && e.tool === 'write_file'), JSON.stringify(events));
+      assert.ok(events.some((e) => e.type === 'tool_end' && e.ok === true && e.ms >= 0), JSON.stringify(events));
+      const idxStart = parsed.findIndex((c) => c.agent_event && c.agent_event.type === 'tool_start');
+      const idxContent = parsed.findIndex((c) => c.choices && c.choices[0].delta && c.choices[0].delta.content);
+      assert.ok(idxStart < idxContent, 'событие инструмента пришло раньше ответа');
+      assert.strictEqual(parsed[parsed.length - 1].choices[0].finish_reason, 'stop');
+      assert.ok(r.text.trimEnd().endsWith('data: [DONE]'), 'стрим закрыт [DONE]');
+      assert.strictEqual(fs.readFileSync(path.join(ws, 'agent-loop.txt'), 'utf8'), 'native-loop');
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   await ok('cloud -agent: native functionCall loop writes files in the sandbox', async () => {
     const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-agent-ws-'));
     try {
