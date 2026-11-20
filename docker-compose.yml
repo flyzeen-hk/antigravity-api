@@ -1,0 +1,33 @@
+# docker compose up -d
+#
+# Перед первым запуском создайте на хосте ./data и положите туда:
+#   auth.json   — для cloud/* моделей (иначе только web/*)
+#   cookie.txt  — для web/* моделей (cookie Gemini из браузера)
+# config.json и apikey.txt создадутся сами; ключ смотрите в data/apikey.txt.
+services:
+  antigravity-api:
+    build: .
+    image: antigravity-api:local
+    container_name: antigravity-api
+    restart: unless-stopped
+    ports:
+      # Только localhost: шлюз не должен торчать в сеть без adminKey/TLS.
+      - "127.0.0.1:8317:8317"
+    environment:
+      AG_HOST: 0.0.0.0
+      AG_PORT: "8317"
+      # Тело запроса: 16 МБ по умолчанию, увеличьте для больших картинок.
+      AG_MAX_BODY_BYTES: "16777216"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8317/_health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

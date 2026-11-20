@@ -42,7 +42,10 @@ const configLib = require('./lib/config');
 const { applyThinkingConfig } = require('./lib/thinking');
 const anthropic = require('./lib/anthropic');
 
-const ROOT = __dirname;
+const ROOT = __dirname; // код
+// Данные (config.json, apikey.txt, auth.json, usage.json, backups/) можно
+// вынести из папки с кодом: нужно для Docker, где /app только для чтения.
+const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT;
 const ADMIN_KEY_FILE = 'admin.key';
 
 // Единственный источник истины по дефолтам — lib/config/defaults.js.
@@ -97,14 +100,34 @@ function persistConfig(file, config) {
   writeFileAtomic(file, JSON.stringify(config, null, 2));
 }
 
+// Порт/адрес из окружения: в Docker конфиг монтируется снаружи, и
+// 127.0.0.1 внутри контейнера недоступен. Возвращает true, если что-то менялось.
+function applyEnvOverrides(config) {
+  let changed = false;
+  const rawPort = process.env.AG_PORT;
+  const envPort = Number(rawPort);
+  if (rawPort && Number.isFinite(envPort) && envPort > 0 && envPort < 65536) {
+    const port = Math.round(envPort);
+    if (config.port !== port) { config.port = port; changed = true; }
+  }
+  if (process.env.AG_HOST) {
+    const host = process.env.AG_HOST.trim();
+    if (host && config.host !== host) { config.host = host; changed = true; }
+  }
+  return changed;
+}
+
 // config.json — источник истины для ключа; apikey.txt — его копия для людей и панели.
 function loadConfig(root = ROOT) {
+  // В Docker данные живут в отдельном томе — его может ещё не быть.
+  try { fs.mkdirSync(root, { recursive: true }); } catch {}
   const file = path.join(root, 'config.json');
   const keyFile = path.join(root, 'apikey.txt');
   if (!fs.existsSync(file)) {
     // apikey.txt пережил удаление config.json — оставляем ключ, чтобы клиенты не сломались.
     const kept = readKeyFile(keyFile);
     const { config } = configLib.normalize({ apiKey: kept.length >= 16 ? kept : newApiKey() });
+    applyEnvOverrides(config); // в Docker порт/хост задаются окружением
     ensureAdminKey(root, config);
     writeFileAtomic(file, JSON.stringify(config, null, 2));
     if (kept !== config.apiKey) {
@@ -128,6 +151,8 @@ function loadConfig(root = ROOT) {
 
   const { config, warnings } = configLib.normalize(raw);
   let dirty = warnings.length > 0 || Number(raw.configVersion) !== configLib.CONFIG_VERSION;
+
+  if (applyEnvOverrides(config)) dirty = true;
 
   if (!config.apiKey) {
     const kept = readKeyFile(keyFile);
@@ -354,7 +379,7 @@ function start(config) {
   const network = new NetworkManager(config);
   // Ищем локальный relay (AGUnlocker) сразу, не дожидаясь первого cloud-запроса.
   if (network.autoDetect) network.autoDetect();
-  const authFile = process.env.AG_AUTH_FILE || path.join(ROOT, 'auth.json');
+  const authFile = process.env.AG_AUTH_FILE || path.join(DATA_DIR, 'auth.json');
   if (!fs.existsSync(authFile)) {
     console.log(`\n  ! Не найден ${authFile} — сначала: python scripts\\extract_token.py\n`);
     process.exit(1);
@@ -367,7 +392,7 @@ function start(config) {
     network,
   });
   const upstream = new Upstream(config, tokens, catalog, network);
-  const guard = new Guard(config.safeMode || {}, process.env.AG_USAGE_FILE || path.join(ROOT, 'usage.json'));
+  const guard = new Guard(config.safeMode || {}, process.env.AG_USAGE_FILE || path.join(DATA_DIR, 'usage.json'));
   const webBridge = new GeminiWebBridge({ ...(config.geminiWeb || {}), network });
   webBridge.ensureBlFresh(true).catch(() => {}); // фоновое обновление BL-версии, best-effort
   const netSummary = network.summary();
@@ -1933,7 +1958,7 @@ function main() {
   const cmd = process.argv[2];
   let loaded;
   try {
-    loaded = loadConfig();
+    loaded = loadConfig(DATA_DIR);
   } catch (e) {
     console.error(`\n  ! ${e.message}\n`);
     process.exit(1);
@@ -1947,7 +1972,7 @@ function main() {
   }
 
   if (cmd === 'models') {
-    const authFile = path.join(ROOT, 'auth.json');
+    const authFile = path.join(DATA_DIR, 'auth.json');
     const network = new NetworkManager(config);
     const tokens = new TokenManager(authFile, { network });
     const catalog = new ModelCatalog(config.upstreamHost, {
@@ -1973,14 +1998,16 @@ function main() {
     return;
   }
 
+  // 0.0.0.0 — это «слушать всё»; в подсказке должен быть реальный адрес.
+  const bannerHost = !config.host || config.host === '0.0.0.0' || config.host === '::' ? '127.0.0.1' : config.host;
   console.log(`
   ANTIGRAVITY API — OpenAI & Gemini Compatible Gateway
   ────────────────────────────────────────────────────────────────────────
-  Base URL (OpenAI):   http://127.0.0.1:${config.port}/v1
-  Base URL (Gemini):   http://127.0.0.1:${config.port}/v1beta
+  Base URL (OpenAI):   http://${bannerHost}:${config.port}/v1
+  Base URL (Gemini):   http://${bannerHost}:${config.port}/v1beta
   API Key File:        apikey.txt${config.apiKey ? '' : ' (не создан)'}
   Upstream Gateway:    ${config.upstreamHost}
-  Web Dashboard:       http://127.0.0.1:${config.port}/
+  Web Dashboard:       http://${bannerHost}:${config.port}/
 `);
 
   if (created) console.log('  Created config.json and apikey.txt (API key generated).\n');

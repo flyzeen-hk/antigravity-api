@@ -353,6 +353,23 @@ async function main() {
     assert.ok(j.id.startsWith('chatcmpl-ag-'));
   });
 
+  await ok('config: normalize({}) возвращает рабочие дефолты, а не пустоту', async () => {
+    const configLib = require('../lib/config');
+    const { config } = configLib.normalize({});
+    assert.strictEqual(config.upstreamHost, 'https://daily-cloudcode-pa.googleapis.com');
+    assert.strictEqual(config.upstreamFallbackHost, 'https://cloudcode-pa.googleapis.com');
+    assert.ok(config.userAgent, 'userAgent задан');
+    assert.ok(config.requestTimeoutMs > 0 && config.retries >= 0);
+    assert.strictEqual(config.port, 8317);
+    assert.strictEqual(config.agent.enabled, true, 'агент включён по умолчанию');
+    assert.strictEqual(config.safeMode.enabled, false, 'Safe Mode выключен по умолчанию');
+    // пользовательские значения перекрывают дефолты, а не затирают соседние
+    const merged = configLib.normalize({ port: 9000, agent: { maxIterations: 5 } }).config;
+    assert.strictEqual(merged.port, 9000);
+    assert.strictEqual(merged.agent.maxIterations, 5);
+    assert.strictEqual(merged.upstreamHost, 'https://daily-cloudcode-pa.googleapis.com');
+  });
+
   await ok('anthropic: /v1/messages non-stream -> текст, usage, stop_reason', async () => {
     const r = await A('/v1/messages', 'POST', {
       model: 'claude-sonnet-4-5-20250929',

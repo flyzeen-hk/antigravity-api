@@ -557,6 +557,33 @@ def pid_on_port(port=None):
     return None
 
 
+def process_command_line(pid):
+    """Командная строка процесса — нужна, чтобы не убить чужой сервер на нашем порту."""
+    try:
+        if sys.platform == "win32":
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Process -Filter 'ProcessId=%d').CommandLine" % int(pid)],
+                capture_output=True, timeout=10,
+            )
+            return _decode_console(res.stdout).strip()
+        with open("/proc/%d/cmdline" % int(pid), "rb") as fh:
+            return fh.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+
+def is_our_server(pid):
+    """Наш ли процесс занимает порт: сверяем командную строку с путём проекта."""
+    if not pid:
+        return False
+    cmd = process_command_line(pid).replace("\\", "/").lower()
+    if not cmd or "server.js" not in cmd:
+        return False
+    base = os.path.abspath(BASE).replace("\\", "/").lower()
+    return base in cmd
+
+
 def is_running():
     try:
         http_get("/_health", timeout=1.2)
@@ -2616,7 +2643,9 @@ class App(tk.Tk):
             self.proc = None
         else:
             pid = pid_on_port()
-            if pid:
+            # Порт может занимать чужой процесс (другой проект, другой gateway):
+            # его нельзя убивать. Останавливаем только свой server.js.
+            if pid and is_our_server(pid):
                 try:
                     if sys.platform == "win32":
                         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
@@ -2625,6 +2654,10 @@ class App(tk.Tk):
                         os.kill(pid, signal.SIGTERM)
                 except Exception:
                     pass
+            elif pid:
+                self.status_text.configure(
+                    text=T("ПОРТ ЗАНЯТ ЧУЖИМ ПРОЦЕССОМ", "PORT BUSY (FOREIGN PROCESS)"), fg=DANGER)
+                return
         self.status_text.configure(text=T("ОСТАНОВЛЕН", "STOPPED"), fg=DANGER)
 
     # ---------------- Windows Startup ----------------
