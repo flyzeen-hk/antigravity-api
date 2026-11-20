@@ -40,6 +40,7 @@ const planner = require('./lib/planner');
 const { stripBom, readJsonFile, writeFileAtomic, backupFile, restoreLatestBackup } = require('./lib/safe_files');
 const configLib = require('./lib/config');
 const { applyThinkingConfig } = require('./lib/thinking');
+const anthropic = require('./lib/anthropic');
 
 const ROOT = __dirname;
 const ADMIN_KEY_FILE = 'admin.key';
@@ -645,6 +646,129 @@ function start(config) {
     }
   }
 
+  // ---- Anthropic Messages API: /v1/messages ----
+  // Claude Code, Cline, Continue и Zed ходят только по этому протоколу.
+
+  function anthropicError(res, status, type, message) {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+  }
+
+  async function handleAnthropicCountTokens(req, res) {
+    const read = await readBodyOrRespond(req, res);
+    if (!read.ok) return;
+    const body = parseRequestBody(read.raw);
+    // Точный подсчёт требует вызова апстрима, а Anthropic-клиенты используют
+    // ответ только для оценки контекста — отдаём детерминированную оценку.
+    return sendJson(res, 200, { input_tokens: anthropic.estimateTokens(body) });
+  }
+
+  async function handleAnthropicMessages(req, res) {
+    const t0 = Date.now();
+    const read = await readBodyOrRespond(req, res);
+    if (!read.ok) return;
+    const body = parseRequestBody(read.raw);
+
+    const modelName = String(body.model || '').trim();
+    if (!modelName) return anthropicError(res, 400, 'invalid_request_error', 'model: обязательное поле');
+    if (!Number.isFinite(body.max_tokens) || body.max_tokens <= 0) {
+      return anthropicError(res, 400, 'invalid_request_error', 'max_tokens: обязательное поле (> 0)');
+    }
+    if (!Array.isArray(body.messages) || !body.messages.length) {
+      return anthropicError(res, 400, 'invalid_request_error', 'messages: обязательное поле');
+    }
+
+    const mapped = anthropic.mapModel(modelName);
+    let parsed = providers.parseModel(mapped);
+    if (!parsed.ok) parsed = (await resolveFlatModel(mapped)) || parsed;
+    if (!parsed.ok) {
+      return anthropicError(res, 404, 'not_found_error', `model: неизвестная модель "${modelName}". Список: GET /v1/models`);
+    }
+    if (parsed.namespace === providers.WEB) {
+      // У веб-канала нет нативного function calling и thinking-блоков,
+      // поэтому /v1/messages для web/* не притворяется рабочим.
+      return anthropicError(res, 400, 'invalid_request_error',
+        'web-модели не поддерживают /v1/messages — используйте /v1/chat/completions с теми же моделями');
+    }
+
+    let requestObj;
+    try {
+      ({ requestObj } = anthropic.anthropicToGeminiRequest(body));
+    } catch (e) {
+      return anthropicError(res, e.status || 400, 'invalid_request_error', e.message);
+    }
+    applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
+
+    const stream = body.stream === true;
+
+    return guarded(res, parsed.baseId, 'anthropic', async () => {
+      const ac = new AbortController();
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.once('close', onClose);
+      try {
+        if (clientGone(res)) throw abortedError();
+        const upRes = await withRetry429(() => upstream.generateWithRetry(parsed.baseId, requestObj, { signal: ac.signal }));
+        if (!upRes.ok) {
+          const text = (await upRes.text().catch(() => '')) || '';
+          if (upRes.status === 429) guard.report429(parsed.baseId, parseResetMs(text));
+          const quota = extractQuotaInfo(text);
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: upRes.status, ms: Date.now() - t0, error: text.slice(0, 160), quota, provider: providers.CLOUD });
+          const message = redactSecrets(text).replace(/\s+/g, ' ').slice(0, 400) || `upstream ${upRes.status}`;
+          const type = upRes.status === 429 ? 'rate_limit_error'
+            : upRes.status === 401 || upRes.status === 403 ? 'authentication_error'
+              : upRes.status === 404 ? 'not_found_error' : 'api_error';
+          return anthropicError(res, upRes.status, type, message);
+        }
+
+        if (!stream) {
+          const saw = [];
+          for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
+            if (!data || data === '[DONE]') continue;
+            saw.push(parseUpstreamData(data));
+          }
+          const out = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw) }, modelName);
+          guard.reportUsage(out.usage.input_tokens + out.usage.output_tokens);
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, provider: providers.CLOUD });
+          return sendJson(res, 200, out);
+        }
+
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        const conv = new anthropic.AnthropicStream(modelName, { includeThinking: !!config.includeThoughts });
+        // message_start нужен сразу: клиенты показывают «печатает» до первого чанка.
+        for (const evt of conv.startMessage()) res.write(anthropic.formatSse(evt));
+        try {
+          for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
+            if (!data || data === '[DONE]') continue;
+            const resp = parseUpstreamData(data);
+            for (const evt of conv.push(resp.response ?? resp)) res.write(anthropic.formatSse(evt));
+          }
+        } catch (e) {
+          if (clientGone(res) || (e && (e.name === 'AbortError' || ac.signal.aborted))) throw abortedError();
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: 502, ms: Date.now() - t0, error: 'stream: ' + e.message, provider: providers.CLOUD });
+          for (const evt of conv.finish()) res.write(anthropic.formatSse(evt));
+          res.end();
+          return;
+        }
+        for (const evt of conv.finish()) res.write(anthropic.formatSse(evt));
+        res.end();
+        guard.reportUsage(conv.usageTokens);
+        pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, stream: true, provider: providers.CLOUD });
+      } catch (err) {
+        if (err && err.code === 'client_disconnected') {
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: 499, ms: Date.now() - t0, error: 'client disconnected', provider: providers.CLOUD });
+          return;
+        }
+        throw err;
+      } finally {
+        res.removeListener('close', onClose);
+        if (clientGone(res) && !ac.signal.aborted) ac.abort();
+      }
+    });
+  }
   // ---- OpenAI: /v1/chat/completions ----
 
   // Модели жёстко неймспейснуты: cloud/<id> | web/<alias>.
@@ -1564,8 +1688,27 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
 
   // ---- маршрутизация ----
 
+  // Браузерные клиенты (Open WebUI, LibreChat, свои страницы) шлют preflight:
+  // без него запрос не уходит вообще. Ключ всё равно обязателен на /v1.
+  function applyCors(req, res) {
+    const origin = req.headers.origin;
+    if (!origin) return;
+    res.setHeader('access-control-allow-origin', origin);
+    res.setHeader('vary', 'origin');
+    res.setHeader('access-control-allow-credentials', 'true');
+    res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
+    res.setHeader('access-control-allow-headers', (req.headers['access-control-request-headers'] || 'authorization,content-type,x-api-key,x-goog-api-key,x-admin-key,anthropic-version,anthropic-beta').slice(0, 1024));
+    res.setHeader('access-control-max-age', '600');
+  }
+
   async function handler(req, res) {
     let p = req.url;
+    applyCors(req, res);
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     try {
       let u;
       try { u = new URL(req.url, 'http://localhost'); } catch {
@@ -1717,8 +1860,10 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       }
 
       if (req.method === 'POST' && p === '/v1/chat/completions') return await handleOpenAIChat(req, res);
+      if (req.method === 'POST' && p === '/v1/messages') return await handleAnthropicMessages(req, res);
+      if (req.method === 'POST' && p === '/v1/messages/count_tokens') return await handleAnthropicCountTokens(req, res);
 
-      sendJson(res, 404, { error: { message: `Нет пути ${p}. Доступно: /v1/chat/completions, /v1/models, /v1/models/{id}, /v1beta/models, /v1beta/models/{m}:generateContent|streamGenerateContent|countTokens` } });
+      sendJson(res, 404, { error: { message: `Нет пути ${p}. Доступно: /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models, /v1/models/{id}, /v1beta/models, /v1beta/models/{m}:generateContent|streamGenerateContent|countTokens` } });
     } catch (e) {
       if (e && e.code === 'client_disconnected') {
         pushLog({ kind: 'http', status: 499, error: 'client disconnected' });

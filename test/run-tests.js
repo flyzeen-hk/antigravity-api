@@ -353,6 +353,121 @@ async function main() {
     assert.ok(j.id.startsWith('chatcmpl-ag-'));
   });
 
+  await ok('anthropic: /v1/messages non-stream -> текст, usage, stop_reason', async () => {
+    const r = await A('/v1/messages', 'POST', {
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 64,
+      system: 'ты — тест',
+      messages: [{ role: 'user', content: 'привет' }],
+    });
+    assert.strictEqual(r.status, 200, r.text);
+    const j = JSON.parse(r.text);
+    assert.strictEqual(j.type, 'message');
+    assert.strictEqual(j.role, 'assistant');
+    assert.match(j.id, /^msg_/);
+    assert.ok(j.content.some((b) => b.type === 'text' && b.text.includes('Привет')), JSON.stringify(j.content));
+    assert.strictEqual(j.stop_reason, 'end_turn');
+    assert.deepStrictEqual(j.usage, { input_tokens: 11, output_tokens: 7 });
+    // запрос ушёл в апстрим как обычный Gemini-запрос
+    assert.strictEqual(mockUp.state.lastBody.model, 'claude-sonnet-4-5-20250929');
+    assert.strictEqual(mockUp.state.lastBody.request.systemInstruction.parts[0].text, 'ты — тест');
+    assert.strictEqual(mockUp.state.lastBody.request.generationConfig.maxOutputTokens, 64);
+  });
+
+  await ok('anthropic: ключ принимается и как x-api-key', async () => {
+    const r = await api(PORT_API, 'POST', '/v1/messages', {
+      model: 'cloud/gemini-3-flash', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }],
+    }, { 'x-api-key': KEY, 'anthropic-version': '2023-06-01' });
+    assert.strictEqual(r.status, 200, r.text);
+    const bad = await api(PORT_API, 'POST', '/v1/messages', {
+      model: 'cloud/gemini-3-flash', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }],
+    }, { 'x-api-key': 'sk-ant-wrong' });
+    assert.strictEqual(bad.status, 401);
+  });
+
+  await ok('anthropic: стрим идёт событиями message_start -> delta -> message_stop', async () => {
+    const r = await A('/v1/messages', 'POST', {
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: 'user', content: 'привет' }],
+    });
+    assert.strictEqual(r.status, 200, r.text);
+    assert.match(r.text, /event: message_start/);
+    const events = r.text.split('\n\n').filter(Boolean).map((chunk) => {
+      const type = (chunk.match(/^event: (.+)$/m) || [])[1];
+      const data = (chunk.match(/^data: (.+)$/m) || [])[1];
+      return { type, data: data ? JSON.parse(data) : null };
+    });
+    const order = events.map((e) => e.type);
+    assert.strictEqual(order[0], 'message_start');
+    assert.ok(order.indexOf('content_block_delta') > 0);
+    assert.strictEqual(order[order.length - 2], 'message_delta');
+    assert.strictEqual(order[order.length - 1], 'message_stop');
+    const text = events.filter((e) => e.type === 'content_block_delta' && e.data.delta.type === 'text_delta')
+      .map((e) => e.data.delta.text).join('');
+    assert.strictEqual(text, 'Привет, мир');
+    // message_start уходит сразу, usage приходит с последним чанком апстрима
+    assert.strictEqual(events[0].data.message.usage.output_tokens, 0);
+    const delta = events[order.length - 2].data;
+    assert.strictEqual(delta.delta.stop_reason, 'end_turn');
+    assert.deepStrictEqual(delta.usage, { input_tokens: 11, output_tokens: 7 });
+  });
+
+  await ok('anthropic: tool_use в ответе + схема инструмента очищается', async () => {
+    const r = await A('/v1/messages', 'POST', {
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'CALL_TOOL' }],
+      tools: [{
+        name: 'get_weather',
+        description: 'погода',
+        input_schema: { $schema: 'http://json-schema.org/draft-07/schema#', additionalProperties: false, type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+      }],
+      tool_choice: { type: 'auto' },
+    });
+    assert.strictEqual(r.status, 200, r.text);
+    const j = JSON.parse(r.text);
+    const tool = j.content.find((b) => b.type === 'tool_use');
+    assert.ok(tool, JSON.stringify(j.content));
+    assert.strictEqual(tool.name, 'get_weather');
+    assert.deepStrictEqual(tool.input, { city: 'Москва' });
+    assert.strictEqual(j.stop_reason, 'tool_use');
+    const decl = mockUp.state.lastBody.request.tools[0].functionDeclarations[0];
+    assert.strictEqual(decl.parameters.$schema, undefined, '$schema вычищен');
+    assert.strictEqual(decl.parameters.additionalProperties, undefined, 'additionalProperties вычищен');
+    assert.strictEqual(mockUp.state.lastBody.request.toolConfig.functionCallingConfig.mode, 'AUTO');
+  });
+
+  await ok('anthropic: count_tokens и валидация входа', async () => {
+    const c = await A('/v1/messages/count_tokens', 'POST', {
+      model: 'claude-sonnet-4-5-20250929', messages: [{ role: 'user', content: 'привет мир' }],
+    });
+    assert.strictEqual(c.status, 200, c.text);
+    assert.ok(JSON.parse(c.text).input_tokens >= 1);
+
+    const noMax = await A('/v1/messages', 'POST', { model: 'claude-sonnet-4-5-20250929', messages: [{ role: 'user', content: 'x' }] });
+    assert.strictEqual(noMax.status, 400);
+    assert.strictEqual(JSON.parse(noMax.text).error.type, 'invalid_request_error');
+
+    const noMsg = await A('/v1/messages', 'POST', { model: 'claude-sonnet-4-5-20250929', max_tokens: 8 });
+    assert.strictEqual(noMsg.status, 400);
+
+    const noModel = await A('/v1/messages', 'POST', { max_tokens: 8, messages: [{ role: 'user', content: 'x' }] });
+    assert.strictEqual(noModel.status, 400);
+    assert.strictEqual(JSON.parse(noModel.text).type, 'error', 'ошибка в Anthropic-формате');
+  });
+
+  await ok('CORS: preflight OPTIONS отдаёт 204 и заголовки', async () => {
+    const r = await api(PORT_API, 'OPTIONS', '/v1/chat/completions', null, {
+      origin: 'http://localhost:3000',
+      'access-control-request-headers': 'authorization,content-type',
+    });
+    assert.strictEqual(r.status, 204);
+    assert.strictEqual(r.headers['access-control-allow-origin'], 'http://localhost:3000');
+    assert.match(String(r.headers['access-control-allow-headers']), /authorization/);
+  });
+
   await ok('chat/completions: перевод запроса (system, роли, параметры)', async () => {
     await A('/v1/chat/completions', 'POST', {
       model: 'cloud/echo-model',
