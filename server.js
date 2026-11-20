@@ -38,8 +38,14 @@ const agent = require('./lib/agent');
 const providers = require('./lib/providers');
 const planner = require('./lib/planner');
 const { stripBom, readJsonFile, writeFileAtomic, backupFile, restoreLatestBackup } = require('./lib/safe_files');
+const configLib = require('./lib/config');
+const { applyThinkingConfig } = require('./lib/thinking');
 
 const ROOT = __dirname;
+const ADMIN_KEY_FILE = 'admin.key';
+
+// Единственный источник истины по дефолтам — lib/config/defaults.js.
+const DEFAULT_CONFIG = configLib.DEFAULTS;
 
 // Санитизация текстов ошибок перед отправкой клиенту: прячем всё, что похоже
 // на токен/ключ (20+ символов букв/цифр) — в сообщениях апстрима могут быть
@@ -50,80 +56,14 @@ function redactSecrets(text) {
   ));
 }
 
-const DEFAULT_CONFIG = {
-  port: 8317,
-  host: '127.0.0.1', // '0.0.0.0' — доступ с других устройств локальной сети
-  upstreamHost: 'https://daily-cloudcode-pa.googleapis.com',
-  // Резервный хост: если primary недоступен по сети (DNS/TCP/TLS),
-  // запросы прозрачно уходят сюда. Практика сообщества: daily -> prod.
-  upstreamFallbackHost: 'https://cloudcode-pa.googleapis.com',
-  // Устаревшее поле: читается как fallback для network.dnsServers.
-  dnsServers: [],
-  // Единый сетевой слой: прокси, DNS-over-HTTPS, свои DNS-серверы.
-  // http(s):// и socks5:// прокси; пусто — прямое соединение/системный DNS.
-  network: {
-    proxy: '',
-    dohUrl: '',
-    dnsServers: [],
-    useEnvProxy: true,
-    timeoutMs: 30000,
-  },
-  userAgent: 'antigravity/1.11.4', // legacy value; start() upgrades it to the official client signature
-  apiKey: '', // генерируется автоматически при первом запуске (apikey.txt)
-  includeThoughts: false, // true — выдавать рассуждения моделей как reasoning_content
-  requestTimeoutMs: 600000,
-  retries: 2,
-  // Разблокировка моделей Gemini 4 через веб-шлюз Google
-  geminiWeb: {
-    enabled: true,
-    cookie: '', // cookie строка или путь к cookie.txt (открывает Gemini 4 Pro)
-    proxy: '',  // e.g. http://127.0.0.1:7890 (опционально)
-    bl: 'boq_assistant-bard-web-server_20260716.08_p0',
-    accountLabel: '', // подпись веб-аккаунта (напр. «личный Pro») — чтобы отличать от аккаунта Antigravity
-  },
-  // Опциональный Safe Mode guard (выключен по умолчанию, чтобы не создавать ложных блокировок)
-  safeMode: {
-    enabled: false,
-    maxRequestsPerMinute: 60,
-    maxRequestsPerHour: 600,
-    maxRequestsPerDay: 3000,
-    maxTokensPerDay: 50000000,
-    maxRequestsPerWeek: 20000,
-    maxTokensPerWeek: 200000000,
-    minIntervalMs: 200,
-    jitterMs: 100,
-    maxConcurrent: 4,
-    cooldownAfter429Ms: 30000,
-    maxCooldownMs: 300000,
-  },
-  // Встроенные агентные файловые инструменты (сервер сам исполняет tool_call
-  // модели над реальными файлами в песочнице workspace). Подробности: lib/agent.js
-  agent: { ...agent.DEFAULTS, planner: { ...planner.DEFAULT_SETTINGS } },
-};
-
-// Миграция конфига в памяти (файл не перезаписываем: в нём живая cookie):
-// - legacy agent.autoAgent удаляется и ничего не включает;
-// - agent.allowWebAgent — только явный true;
-// - agent.planner дополняется дефолтами.
-function normalizeConfig(config) {
-  const a = config.agent && typeof config.agent === 'object' ? config.agent : {};
-  const normalized = { ...agent.DEFAULTS, ...a };
-  delete normalized.autoAgent;
-  normalized.allowWebAgent = a.allowWebAgent === true;
-  normalized.planner = {
-    ...planner.DEFAULT_SETTINGS,
-    ...(a.planner && typeof a.planner === 'object' ? a.planner : {}),
-  };
-  config.agent = normalized;
-  return config;
-}
-
-function isPlainObject(v) {
-  return !!v && typeof v === 'object' && !Array.isArray(v);
-}
+const isPlainObject = configLib.isPlainObject;
 
 function newApiKey() {
   return 'agk_' + crypto.randomBytes(24).toString('hex');
+}
+
+function newAdminKey() {
+  return 'agadm_' + crypto.randomBytes(24).toString('hex');
 }
 
 function readKeyFile(file) {
@@ -135,6 +75,27 @@ function readKeyFile(file) {
   }
 }
 
+// Два секрета с разными правами:
+//   apiKey   — то, что получает клиент моделей (Cursor/Cline/скрипты). Только /v1*.
+//   adminKey — то, что защищает /_* и HTML-дашборд. Клиентам НЕ выдаётся:
+//              иначе один ключ позволяет переписать proxy/config (а через proxy
+//              увести OAuth-токен Google для cloud-пути).
+function ensureAdminKey(root, config) {
+  const file = path.join(root, ADMIN_KEY_FILE);
+  const kept = readKeyFile(file);
+  if (!config.adminKey) config.adminKey = kept.length >= 16 ? kept : newAdminKey();
+  if (kept !== config.adminKey) {
+    backupFile(file);
+    writeFileAtomic(file, config.adminKey + '\n');
+  }
+  return config;
+}
+
+function persistConfig(file, config) {
+  backupFile(file);
+  writeFileAtomic(file, JSON.stringify(config, null, 2));
+}
+
 // config.json — источник истины для ключа; apikey.txt — его копия для людей и панели.
 function loadConfig(root = ROOT) {
   const file = path.join(root, 'config.json');
@@ -142,13 +103,14 @@ function loadConfig(root = ROOT) {
   if (!fs.existsSync(file)) {
     // apikey.txt пережил удаление config.json — оставляем ключ, чтобы клиенты не сломались.
     const kept = readKeyFile(keyFile);
-    const cfg = normalizeConfig({ ...DEFAULT_CONFIG, apiKey: kept.length >= 16 ? kept : newApiKey() });
-    writeFileAtomic(file, JSON.stringify(cfg, null, 2));
-    if (kept !== cfg.apiKey) {
+    const { config } = configLib.normalize({ apiKey: kept.length >= 16 ? kept : newApiKey() });
+    ensureAdminKey(root, config);
+    writeFileAtomic(file, JSON.stringify(config, null, 2));
+    if (kept !== config.apiKey) {
       backupFile(keyFile);
-      writeFileAtomic(keyFile, cfg.apiKey + '\n');
+      writeFileAtomic(keyFile, config.apiKey + '\n');
     }
-    return { config: cfg, created: true };
+    return { config, created: true, warnings: [] };
   }
   let raw;
   try {
@@ -162,24 +124,31 @@ function loadConfig(root = ROOT) {
     console.warn(`  ! config.json был повреждён (${e.message}) — восстановлен из backups/${path.basename(restored.from)}`);
     raw = restored.data;
   }
-  const config = normalizeConfig({
-    ...DEFAULT_CONFIG,
-    ...raw,
-    // Панель показывает эти значения как текущие — без слияния Guard молча
-    // подставил бы свои, более строгие.
-    safeMode: { ...DEFAULT_CONFIG.safeMode, ...(isPlainObject(raw.safeMode) ? raw.safeMode : {}) },
-  });
+
+  const { config, warnings } = configLib.normalize(raw);
+  let dirty = warnings.length > 0 || Number(raw.configVersion) !== configLib.CONFIG_VERSION;
+
   if (!config.apiKey) {
     const kept = readKeyFile(keyFile);
     config.apiKey = kept.length >= 16 ? kept : newApiKey();
-    backupFile(file);
-    writeFileAtomic(file, JSON.stringify({ ...raw, apiKey: config.apiKey }, null, 2));
+    dirty = true;
   }
+  const keptAdmin = readKeyFile(path.join(root, ADMIN_KEY_FILE));
+  if (!config.adminKey) {
+    config.adminKey = keptAdmin.length >= 16 ? keptAdmin : newAdminKey();
+    dirty = true;
+  }
+  ensureAdminKey(root, config);
+
+  // Миграции/докидывание ключа сохраняем сразу: иначе каждый старт будет
+  // повторять одну и ту же миграцию на старом файле.
+  if (dirty) persistConfig(file, config);
+
   if (readKeyFile(keyFile) !== config.apiKey) {
     backupFile(keyFile);
     writeFileAtomic(keyFile, config.apiKey + '\n');
   }
-  return { config, created: false };
+  return { config, created: false, warnings };
 }
 
 const CLOUD_CODE_CL = '1003475615';
@@ -503,22 +472,60 @@ function start(config) {
     return '';
   };
 
-  const MAX_BODY_BYTES = 64 * 1024 * 1024;
+  // 16 МБ достаточно для чата с base64-картинками; 64 МБ давали пик памяти
+  // ~128 МБ на запрос (Buffer.concat + toString) и не приносили пользы.
+  const MAX_BODY_BYTES = Number(process.env.AG_MAX_BODY_BYTES) > 0
+    ? Number(process.env.AG_MAX_BODY_BYTES) : 16 * 1024 * 1024;
+  const MB = (n) => `${Math.round(n / (1024 * 1024))} МБ`;
+
+  function bodyTooLargeError() {
+    const err = new Error(`Тело запроса больше ${MB(MAX_BODY_BYTES)}`);
+    err.status = 413;
+    err.code = 'body_too_large';
+    return err;
+  }
+
+  // Сбросить остаток отклонённого тела, не убивая сокет мгновенно.
+  // Если оборвать соединение с непрочитанными входящими данными, ядро отвечает
+  // RST и уже отправленный 413 может потеряться на стороне клиента.
+  // Поэтому дочитываем и выбрасываем — но только до потолка и с таймаутом.
+  function drainRejectedBody(req) {
+    const cap = MAX_BODY_BYTES * 2;
+    let extra = 0;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      req.removeListener('data', onData);
+      try { req.destroy(); } catch {}
+    };
+    const onData = (chunk) => {
+      extra += chunk.length;
+      if (extra > cap) finish();
+    };
+    const timer = setTimeout(finish, 2000);
+    if (timer.unref) timer.unref();
+    req.on('data', onData);
+    req.once('end', finish);
+    req.once('error', finish);
+    req.resume();
+  }
 
   async function readBody(req) {
+    // Content-Length известен заранее — нет повода прочитать 16 МБ ради отказа.
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) throw bodyTooLargeError();
+
     const chunks = [];
     let size = 0;
     for await (const c of req) {
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        // Дальше читать незачем: клиент должен получить 413, а не обрыв соединения.
-        const err = new Error(`Тело запроса больше ${MAX_BODY_BYTES / (1024 * 1024)} МБ`);
-        err.status = 413;
-        err.code = 'body_too_large';
-        // Остаток тела не сливаем: без сброса соединения клиент продолжает
-        // слать данные, а Node держит их в памяти сколько придётся.
-        req.destroy();
-        throw err;
+        // Никакого req.destroy() здесь: он убивает сокет и клиент получает RST
+        // вместо диагностики. Оборвёт соединение readBodyOrRespond после ответа.
+        req.pause();
+        throw bodyTooLargeError();
       }
       chunks.push(c);
     }
@@ -526,41 +533,76 @@ function start(config) {
   }
 
   // Чтение тела с ответом клиенту: 413 при превышении лимита, 400 при обрыве.
+  // 413 уходит ДО закрытия сокета, поэтому клиент видит JSON, а не «socket hang up».
   async function readBodyOrRespond(req, res) {
     try {
       return { ok: true, raw: await readBody(req) };
     } catch (err) {
       const tooLarge = err && err.status === 413;
-      sendApiError(res, tooLarge ? 413 : 400, {
-        error: {
-          message: tooLarge
-            ? `Тело запроса больше ${MAX_BODY_BYTES / (1024 * 1024)} МБ. Сократите сообщение или вложения.`
-            : 'Не удалось прочитать тело запроса (соединение оборвано).',
-          type: 'invalid_request_error',
-          code: tooLarge ? 'body_too_large' : 'body_read_failed',
-        },
-      });
+      const status = tooLarge ? 413 : 400;
+      const payload = JSON.stringify({ error: {
+        message: tooLarge
+          ? `Тело запроса больше ${MB(MAX_BODY_BYTES)}. Сократите сообщение или вложения.`
+          : 'Не удалось прочитать тело запроса (соединение оборвано).',
+        type: 'invalid_request_error',
+        code: tooLarge ? 'body_too_large' : 'body_read_failed',
+      } });
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(status, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': Buffer.byteLength(payload),
+          ...(tooLarge ? { connection: 'close' } : {}),
+        });
+        res.end(payload);
+        if (tooLarge) drainRejectedBody(req);
+      }
       return { ok: false };
     }
   }
 
+  // Сравнение ключей без тайминг-утечки (длина + timingSafeEqual).
+  function keyEquals(given, expected) {
+    if (!expected) return false;
+    const a = Buffer.from(String(given || ''), 'utf8');
+    const b = Buffer.from(String(expected), 'utf8');
+    if (a.length !== b.length) return false;
+    try { return crypto.timingSafeEqual(a, b); } catch { return false; }
+  }
+
+  function presentedKeys(req) {
+    const bearer = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    let query = '';
+    try { query = new URL(req.url, 'http://localhost').searchParams.get('key') || ''; } catch {}
+    return [bearer, req.headers['x-goog-api-key'], req.headers['x-api-key'], req.headers['x-admin-key'], query];
+  }
+
+  // Ключ клиентов моделей: только /v1*.
   function authOk(req) {
     // Authorization: Bearer <key> — основной способ (OpenAI-совместимость).
     // x-goog-api-key и ?key= — для Gemini SDK (google-generativeai и т.п.).
-    const h = req.headers.authorization || '';
-    if (h === 'Bearer ' + config.apiKey) return true;
-    if (req.headers['x-goog-api-key'] === config.apiKey) return true;
-    try {
-      const u = new URL(req.url, 'http://localhost');
-      return u.searchParams.get('key') === config.apiKey;
-    } catch {
-      return false;
-    }
+    return presentedKeys(req).some((k) => keyEquals(k, config.apiKey));
+  }
+
+  // Админский ключ: /_* и HTML-дашборд. В тестах/кастомных запусках adminKey
+  // может отсутствовать — тогда допускаем apiKey (так работают фикстуры).
+  function adminOk(req) {
+    const expected = config.adminKey || config.apiKey;
+    return presentedKeys(req).some((k) => keyEquals(k, expected));
+  }
+
+  // Чтение состояния: доступно обоим ключам (не даёт менять конфиг).
+  function statusOk(req) {
+    return adminOk(req) || authOk(req);
   }
 
   function unauthorized(res) {
     res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer' });
     res.end(JSON.stringify({ error: { message: 'Неверный API-ключ. Возьми его из apikey.txt', type: 'invalid_request_error' } }));
+  }
+
+  function forbidden(res, code, message) {
+    res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: { message, type: 'permission_error', code } }));
   }
 
   async function upstreamErrorToClient(res, upRes) {
@@ -575,7 +617,7 @@ function start(config) {
   async function handleDiagnosticChat(req, res) {
     const t0 = Date.now();
     try {
-      if (!authOk(req)) {
+      if (!statusOk(req)) {
         throw diagnosticError(401, 'invalid_api_key', 'Неверный или отсутствующий ключ приложения. Проверьте Authorization: Bearer и актуальный ключ в apikey.txt.', 'auth');
       }
       if (req.method !== 'POST') {
@@ -585,7 +627,7 @@ function start(config) {
       let raw;
       try { raw = await readBody(req); }
       catch {
-        throw diagnosticError(413, 'body_read_failed', 'Не удалось прочитать тело запроса или превышен лимит 64 МБ. Сократите сообщение и отправьте JSON повторно.', 'validation');
+        throw diagnosticError(413, 'body_read_failed', `Не удалось прочитать тело запроса или превышен лимит ${MB(MAX_BODY_BYTES)}. Сократите сообщение и отправьте JSON повторно.`, 'validation');
       }
       let body;
       try { body = JSON.parse(raw); }
@@ -684,11 +726,15 @@ function start(config) {
   // config.json — из тела запроса их включить нельзя.
   function agentConfigFor(body) {
     const req = body && body.agent && typeof body.agent === 'object' ? body.agent : {};
-    const SAFE_REQ_KEYS = ['workspaceRoot', 'maxIterations', 'maxReadBytes', 'maxWriteBytes', 'maxListEntries', 'shellTimeoutMs', 'auditFile', 'auditRotateBytes'];
     const cfg = { ...agent.DEFAULTS, ...(config.agent || {}) };
-    for (const k of SAFE_REQ_KEYS) {
-      if (req[k] !== undefined) cfg[k] = req[k];
-    }
+    // auditFile/auditRotateBytes и опасные флаги НЕ принимаются из тела запроса:
+    // путь журнала из запроса — это запись в произвольный файл в обход песочницы.
+    if (typeof req.workspaceRoot === 'string' && req.workspaceRoot.trim()) cfg.workspaceRoot = req.workspaceRoot.trim();
+    if (req.maxIterations !== undefined) cfg.maxIterations = configLib.clampNumber(req.maxIterations, 1, 24, cfg.maxIterations);
+    if (req.maxReadBytes !== undefined) cfg.maxReadBytes = configLib.clampNumber(req.maxReadBytes, 1024, 1024 * 1024, cfg.maxReadBytes);
+    if (req.maxWriteBytes !== undefined) cfg.maxWriteBytes = configLib.clampNumber(req.maxWriteBytes, 1024, 8 * 1024 * 1024, cfg.maxWriteBytes);
+    if (req.maxListEntries !== undefined) cfg.maxListEntries = configLib.clampNumber(req.maxListEntries, 1, 5000, cfg.maxListEntries);
+    if (req.shellTimeoutMs !== undefined) cfg.shellTimeoutMs = configLib.clampNumber(req.shellTimeoutMs, 1000, 600000, cfg.shellTimeoutMs);
     cfg.allowDelete = !!(config.agent && config.agent.allowDelete);
     cfg.allowShell = !!(config.agent && config.agent.allowShell);
     cfg.allowAbsolutePaths = !!(config.agent && config.agent.allowAbsolutePaths);
@@ -1504,9 +1550,14 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       if (p === '/_health') return sendJson(res, 200, { ok: true, uptime: process.uptime() });
       if (p === '/api/diagnostics/chat') return await handleDiagnosticChat(req, res);
 
-      if (!authOk(req)) return unauthorized(res);
+      if (!statusOk(req)) return unauthorized(res);
 
       if (p === '/' || p === '/_status') {
+        // Дашборд — административная поверхность: клиентский API-ключ
+        // (он лежит у Cursor/Cline/любого скрипта) в панель не пускаем.
+        if (p === '/' && !adminOk(req)) {
+          return forbidden(res, 'admin_key_required', 'HTML-дашборд доступен только с админским ключом (admin.key). Клиентский API-ключ не даёт доступа к панели.');
+        }
         const s = {
           startedAt: stats.startedAt,
           requests: stats.requests,
@@ -1570,73 +1621,52 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       }
 
       if (req.method === 'POST' && p === '/_config') {
-        let parsed = {};
+        if (!adminOk(req)) {
+          return forbidden(res, 'admin_key_required', 'Изменение настроек доступно только с админским ключом (admin.key). Клиентский API-ключ даёт доступ только к /v1*.');
+        }
         const readCfg = await readBodyOrRespond(req, res);
         if (!readCfg.ok) return;
+        let parsed;
         try {
           parsed = parseRequestBody(readCfg.raw);
         } catch {
           return sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
         }
-        if (parsed.safeMode && typeof parsed.safeMode === 'object') {
-          guard.updateConfig(parsed.safeMode);
-          config.safeMode = { ...(config.safeMode || {}), ...parsed.safeMode };
-        }
-        if (parsed.geminiWeb && typeof parsed.geminiWeb === 'object') {
-          webBridge.updateConfig(parsed.geminiWeb);
-          config.geminiWeb = { ...(config.geminiWeb || {}), ...parsed.geminiWeb };
-        }
-        if (parsed.network && typeof parsed.network === 'object') {
-          config.network = { ...(config.network || {}), ...parsed.network };
-        }
-        if (parsed.agent && typeof parsed.agent === 'object') {
-          // Исполнитель создаётся на каждый запрос — изменения применяются сразу.
-          const prev = config.agent && typeof config.agent === 'object' ? config.agent : {};
-          const incoming = { ...parsed.agent };
-          if (incoming.planner && typeof incoming.planner === 'object') {
-            incoming.planner = { ...planner.DEFAULT_SETTINGS, ...(prev.planner || {}), ...incoming.planner };
-          } else {
-            delete incoming.planner;
-          }
-          config.agent = { ...agent.DEFAULTS, ...prev, ...incoming };
-          delete config.agent.autoAgent;
-          config.agent.allowWebAgent = config.agent.allowWebAgent === true;
-          config.agent.planner = { ...planner.DEFAULT_SETTINGS, ...(prev.planner || {}), ...(incoming.planner || {}) };
-        }
-        if (Array.isArray(parsed.dnsServers)) {
-          config.dnsServers = parsed.dnsServers;
-        }
-        if (parsed.network || parsed.geminiWeb || Array.isArray(parsed.dnsServers)) {
-          network.updateConfig(config);
-        }
-        if (parsed.safeMode || parsed.geminiWeb || parsed.network || parsed.agent || Array.isArray(parsed.dnsServers)) {
-          // не пишем config.json в тестовом окружении (persistConfig: false)
-          if (config.persistConfig !== false) {
+
+        // Белый список полей: опасные флаги агента (allowDelete/allowShell/
+        // allowAbsolutePaths/auditFile) и секреты не принимаются из HTTP никогда.
+        const patch = configLib.patchConfig(config, parsed);
+        Object.assign(config, patch.config);
+
+        // Применяем к живым объектам. Исполнитель агента создаётся на каждый
+        // запрос, поэтому его настройки подхватываются сами.
+        guard.updateConfig(config.safeMode);
+        webBridge.updateConfig(config.geminiWeb);
+        network.updateConfig(config);
+
+        if (config.persistConfig !== false && patch.applied.length) {
+          // В файл пишем нормализованный конфиг целиком: миграции и дефолты не
+          // теряются, неизвестные ключи сохраняются (deepMerge в lib/config).
+          // apiKey/adminKey живут в этом же объекте, поэтому не пропадают.
+          try {
             const cfgPath = path.join(ROOT, 'config.json');
-            try {
-              const current = fs.existsSync(cfgPath) ? readJsonFile(cfgPath) : {};
-              if (parsed.safeMode) current.safeMode = { ...(current.safeMode || {}), ...parsed.safeMode };
-              if (parsed.geminiWeb) current.geminiWeb = { ...(current.geminiWeb || {}), ...parsed.geminiWeb };
-              if (parsed.network) current.network = { ...(current.network || {}), ...parsed.network };
-              if (parsed.agent) {
-                const prev = current.agent && typeof current.agent === 'object' ? current.agent : {};
-                const next = { ...prev, ...parsed.agent };
-                delete next.autoAgent;
-                if (parsed.agent.planner && typeof parsed.agent.planner === 'object') {
-                  next.planner = { ...planner.DEFAULT_SETTINGS, ...(prev.planner || {}), ...parsed.agent.planner };
-                }
-                next.allowWebAgent = next.allowWebAgent === true;
-                current.agent = next;
-              }
-              if (Array.isArray(parsed.dnsServers)) current.dnsServers = parsed.dnsServers;
-              backupFile(cfgPath);
-              writeFileAtomic(cfgPath, JSON.stringify(current, null, 2));
-            } catch (e) {
-              console.error('Failed to save config.json:', e);
-            }
+            backupFile(cfgPath);
+            writeFileAtomic(cfgPath, JSON.stringify(config, null, 2));
+          } catch (e) {
+            console.error('Failed to save config.json:', e);
+            return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${e.message}`, type: 'internal_error' } });
           }
         }
-        const reply = { ok: true, safeMode: guard.cfg, network: network.summary() };
+
+        const reply = {
+          ok: true,
+          applied: patch.applied,
+          ignored: patch.ignored,
+          warnings: patch.warnings,
+          restartRequired: patch.ignored.filter((k) => /allowDelete|allowShell|allowAbsolutePaths|auditFile/.test(k)),
+          safeMode: guard.cfg,
+          network: network.summary(),
+        };
         if (webBridge.summary) reply.geminiWeb = webBridge.summary();
         return sendJson(res, 200, reply);
       }

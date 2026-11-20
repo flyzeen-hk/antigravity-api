@@ -1114,8 +1114,8 @@ async function main() {
   });
 
   await ok('413: тело больше лимита -> понятный ответ, а не обрыв', async () => {
-    // 64 МБ + 1 МБ строится виртуально; Content-Length честный.
-    const total = 64 * 1024 * 1024 + 1024 * 1024;
+    // 17 МБ строится виртуально; Content-Length честный (лимит шлюза — 16 МБ).
+    const total = 17 * 1024 * 1024;
     const head = '{"model":"cloud/echo-model","messages":[{"role":"user","content":"';
     const tail = '"}]}';
     const filler = new ArrayBuffer(1024 * 1024);
@@ -1131,8 +1131,10 @@ async function main() {
         res.on('end', () => finish({ status: res.statusCode, text: Buffer.concat(ch).toString('utf8') }));
         res.on('error', () => finish({ status: 0 }));
       });
-      req.on('error', () => finish({ status: -1 }));
-      // Сервер сбросит соединение, как только превысит лимит — не ждём ответа вечно.
+      // Ответ 413 сервер пишет сразу (content-length известен), но следом
+      // закрывает сокет — клиент может увидеть и «response», и «error».
+      // Даём ответу фору, чтобы тест не зависел от гонки: только потом -1.
+      req.on('error', () => setTimeout(() => finish({ status: -1 }), 1500));
       const timer = setTimeout(() => { req.destroy(); }, 8000);
       req.on('close', () => clearTimeout(timer));
       req.write(head);
@@ -1148,13 +1150,12 @@ async function main() {
       };
       pump();
     });
-    // Либо явный 413, либо сброс сокета после ответа — но не зависание и не падение.
-    assert.ok(r.status === 413 || r.status === 0 || r.status === -1, 'status ' + r.status);
-    if (r.status === 413) {
-      const j = JSON.parse(r.text);
-      assert.strictEqual(j.error.code, 'body_too_large');
-      assert.match(j.error.message, /64 МБ/);
-    }
+    // Клиент обязан получить именно 413 с кодом body_too_large: раньше сервер
+    // уничтожал сокет, и клиент видел «socket hang up» (status 0/-1).
+    assert.strictEqual(r.status, 413, 'ожидался 413, получено: ' + r.status);
+    const j = JSON.parse(r.text);
+    assert.strictEqual(j.error.code, 'body_too_large');
+    assert.match(j.error.message, /МБ/);
   });
 
   await ok('отмена: клиент отключается во время стрима -> апстрим обрывается, в лог 499', async () => {
