@@ -1,13 +1,14 @@
 {
   "name": "antigravity-api",
-  "version": "1.0.0",
+  "version": "1.2.1",
   "description": "Turn your Google Antigravity account into a full OpenAI/Gemini-compatible API key (local gateway to daily-cloudcode-pa.googleapis.com)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "key": "node server.js key",
     "models": "node server.js models",
-    "test": "node test/all.js"
+    "test": "node test/all.js",
+    "test:unit": "node test/test_models.js && node test/agent_tools_test.js && node test/test_translate.js && node test/test_web_bridge.js"
   },
   "engines": {
     "node": ">=18"

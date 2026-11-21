@@ -38,8 +38,18 @@ const agent = require('./lib/agent');
 const providers = require('./lib/providers');
 const planner = require('./lib/planner');
 const { stripBom, readJsonFile, writeFileAtomic, backupFile, restoreLatestBackup } = require('./lib/safe_files');
+const configLib = require('./lib/config');
+const { applyThinkingConfig } = require('./lib/thinking');
+const anthropic = require('./lib/anthropic');
 
-const ROOT = __dirname;
+const ROOT = __dirname; // код
+// Данные (config.json, apikey.txt, auth.json, usage.json, backups/) можно
+// вынести из папки с кодом: нужно для Docker, где /app только для чтения.
+const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT;
+const ADMIN_KEY_FILE = 'admin.key';
+
+// Единственный источник истины по дефолтам — lib/config/defaults.js.
+const DEFAULT_CONFIG = configLib.DEFAULTS;
 
 // Санитизация текстов ошибок перед отправкой клиенту: прячем всё, что похоже
 // на токен/ключ (20+ символов букв/цифр) — в сообщениях апстрима могут быть
@@ -50,80 +60,14 @@ function redactSecrets(text) {
   ));
 }
 
-const DEFAULT_CONFIG = {
-  port: 8317,
-  host: '127.0.0.1', // '0.0.0.0' — доступ с других устройств локальной сети
-  upstreamHost: 'https://daily-cloudcode-pa.googleapis.com',
-  // Резервный хост: если primary недоступен по сети (DNS/TCP/TLS),
-  // запросы прозрачно уходят сюда. Практика сообщества: daily -> prod.
-  upstreamFallbackHost: 'https://cloudcode-pa.googleapis.com',
-  // Устаревшее поле: читается как fallback для network.dnsServers.
-  dnsServers: [],
-  // Единый сетевой слой: прокси, DNS-over-HTTPS, свои DNS-серверы.
-  // http(s):// и socks5:// прокси; пусто — прямое соединение/системный DNS.
-  network: {
-    proxy: '',
-    dohUrl: '',
-    dnsServers: [],
-    useEnvProxy: true,
-    timeoutMs: 30000,
-  },
-  userAgent: 'antigravity/1.11.4', // legacy value; start() upgrades it to the official client signature
-  apiKey: '', // генерируется автоматически при первом запуске (apikey.txt)
-  includeThoughts: false, // true — выдавать рассуждения моделей как reasoning_content
-  requestTimeoutMs: 600000,
-  retries: 2,
-  // Разблокировка моделей Gemini 4 через веб-шлюз Google
-  geminiWeb: {
-    enabled: true,
-    cookie: '', // cookie строка или путь к cookie.txt (открывает Gemini 4 Pro)
-    proxy: '',  // e.g. http://127.0.0.1:7890 (опционально)
-    bl: 'boq_assistant-bard-web-server_20260716.08_p0',
-    accountLabel: '', // подпись веб-аккаунта (напр. «личный Pro») — чтобы отличать от аккаунта Antigravity
-  },
-  // Опциональный Safe Mode guard (выключен по умолчанию, чтобы не создавать ложных блокировок)
-  safeMode: {
-    enabled: false,
-    maxRequestsPerMinute: 60,
-    maxRequestsPerHour: 600,
-    maxRequestsPerDay: 3000,
-    maxTokensPerDay: 50000000,
-    maxRequestsPerWeek: 20000,
-    maxTokensPerWeek: 200000000,
-    minIntervalMs: 200,
-    jitterMs: 100,
-    maxConcurrent: 4,
-    cooldownAfter429Ms: 30000,
-    maxCooldownMs: 300000,
-  },
-  // Встроенные агентные файловые инструменты (сервер сам исполняет tool_call
-  // модели над реальными файлами в песочнице workspace). Подробности: lib/agent.js
-  agent: { ...agent.DEFAULTS, planner: { ...planner.DEFAULT_SETTINGS } },
-};
-
-// Миграция конфига в памяти (файл не перезаписываем: в нём живая cookie):
-// - legacy agent.autoAgent удаляется и ничего не включает;
-// - agent.allowWebAgent — только явный true;
-// - agent.planner дополняется дефолтами.
-function normalizeConfig(config) {
-  const a = config.agent && typeof config.agent === 'object' ? config.agent : {};
-  const normalized = { ...agent.DEFAULTS, ...a };
-  delete normalized.autoAgent;
-  normalized.allowWebAgent = a.allowWebAgent === true;
-  normalized.planner = {
-    ...planner.DEFAULT_SETTINGS,
-    ...(a.planner && typeof a.planner === 'object' ? a.planner : {}),
-  };
-  config.agent = normalized;
-  return config;
-}
-
-function isPlainObject(v) {
-  return !!v && typeof v === 'object' && !Array.isArray(v);
-}
+const isPlainObject = configLib.isPlainObject;
 
 function newApiKey() {
   return 'agk_' + crypto.randomBytes(24).toString('hex');
+}
+
+function newAdminKey() {
+  return 'agadm_' + crypto.randomBytes(24).toString('hex');
 }
 
 function readKeyFile(file) {
@@ -135,20 +79,55 @@ function readKeyFile(file) {
   }
 }
 
+// Два секрета с разными правами:
+//   apiKey   — то, что получает клиент моделей (Cursor/Cline/скрипты). Только /v1*.
+//   adminKey — то, что защищает /_* и HTML-дашборд. Клиентам НЕ выдаётся:
+//              иначе один ключ позволяет переписать proxy/config (а через proxy
+//              увести OAuth-токен Google для cloud-пути).
+function ensureAdminKey(root, config) {
+  const file = path.join(root, ADMIN_KEY_FILE);
+  const kept = readKeyFile(file);
+  if (!config.adminKey) config.adminKey = kept.length >= 16 ? kept : newAdminKey();
+  if (kept !== config.adminKey) {
+    backupFile(file);
+    writeFileAtomic(file, config.adminKey + '\n');
+  }
+  return config;
+}
+
+function persistConfig(file, config) {
+  backupFile(file);
+  writeFileAtomic(file, JSON.stringify(config, null, 2));
+}
+
+// Порт/адрес из окружения действуют только на текущий запуск и НЕ попадают в
+// config.json: иначе том «залипает» на 0.0.0.0 после первого docker compose up.
+function envListen(config) {
+  const rawPort = process.env.AG_PORT;
+  const envPort = Number(rawPort);
+  const port = rawPort && Number.isFinite(envPort) && envPort > 0 && envPort < 65536
+    ? Math.round(envPort) : config.port;
+  const host = (process.env.AG_HOST || '').trim() || config.host;
+  return { port, host };
+}
+
 // config.json — источник истины для ключа; apikey.txt — его копия для людей и панели.
 function loadConfig(root = ROOT) {
+  // В Docker данные живут в отдельном томе — его может ещё не быть.
+  try { fs.mkdirSync(root, { recursive: true }); } catch {}
   const file = path.join(root, 'config.json');
   const keyFile = path.join(root, 'apikey.txt');
   if (!fs.existsSync(file)) {
     // apikey.txt пережил удаление config.json — оставляем ключ, чтобы клиенты не сломались.
     const kept = readKeyFile(keyFile);
-    const cfg = normalizeConfig({ ...DEFAULT_CONFIG, apiKey: kept.length >= 16 ? kept : newApiKey() });
-    writeFileAtomic(file, JSON.stringify(cfg, null, 2));
-    if (kept !== cfg.apiKey) {
+    const { config } = configLib.normalize({ apiKey: kept.length >= 16 ? kept : newApiKey() });
+    ensureAdminKey(root, config);
+    writeFileAtomic(file, JSON.stringify(config, null, 2));
+    if (kept !== config.apiKey) {
       backupFile(keyFile);
-      writeFileAtomic(keyFile, cfg.apiKey + '\n');
+      writeFileAtomic(keyFile, config.apiKey + '\n');
     }
-    return { config: cfg, created: true };
+    return { config, created: true, warnings: [] };
   }
   let raw;
   try {
@@ -162,24 +141,31 @@ function loadConfig(root = ROOT) {
     console.warn(`  ! config.json был повреждён (${e.message}) — восстановлен из backups/${path.basename(restored.from)}`);
     raw = restored.data;
   }
-  const config = normalizeConfig({
-    ...DEFAULT_CONFIG,
-    ...raw,
-    // Панель показывает эти значения как текущие — без слияния Guard молча
-    // подставил бы свои, более строгие.
-    safeMode: { ...DEFAULT_CONFIG.safeMode, ...(isPlainObject(raw.safeMode) ? raw.safeMode : {}) },
-  });
+
+  const { config, warnings } = configLib.normalize(raw);
+  let dirty = warnings.length > 0 || Number(raw.configVersion) !== configLib.CONFIG_VERSION;
+
   if (!config.apiKey) {
     const kept = readKeyFile(keyFile);
     config.apiKey = kept.length >= 16 ? kept : newApiKey();
-    backupFile(file);
-    writeFileAtomic(file, JSON.stringify({ ...raw, apiKey: config.apiKey }, null, 2));
+    dirty = true;
   }
+  const keptAdmin = readKeyFile(path.join(root, ADMIN_KEY_FILE));
+  if (!config.adminKey) {
+    config.adminKey = keptAdmin.length >= 16 ? keptAdmin : newAdminKey();
+    dirty = true;
+  }
+  ensureAdminKey(root, config);
+
+  // Миграции/докидывание ключа сохраняем сразу: иначе каждый старт будет
+  // повторять одну и ту же миграцию на старом файле.
+  if (dirty) persistConfig(file, config);
+
   if (readKeyFile(keyFile) !== config.apiKey) {
     backupFile(keyFile);
     writeFileAtomic(keyFile, config.apiKey + '\n');
   }
-  return { config, created: false };
+  return { config, created: false, warnings };
 }
 
 const CLOUD_CODE_CL = '1003475615';
@@ -280,17 +266,40 @@ class Upstream {
     });
   }
 
-  // генерация с одним автоматическим retry после refresh (401/403/смена токена)
+  // Генерация с одним повтором после обновления токена.
+  // Повторяем только «токенные» 401/403: у постоянного 403 (нет доступа к
+  // модели/проекту) второй запрос ничего не даст, только удвоит расход.
   async generateWithRetry(model, requestObj, { signal } = {}) {
-    let res = await this.generateContent(model, requestObj, { signal });
-    if (res.status === 401 || res.status === 403) {
-      // токен мог отозваться — принудительно обновим и попробуем ещё раз
-      this.tokens.accessToken = '';
-      this.tokens.expiresAt = 0;
-      this.refreshCount++;
-      res = await this.generateContent(model, requestObj, { signal });
+    const res = await this.generateContent(model, requestObj, { signal });
+    if (res.status !== 401 && res.status !== 403) return res;
+
+    let body = '';
+    try { body = await res.text(); } catch {}
+    const tokenIssue = res.status === 401
+      || /invalid_grant|access_token|token.*expired|expired.*token|unauthenticated|invalid credentials|login required/i.test(body);
+    if (!tokenIssue) {
+      // Тело уже прочитано — отдаём его вызывающему повторно без второго запроса.
+      return Object.assign({}, res, {
+        text: async () => body,
+        json: async () => JSON.parse(body),
+      });
     }
-    return res;
+
+    // Один refresh на всех: параллельные запросы не должны дёргать OAuth каждый сам.
+    if (!this._refreshPromise) {
+      this._refreshPromise = (async () => {
+        this.tokens.accessToken = '';
+        this.tokens.expiresAt = 0;
+        this.refreshCount++;
+        try {
+          await this.tokens.getAccessToken();
+        } finally {
+          this._refreshPromise = null;
+        }
+      })();
+    }
+    await this._refreshPromise;
+    return this.generateContent(model, requestObj, { signal });
   }
 
   // Информация об аккаунте (tier/проект/регион) — кэш 5 минут, best-effort.
@@ -379,12 +388,22 @@ class Upstream {
 
 function start(config) {
   config.userAgent = resolveCloudCodeUserAgent(config.userAgent);
+  // В контейнере том может быть смонтирован root'ом: без записи сервер упадёт
+  // позже и непонятно где. Лучше сказать прямо при старте.
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.accessSync(DATA_DIR, fs.constants.W_OK);
+  } catch (e) {
+    console.error(`\n  ! Каталог данных ${DATA_DIR} недоступен для записи: ${e.message}`);
+    console.error('    В Docker: chown -R 1000:1000 ./data (или user: "1000:1000" в compose).\n');
+    process.exit(1);
+  }
   // dns.setServers affects dns.resolve*, not fetch()/getaddrinfo. The network
   // layer supplies a real lookup for proxied and custom-DNS transports.
   const network = new NetworkManager(config);
   // Ищем локальный relay (AGUnlocker) сразу, не дожидаясь первого cloud-запроса.
   if (network.autoDetect) network.autoDetect();
-  const authFile = process.env.AG_AUTH_FILE || path.join(ROOT, 'auth.json');
+  const authFile = process.env.AG_AUTH_FILE || path.join(DATA_DIR, 'auth.json');
   if (!fs.existsSync(authFile)) {
     console.log(`\n  ! Не найден ${authFile} — сначала: python scripts\\extract_token.py\n`);
     process.exit(1);
@@ -397,8 +416,33 @@ function start(config) {
     network,
   });
   const upstream = new Upstream(config, tokens, catalog, network);
-  const guard = new Guard(config.safeMode || {}, process.env.AG_USAGE_FILE || path.join(ROOT, 'usage.json'));
-  const webBridge = new GeminiWebBridge({ ...(config.geminiWeb || {}), network });
+  const guard = new Guard(config.safeMode || {}, process.env.AG_USAGE_FILE || path.join(DATA_DIR, 'usage.json'));
+
+  // Ротация cookie в веб-мосте должна переживать рестарт: пишем её туда же,
+  // откуда она читается — в файл, если задан cookie_file, иначе в config.json.
+  function persistRotatedCookie(cookie, accountName = '') {
+    try {
+      const ws = config.geminiWeb || {};
+      if (accountName && Array.isArray(ws.accounts)) {
+        const acc = ws.accounts.find((a) => a && a.name === accountName);
+        if (acc) acc.cookie = cookie;
+      } else if (ws.cookie_file) {
+        const file = path.isAbsolute(ws.cookie_file) ? ws.cookie_file : path.join(DATA_DIR, ws.cookie_file);
+        backupFile(file);
+        writeFileAtomic(file, cookie + '\n');
+        return;
+      } else {
+        config.geminiWeb = { ...ws, cookie };
+      }
+      if (config.persistConfig !== false) {
+        const cfgPath = path.join(DATA_DIR, 'config.json');
+        backupFile(cfgPath);
+        writeFileAtomic(cfgPath, JSON.stringify(config, null, 2));
+      }
+    } catch {}
+  }
+
+  const webBridge = new GeminiWebBridge({ ...(config.geminiWeb || {}), network, onCookieRotated: persistRotatedCookie });
   webBridge.ensureBlFresh(true).catch(() => {}); // фоновое обновление BL-версии, best-effort
   const netSummary = network.summary();
   if (netSummary.active) {
@@ -503,22 +547,60 @@ function start(config) {
     return '';
   };
 
-  const MAX_BODY_BYTES = 64 * 1024 * 1024;
+  // 16 МБ достаточно для чата с base64-картинками; 64 МБ давали пик памяти
+  // ~128 МБ на запрос (Buffer.concat + toString) и не приносили пользы.
+  const MAX_BODY_BYTES = Number(process.env.AG_MAX_BODY_BYTES) > 0
+    ? Number(process.env.AG_MAX_BODY_BYTES) : 16 * 1024 * 1024;
+  const MB = (n) => `${Math.round(n / (1024 * 1024))} МБ`;
+
+  function bodyTooLargeError() {
+    const err = new Error(`Тело запроса больше ${MB(MAX_BODY_BYTES)}`);
+    err.status = 413;
+    err.code = 'body_too_large';
+    return err;
+  }
+
+  // Сбросить остаток отклонённого тела, не убивая сокет мгновенно.
+  // Если оборвать соединение с непрочитанными входящими данными, ядро отвечает
+  // RST и уже отправленный 413 может потеряться на стороне клиента.
+  // Поэтому дочитываем и выбрасываем — но только до потолка и с таймаутом.
+  function drainRejectedBody(req) {
+    const cap = MAX_BODY_BYTES * 2;
+    let extra = 0;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      req.removeListener('data', onData);
+      try { req.destroy(); } catch {}
+    };
+    const onData = (chunk) => {
+      extra += chunk.length;
+      if (extra > cap) finish();
+    };
+    const timer = setTimeout(finish, 2000);
+    if (timer.unref) timer.unref();
+    req.on('data', onData);
+    req.once('end', finish);
+    req.once('error', finish);
+    req.resume();
+  }
 
   async function readBody(req) {
+    // Content-Length известен заранее — нет повода прочитать 16 МБ ради отказа.
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) throw bodyTooLargeError();
+
     const chunks = [];
     let size = 0;
     for await (const c of req) {
       size += c.length;
       if (size > MAX_BODY_BYTES) {
-        // Дальше читать незачем: клиент должен получить 413, а не обрыв соединения.
-        const err = new Error(`Тело запроса больше ${MAX_BODY_BYTES / (1024 * 1024)} МБ`);
-        err.status = 413;
-        err.code = 'body_too_large';
-        // Остаток тела не сливаем: без сброса соединения клиент продолжает
-        // слать данные, а Node держит их в памяти сколько придётся.
-        req.destroy();
-        throw err;
+        // Никакого req.destroy() здесь: он убивает сокет и клиент получает RST
+        // вместо диагностики. Оборвёт соединение readBodyOrRespond после ответа.
+        req.pause();
+        throw bodyTooLargeError();
       }
       chunks.push(c);
     }
@@ -526,41 +608,223 @@ function start(config) {
   }
 
   // Чтение тела с ответом клиенту: 413 при превышении лимита, 400 при обрыве.
+  // 413 уходит ДО закрытия сокета, поэтому клиент видит JSON, а не «socket hang up».
   async function readBodyOrRespond(req, res) {
     try {
       return { ok: true, raw: await readBody(req) };
     } catch (err) {
       const tooLarge = err && err.status === 413;
-      sendApiError(res, tooLarge ? 413 : 400, {
-        error: {
-          message: tooLarge
-            ? `Тело запроса больше ${MAX_BODY_BYTES / (1024 * 1024)} МБ. Сократите сообщение или вложения.`
-            : 'Не удалось прочитать тело запроса (соединение оборвано).',
-          type: 'invalid_request_error',
-          code: tooLarge ? 'body_too_large' : 'body_read_failed',
-        },
-      });
+      const status = tooLarge ? 413 : 400;
+      const payload = JSON.stringify({ error: {
+        message: tooLarge
+          ? `Тело запроса больше ${MB(MAX_BODY_BYTES)}. Сократите сообщение или вложения.`
+          : 'Не удалось прочитать тело запроса (соединение оборвано).',
+        type: 'invalid_request_error',
+        code: tooLarge ? 'body_too_large' : 'body_read_failed',
+      } });
+      if (!res.headersSent && !res.destroyed) {
+        res.writeHead(status, {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': Buffer.byteLength(payload),
+          ...(tooLarge ? { connection: 'close' } : {}),
+        });
+        res.end(payload);
+        if (tooLarge) drainRejectedBody(req);
+      }
       return { ok: false };
     }
   }
 
+  // Сравнение ключей без тайминг-утечки (длина + timingSafeEqual).
+  function keyEquals(given, expected) {
+    if (!expected) return false;
+    const a = Buffer.from(String(given || ''), 'utf8');
+    const b = Buffer.from(String(expected), 'utf8');
+    if (a.length !== b.length) return false;
+    try { return crypto.timingSafeEqual(a, b); } catch { return false; }
+  }
+
+  function presentedKeys(req) {
+    const bearer = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    let query = '';
+    try { query = new URL(req.url, 'http://localhost').searchParams.get('key') || ''; } catch {}
+    return [bearer, req.headers['x-goog-api-key'], req.headers['x-api-key'], req.headers['x-admin-key'], query];
+  }
+
+  // Ключ клиентов моделей: только /v1*.
   function authOk(req) {
     // Authorization: Bearer <key> — основной способ (OpenAI-совместимость).
     // x-goog-api-key и ?key= — для Gemini SDK (google-generativeai и т.п.).
-    const h = req.headers.authorization || '';
-    if (h === 'Bearer ' + config.apiKey) return true;
-    if (req.headers['x-goog-api-key'] === config.apiKey) return true;
+    return presentedKeys(req).some((k) => keyEquals(k, config.apiKey));
+  }
+
+  // Админский ключ: /_* и HTML-дашборд. В тестах/кастомных запусках adminKey
+  // может отсутствовать — тогда допускаем apiKey (так работают фикстуры).
+  function adminOk(req) {
+    const expected = config.adminKey || config.apiKey;
+    return presentedKeys(req).some((k) => keyEquals(k, expected));
+  }
+
+  // Чтение состояния: доступно обоим ключам (не даёт менять конфиг).
+  function statusOk(req) {
+    return adminOk(req) || authOk(req);
+  }
+
+  // Сохранение config.json: нормализованный объект целиком, с бэкапом.
+  // Путь — DATA_DIR: в Docker /app только для чтения.
+  function saveConfigFile() {
+    if (config.persistConfig === false) return null;
     try {
-      const u = new URL(req.url, 'http://localhost');
-      return u.searchParams.get('key') === config.apiKey;
-    } catch {
-      return false;
+      const cfgPath = path.join(DATA_DIR, 'config.json');
+      backupFile(cfgPath);
+      writeFileAtomic(cfgPath, JSON.stringify(config, null, 2));
+      return null;
+    } catch (e) {
+      console.error('Failed to save config.json:', e);
+      return e;
     }
   }
 
-  function unauthorized(res) {
+  // Мутация списка веб-аккаунтов: add | update | remove | activate.
+  // Секреты наружу не отдаём, в ответе только имена, статусы и предупреждения.
+  async function handleWebAccountAction(res, body) {
+    const action = String(body.action || 'add').toLowerCase();
+    const name = String(body.name || '').trim().slice(0, 80);
+    if (!['add', 'update', 'remove', 'activate'].includes(action)) {
+      return sendJson(res, 400, { error: { message: 'action: add | update | remove | activate', type: 'invalid_request_error' } });
+    }
+    if (!name) {
+      return sendJson(res, 400, { error: { message: 'name: обязательное поле', type: 'invalid_request_error' } });
+    }
+
+    const list = (config.geminiWeb.accounts || []).map((a) => ({ ...a }));
+    const idx = list.findIndex((a) => a.name.toLowerCase() === name.toLowerCase());
+    const warnings = [];
+
+    if (action === 'remove' || action === 'activate') {
+      if (idx < 0) {
+        return sendJson(res, 404, { error: { message: `Аккаунт "${name}" не найден`, type: 'not_found_error' } });
+      }
+      if (action === 'remove') list.splice(idx, 1);
+    } else {
+      const cookie = typeof body.cookie === 'string' ? body.cookie.trim() : '';
+      const cookieFile = typeof body.cookie_file === 'string' ? body.cookie_file.trim()
+        : (typeof body.cookieFile === 'string' ? body.cookieFile.trim() : '');
+      if (action === 'add' && idx >= 0) {
+        return sendJson(res, 409, { error: { message: `Аккаунт "${name}" уже есть (action=update)`, type: 'invalid_request_error' } });
+      }
+      if (action === 'update' && idx < 0) {
+        return sendJson(res, 404, { error: { message: `Аккаунт "${name}" не найден`, type: 'not_found_error' } });
+      }
+      const prev = idx >= 0 ? list[idx] : { name };
+      // Пустая cookie при update означает «не менять», а не «стереть».
+      const nextCookie = cookie || prev.cookie || '';
+      const nextCookieFile = cookieFile || prev.cookie_file || '';
+      if (!nextCookie && !nextCookieFile) {
+        return sendJson(res, 400, { error: {
+          message: 'Нужна cookie или cookie_file: без них аккаунт бесполезен',
+          type: 'invalid_request_error',
+        } });
+      }
+      if (cookie && !/SAPISID|__Secure-1PSID|__Secure-3PSID/.test(cookie)) {
+        warnings.push('в cookie нет SAPISID/__Secure-1PSID — веб-запросы, скорее всего, вернут 401/403');
+      }
+      const next = {
+        name,
+        cookie: nextCookie,
+        cookie_file: nextCookieFile,
+        proxy: typeof body.proxy === 'string' ? body.proxy.trim() : (prev.proxy || ''),
+        authUser: Number.isInteger(body.authUser) ? body.authUser : (prev.authUser ?? null),
+        label: typeof body.label === 'string' ? body.label.trim().slice(0, 80) : (prev.label || ''),
+        thinkMode: body.thinkMode === 'extended' || body.thinkMode === 'default' ? body.thinkMode : (prev.thinkMode ?? null),
+        temporaryChats: typeof body.temporaryChats === 'boolean' ? body.temporaryChats : (prev.temporaryChats === true),
+      };
+      if (idx >= 0) list[idx] = next; else list.push(next);
+    }
+
+    let activeAccount = config.geminiWeb.activeAccount || '';
+    if (action === 'activate') activeAccount = name;
+    if (action === 'remove' && activeAccount.toLowerCase() === name.toLowerCase()) activeAccount = '';
+
+    const patch = configLib.patchConfig(config, { geminiWeb: { accounts: list, activeAccount } });
+    Object.assign(config, patch.config);
+    webBridge.updateConfig(config.geminiWeb);
+    const saveErr = saveConfigFile();
+    if (saveErr) {
+      return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${saveErr.message}`, type: 'internal_error' } });
+    }
+    const ws = webBridge.summary ? webBridge.summary() : {};
+    return sendJson(res, 200, {
+      ok: true,
+      action,
+      activeAccount: config.geminiWeb.activeAccount || '',
+      accounts: ws.accounts || [],
+      warnings: [...warnings, ...patch.warnings],
+    });
+  }
+
+  // ---- защита от перебора ключа ----
+  // Ключ короткий и лежит в файле, но шлюз слушает localhost и по нему ходят
+  // скрипты: без счётчика ошибок любой локальный процесс мог бы перебирать
+  // ключ со скоростью тысяч попыток в секунду.
+  const AUTH_FAIL = { maxFailures: 20, windowMs: 60_000, blockMs: 300_000 };
+  const authFails = new Map(); // ip -> { count, firstAt, blockedUntil }
+
+  function clientIp(req) {
+    const raw = (req.socket && req.socket.remoteAddress) || 'unknown';
+    return raw.replace(/^::ffff:/, '');
+  }
+
+  function authBlocked(req) {
+    const st = authFails.get(clientIp(req));
+    if (!st) return 0;
+    const now = Date.now();
+    if (st.blockedUntil > now) return st.blockedUntil;
+    if (now - st.firstAt > AUTH_FAIL.windowMs) authFails.delete(clientIp(req));
+    return 0;
+  }
+
+  function noteAuthFailure(req) {
+    const ip = clientIp(req);
+    const now = Date.now();
+    let st = authFails.get(ip);
+    if (!st || now - st.firstAt > AUTH_FAIL.windowMs) st = { count: 0, firstAt: now, blockedUntil: 0 };
+    st.count += 1;
+    if (st.count >= AUTH_FAIL.maxFailures) {
+      st.blockedUntil = now + AUTH_FAIL.blockMs;
+      st.count = 0;
+      st.firstAt = now;
+      pushLog({ kind: 'security', status: 429, error: `auth brute-force from ${ip}, blocked ${AUTH_FAIL.blockMs / 1000}s` });
+    }
+    authFails.set(ip, st);
+    // Чистим старые записи, чтобы Map не рос бесконечно.
+    if (authFails.size > 512) {
+      for (const [key, v] of authFails) {
+        if (v.blockedUntil < now && now - v.firstAt > AUTH_FAIL.windowMs) authFails.delete(key);
+      }
+    }
+  }
+
+  function unauthorized(res, blockedUntil = 0) {
+    if (blockedUntil) {
+      res.writeHead(429, {
+        'content-type': 'application/json; charset=utf-8',
+        'retry-after': String(Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000))),
+      });
+      res.end(JSON.stringify({ error: {
+        message: 'Слишком много неверных ключей с этого адреса. Повторите позже.',
+        type: 'rate_limit_error',
+        code: 'too_many_auth_failures',
+      } }));
+      return;
+    }
     res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer' });
     res.end(JSON.stringify({ error: { message: 'Неверный API-ключ. Возьми его из apikey.txt', type: 'invalid_request_error' } }));
+  }
+
+  function forbidden(res, code, message) {
+    res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ error: { message, type: 'permission_error', code } }));
   }
 
   async function upstreamErrorToClient(res, upRes) {
@@ -575,7 +839,8 @@ function start(config) {
   async function handleDiagnosticChat(req, res) {
     const t0 = Date.now();
     try {
-      if (!authOk(req)) {
+      if (!statusOk(req)) {
+        noteAuthFailure(req);
         throw diagnosticError(401, 'invalid_api_key', 'Неверный или отсутствующий ключ приложения. Проверьте Authorization: Bearer и актуальный ключ в apikey.txt.', 'auth');
       }
       if (req.method !== 'POST') {
@@ -585,7 +850,7 @@ function start(config) {
       let raw;
       try { raw = await readBody(req); }
       catch {
-        throw diagnosticError(413, 'body_read_failed', 'Не удалось прочитать тело запроса или превышен лимит 64 МБ. Сократите сообщение и отправьте JSON повторно.', 'validation');
+        throw diagnosticError(413, 'body_read_failed', `Не удалось прочитать тело запроса или превышен лимит ${MB(MAX_BODY_BYTES)}. Сократите сообщение и отправьте JSON повторно.`, 'validation');
       }
       let body;
       try { body = JSON.parse(raw); }
@@ -603,6 +868,129 @@ function start(config) {
     }
   }
 
+  // ---- Anthropic Messages API: /v1/messages ----
+  // Claude Code, Cline, Continue и Zed ходят только по этому протоколу.
+
+  function anthropicError(res, status, type, message) {
+    res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ type: 'error', error: { type, message } }));
+  }
+
+  async function handleAnthropicCountTokens(req, res) {
+    const read = await readBodyOrRespond(req, res);
+    if (!read.ok) return;
+    const body = parseRequestBody(read.raw);
+    // Точный подсчёт требует вызова апстрима, а Anthropic-клиенты используют
+    // ответ только для оценки контекста — отдаём детерминированную оценку.
+    return sendJson(res, 200, { input_tokens: anthropic.estimateTokens(body) });
+  }
+
+  async function handleAnthropicMessages(req, res) {
+    const t0 = Date.now();
+    const read = await readBodyOrRespond(req, res);
+    if (!read.ok) return;
+    const body = parseRequestBody(read.raw);
+
+    const modelName = String(body.model || '').trim();
+    if (!modelName) return anthropicError(res, 400, 'invalid_request_error', 'model: обязательное поле');
+    if (!Number.isFinite(body.max_tokens) || body.max_tokens <= 0) {
+      return anthropicError(res, 400, 'invalid_request_error', 'max_tokens: обязательное поле (> 0)');
+    }
+    if (!Array.isArray(body.messages) || !body.messages.length) {
+      return anthropicError(res, 400, 'invalid_request_error', 'messages: обязательное поле');
+    }
+
+    const mapped = anthropic.mapModel(modelName);
+    let parsed = providers.parseModel(mapped);
+    if (!parsed.ok) parsed = (await resolveFlatModel(mapped)) || parsed;
+    if (!parsed.ok) {
+      return anthropicError(res, 404, 'not_found_error', `model: неизвестная модель "${modelName}". Список: GET /v1/models`);
+    }
+    if (parsed.namespace === providers.WEB) {
+      // У веб-канала нет нативного function calling и thinking-блоков,
+      // поэтому /v1/messages для web/* не притворяется рабочим.
+      return anthropicError(res, 400, 'invalid_request_error',
+        'web-модели не поддерживают /v1/messages — используйте /v1/chat/completions с теми же моделями');
+    }
+
+    let requestObj;
+    try {
+      ({ requestObj } = anthropic.anthropicToGeminiRequest(body));
+    } catch (e) {
+      return anthropicError(res, e.status || 400, 'invalid_request_error', e.message);
+    }
+    applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
+
+    const stream = body.stream === true;
+
+    return guarded(res, parsed.baseId, 'anthropic', async () => {
+      const ac = new AbortController();
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.once('close', onClose);
+      try {
+        if (clientGone(res)) throw abortedError();
+        const upRes = await withRetry429(() => upstream.generateWithRetry(parsed.baseId, requestObj, { signal: ac.signal }));
+        if (!upRes.ok) {
+          const text = (await upRes.text().catch(() => '')) || '';
+          if (upRes.status === 429) guard.report429(parsed.baseId, parseResetMs(text));
+          const quota = extractQuotaInfo(text);
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: upRes.status, ms: Date.now() - t0, error: text.slice(0, 160), quota, provider: providers.CLOUD });
+          const message = redactSecrets(text).replace(/\s+/g, ' ').slice(0, 400) || `upstream ${upRes.status}`;
+          const type = upRes.status === 429 ? 'rate_limit_error'
+            : upRes.status === 401 || upRes.status === 403 ? 'authentication_error'
+              : upRes.status === 404 ? 'not_found_error' : 'api_error';
+          return anthropicError(res, upRes.status, type, message);
+        }
+
+        if (!stream) {
+          const saw = [];
+          for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
+            if (!data || data === '[DONE]') continue;
+            saw.push(parseUpstreamData(data));
+          }
+          const out = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw) }, modelName);
+          guard.reportUsage(out.usage.input_tokens + out.usage.output_tokens);
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, provider: providers.CLOUD });
+          return sendJson(res, 200, out);
+        }
+
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        const conv = new anthropic.AnthropicStream(modelName, { includeThinking: !!config.includeThoughts });
+        // message_start нужен сразу: клиенты показывают «печатает» до первого чанка.
+        for (const evt of conv.startMessage()) res.write(anthropic.formatSse(evt));
+        try {
+          for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
+            if (!data || data === '[DONE]') continue;
+            const resp = parseUpstreamData(data);
+            for (const evt of conv.push(resp.response ?? resp)) res.write(anthropic.formatSse(evt));
+          }
+        } catch (e) {
+          if (clientGone(res) || (e && (e.name === 'AbortError' || ac.signal.aborted))) throw abortedError();
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: 502, ms: Date.now() - t0, error: 'stream: ' + e.message, provider: providers.CLOUD });
+          for (const evt of conv.finish()) res.write(anthropic.formatSse(evt));
+          res.end();
+          return;
+        }
+        for (const evt of conv.finish()) res.write(anthropic.formatSse(evt));
+        res.end();
+        guard.reportUsage(conv.usageTokens);
+        pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, stream: true, provider: providers.CLOUD });
+      } catch (err) {
+        if (err && err.code === 'client_disconnected') {
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: 499, ms: Date.now() - t0, error: 'client disconnected', provider: providers.CLOUD });
+          return;
+        }
+        throw err;
+      } finally {
+        res.removeListener('close', onClose);
+        if (clientGone(res) && !ac.signal.aborted) ac.abort();
+      }
+    });
+  }
   // ---- OpenAI: /v1/chat/completions ----
 
   // Модели жёстко неймспейснуты: cloud/<id> | web/<alias>.
@@ -684,17 +1072,28 @@ function start(config) {
   // config.json — из тела запроса их включить нельзя.
   function agentConfigFor(body) {
     const req = body && body.agent && typeof body.agent === 'object' ? body.agent : {};
-    const SAFE_REQ_KEYS = ['workspaceRoot', 'maxIterations', 'maxReadBytes', 'maxWriteBytes', 'maxListEntries', 'shellTimeoutMs', 'auditFile', 'auditRotateBytes'];
     const cfg = { ...agent.DEFAULTS, ...(config.agent || {}) };
-    for (const k of SAFE_REQ_KEYS) {
-      if (req[k] !== undefined) cfg[k] = req[k];
-    }
+    // auditFile/auditRotateBytes и опасные флаги НЕ принимаются из тела запроса:
+    // путь журнала из запроса — это запись в произвольный файл в обход песочницы.
+    const reqWorkspace = typeof req.workspaceRoot === 'string' && req.workspaceRoot.trim();
+    if (reqWorkspace) cfg.workspaceRoot = req.workspaceRoot.trim();
+    if (req.maxIterations !== undefined) cfg.maxIterations = configLib.clampNumber(req.maxIterations, 1, 24, cfg.maxIterations);
+    if (req.maxReadBytes !== undefined) cfg.maxReadBytes = configLib.clampNumber(req.maxReadBytes, 1024, 1024 * 1024, cfg.maxReadBytes);
+    if (req.maxWriteBytes !== undefined) cfg.maxWriteBytes = configLib.clampNumber(req.maxWriteBytes, 1024, 8 * 1024 * 1024, cfg.maxWriteBytes);
+    if (req.maxListEntries !== undefined) cfg.maxListEntries = configLib.clampNumber(req.maxListEntries, 1, 5000, cfg.maxListEntries);
+    if (req.shellTimeoutMs !== undefined) cfg.shellTimeoutMs = configLib.clampNumber(req.shellTimeoutMs, 1000, 600000, cfg.shellTimeoutMs);
     cfg.allowDelete = !!(config.agent && config.agent.allowDelete);
     cfg.allowShell = !!(config.agent && config.agent.allowShell);
     cfg.allowAbsolutePaths = !!(config.agent && config.agent.allowAbsolutePaths);
     cfg.allowWebAgent = !!(config.agent && config.agent.allowWebAgent === true);
     cfg.planner = { ...planner.DEFAULT_SETTINGS, ...((config.agent && config.agent.planner) || {}) };
     cfg.enabled = !(config.agent && config.agent.enabled === false);
+    // Не из тела запроса: база песочницы и каталог служебных файлов.
+    cfg.dataDir = DATA_DIR;
+    cfg.workspaceBase = process.env.AG_WORKSPACE_BASE ? path.resolve(process.env.AG_WORKSPACE_BASE) : DATA_DIR;
+    // Проверяем только путь, пришедший из запроса: workspaceRoot из конфига
+    // доверенный (иначе дефолтная папка в DATA_DIR сама себе противоречит).
+    cfg.validateWorkspace = !!reqWorkspace;
     return cfg;
   }
 
@@ -709,7 +1108,14 @@ function start(config) {
     }
 
     const acfg = agentConfigFor(body);
-    const executor = agent.createExecutor(acfg, ROOT);
+    let executor;
+    try {
+      executor = agent.createExecutor(acfg, ROOT);
+    } catch (err) {
+      return sendJson(res, 400, {
+        error: { message: err.message, type: 'invalid_request_error', code: 'workspace_denied' },
+      });
+    }
 
     // Гибридный консультант доступен только cloud-циклу: исполнитель надёжный,
     // веб-модель только советует. Веб-циклу planner не предлагается.
@@ -768,7 +1174,7 @@ function start(config) {
           saw.push(parseUpstreamData(data));
         }
         const merged = mergeGeminiResponse(saw);
-        const out = geminiToOpenAIResponse({ response: merged }, model);
+        const out = geminiToOpenAIResponse({ response: merged }, model, { includeThoughts: !!config.includeThoughts });
         const m = out.choices?.[0]?.message || {};
         return { content: m.content || '', tool_calls: m.tool_calls || [], usage: out.usage, upstream_model: out.upstream_model };
       } finally {
@@ -779,17 +1185,56 @@ function start(config) {
 
     const chat = useWeb ? chatWeb : chatCloud;
 
+    // SSE открывается ДО цикла: иначе клиент минуту видит пустоту (агент ходит
+    // в апстрим несколько раз), а прокси рвут соединение по таймауту.
+    let sseBase = null;
+    let pingTimer = null;
+    const openSse = () => {
+      if (sseBase || !stream) return;
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+      sseBase = {
+        id: 'chatcmpl-' + crypto.randomUUID(),
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: requestedModel,
+      };
+      res.write(`data: ${JSON.stringify({ ...sseBase, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}\n\n`);
+      pingTimer = setInterval(() => {
+        if (res.writableEnded) return;
+        res.write(': keep-alive\n\n'); // SSE-комментарий, клиенты его игнорируют
+      }, 10000);
+      if (pingTimer.unref) pingTimer.unref();
+    };
+    const stopSse = () => {
+      if (pingTimer) { clearInterval(pingTimer); pingTimer = null; }
+    };
+    const onAgentEvent = (evt) => {
+      if (!sseBase || res.writableEnded) return;
+      const payload = evt.type === 'iteration' ? { type: 'iteration', iteration: evt.iteration }
+        : evt.type === 'tool_start' ? { type: 'tool_start', tool: evt.tool }
+          : { type: 'tool_end', tool: evt.tool, ok: evt.ok, ms: evt.ms };
+      res.write(`data: ${JSON.stringify({ ...sseBase, agent_event: payload, choices: [{ index: 0, delta: {}, finish_reason: null }] })}\n\n`);
+    };
+
     const run = async () => {
-      const result = await agent.runAgentLoop({
-        chat,
-        messages: body.messages || [],
-        executor: loopExecutor,
-        maxIterations: acfg.maxIterations,
-        systemPrompt,
-      });
-      if (result.usage && result.usage.total_tokens) guard.reportUsage(result.usage.total_tokens);
-      pushLog({ kind: 'openai', model: requestedModel, status: 200, ms: Date.now() - t0, agentActions: result.trace.length, provider: parsed.namespace });
-      return result;
+      openSse();
+      res.once('close', stopSse);
+      try {
+        const result = await agent.runAgentLoop({
+          chat,
+          messages: body.messages || [],
+          executor: loopExecutor,
+          maxIterations: acfg.maxIterations,
+          systemPrompt,
+          onEvent: onAgentEvent,
+        });
+        if (result.usage && result.usage.total_tokens) guard.reportUsage(result.usage.total_tokens);
+        pushLog({ kind: 'openai', model: requestedModel, status: 200, ms: Date.now() - t0, agentActions: result.trace.length, provider: parsed.namespace });
+        return result;
+      } finally {
+        stopSse();
+        res.removeListener('close', stopSse);
+      }
     };
 
     const agentMeta = () => useWeb
@@ -816,18 +1261,11 @@ function start(config) {
           },
         });
       }
-      // SSE: прогресс инструментов — события agent_event, затем контент одним дельта-чанком.
-      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-      const base = {
-        id: 'chatcmpl-' + crypto.randomUUID(),
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: requestedModel,
-      };
-      res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] })}\n\n`);
-      for (const a of result.trace) {
-        res.write(`data: ${JSON.stringify({ ...base, agent_event: { tool: a.tool, ok: a.ok }, choices: [{ index: 0, delta: {}, finish_reason: null }] })}\n\n`);
-      }
+      // Стрим уже открыт в openSse(): прогресс ушёл живыми событиями,
+      // здесь только финальный контент и закрытие.
+      stopSse();
+      if (!sseBase) openSse();
+      const base = sseBase;
       if (result.content) {
         res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: result.content }, finish_reason: null }] })}\n\n`);
       }
@@ -923,9 +1361,15 @@ function start(config) {
       if (!webBridge.isWebModel(parsed.baseId)) {
         return sendJson(res, 400, webBridgeDisabledError());
       }
+      // Web-модели тоже под Safe Mode: раньше лимиты запросов на них не
+      // действовали вообще (считались только токены).
+      return guarded(res, parsed.baseId, 'openai', async () => {
+      const ac = new AbortController();
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.once('close', onClose);
       try {
         const out = await webBridge.handleOpenAIChat(
-          { ...body, model: parsed.baseId, tools: undefined }, stream, res);
+          { ...body, model: parsed.baseId, tools: undefined }, stream, res, { signal: ac.signal });
         if (out) {
           guard.reportUsage(out.usage?.total_tokens);
           pushLog({ kind: 'openai', model: parsed.displayId, status: 200, ms: Date.now() - t0, stream, provider: providers.WEB });
@@ -941,14 +1385,22 @@ function start(config) {
         const detail = redactSecrets(String(err && err.message || 'unknown error')).replace(/\s+/g, ' ').slice(0, 220);
         const message = regional ? normalizeDiagnosticError(err, { bridge: 'web' }).error.message
           : `Gemini Web request failed: ${detail} (проверьте VPN и свежесть куки; повторите попытку)`;
+        if (status === 429) guard.report429(parsed.baseId, parseResetMs(detail));
         pushLog({ kind: 'openai', status, ms: Date.now() - t0, error: regional ? code : 'web: ' + detail.slice(0, 140), provider: providers.WEB });
         sendApiError(res, status, { error: { message, type, code } }, stream);
         return;
+      } finally {
+        res.removeListener('close', onClose);
+        if (clientGone(res) && !ac.signal.aborted) ac.abort();
       }
+      });
     }
 
     const model = parsed.baseId;
     const requestObj = openAIToGeminiRequest(body);
+    // reasoning_effort/thinking -> generationConfig.thinkingConfig (только если
+    // config.thinking.mapReasoningEffort=true: поддержка зависит от апстрима).
+    applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
 
     return guarded(res, model, 'openai', async () => {
       const ac = new AbortController();
@@ -1044,7 +1496,7 @@ function start(config) {
       },
       traceId,
     };
-    return geminiToOpenAIResponse(resp, model);
+    return geminiToOpenAIResponse(resp, model, { includeThoughts: !!config.includeThoughts });
   }
 
   // ---- Gemini-нативный API ----
@@ -1086,6 +1538,12 @@ function start(config) {
       if (!webBridge.isWebModel(model)) {
         return sendJson(res, 400, webBridgeDisabledError());
       }
+      return guarded(res, model, 'gemini', async () => {
+      // Уход клиента обязан рвать веб-запрос: ответ Gemini идёт 10-30 c,
+      // и без отмены шлюз продолжает занимать квоту впустую.
+      const ac = new AbortController();
+      const onClose = () => { if (!res.writableEnded) ac.abort(); };
+      res.once('close', onClose);
       try {
         const prompt = webBridge.contentsToPrompt(requestObj);
         const meta = webBridge.getModelMeta(model);
@@ -1093,7 +1551,7 @@ function start(config) {
 
         if (stream) {
           const reqBody = webBridge.buildPayload(prompt, meta.modelId, meta.thinkMode, lang);
-          const upRes = await webBridge.sendStreamRequestResilient(reqBody, meta, lang);
+          const upRes = await webBridge.sendStreamRequestResilient(reqBody, meta, lang, { signal: ac.signal });
           const iterator = webBridge.streamResponse(upRes)[Symbol.asyncIterator]();
           const first = await iterator.next();
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -1120,7 +1578,7 @@ function start(config) {
           return;
         }
 
-        const text = await webBridge.generate(prompt, meta.modelId, meta.thinkMode, lang);
+        const text = await webBridge.generate(prompt, meta.modelId, meta.thinkMode, lang, { signal: ac.signal });
         const out = {
           candidates: [{
             content: { parts: [{ text }], role: 'model' },
@@ -1143,12 +1601,17 @@ function start(config) {
         const message = regional ? normalizeDiagnosticError(err, { bridge: 'web' }).error.message
           : `Gemini Web request failed: ${detail} (проверьте VPN и свежесть куки; повторите попытку)`;
         pushLog({ kind: 'gemini', status, ms: Date.now() - t0, error: regional ? 'region_not_supported' : 'web: ' + detail.slice(0, 140), provider: providers.WEB });
+        if (status === 429) guard.report429(model, parseResetMs(detail));
         return sendApiError(res, status, { error: {
           message,
           type: regional ? 'invalid_request_error' : 'api_error',
           code: regional ? 'region_not_supported' : status,
         } });
+      } finally {
+        res.removeListener('close', onClose);
+        if (clientGone(res) && !ac.signal.aborted) ac.abort();
       }
+      });
     }
 
     return guarded(res, model, 'gemini', async () => {
@@ -1389,6 +1852,9 @@ function start(config) {
         webKvs =
           `<div class="kv"><span class="k">Status</span><span><span class="badge ${enCls}">${ws.enabled ? 'Enabled' : 'Disabled'}</span></span></div>` +
           `<div class="kv"><span class="k">Cookie</span><span><span class="badge ${ckCls}">${ws.cookieSet ? 'set' : 'none (anonymous)'}</span></span></div>` +
+          (ws.accounts && ws.accounts.length
+            ? `<div class="kv"><span class="k">Accounts</span><span>${ws.accounts.map((a) => `<code>${esc(a.name)}</code>${a.active ? ' <span class="badge ok">active</span>' : ''}${a.cooldownUntil ? ' <span class="badge warn">cooldown</span>' : ''}${a.requests ? ' · ' + esc(a.requests) + ' req' : ''}`).join(' ')}</span></div>`
+            : '') +
           `<div class="kv"><span class="k">BL version</span><span><code>${esc(ws.bl)}</code></span></div>` +
           (ws.proxy ? `<div class="kv"><span class="k">Proxy</span><span><code>${esc(ws.proxy)}</code></span></div>` : '') +
           (ws.authUser !== null && ws.authUser !== undefined ? `<div class="kv"><span class="k">Google /u/</span><span><code>${esc(ws.authUser)}</code></span></div>` : '') +
@@ -1493,8 +1959,27 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
 
   // ---- маршрутизация ----
 
+  // Браузерные клиенты (Open WebUI, LibreChat, свои страницы) шлют preflight:
+  // без него запрос не уходит вообще. Ключ всё равно обязателен на /v1.
+  function applyCors(req, res) {
+    const origin = req.headers.origin;
+    if (!origin) return;
+    res.setHeader('access-control-allow-origin', origin);
+    res.setHeader('vary', 'origin');
+    res.setHeader('access-control-allow-credentials', 'true');
+    res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
+    res.setHeader('access-control-allow-headers', (req.headers['access-control-request-headers'] || 'authorization,content-type,x-api-key,x-goog-api-key,x-admin-key,anthropic-version,anthropic-beta').slice(0, 1024));
+    res.setHeader('access-control-max-age', '600');
+  }
+
   async function handler(req, res) {
     let p = req.url;
+    applyCors(req, res);
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
     try {
       let u;
       try { u = new URL(req.url, 'http://localhost'); } catch {
@@ -1504,9 +1989,19 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       if (p === '/_health') return sendJson(res, 200, { ok: true, uptime: process.uptime() });
       if (p === '/api/diagnostics/chat') return await handleDiagnosticChat(req, res);
 
-      if (!authOk(req)) return unauthorized(res);
+      const blockedUntil = authBlocked(req);
+      if (blockedUntil) return unauthorized(res, blockedUntil);
+      if (!statusOk(req)) {
+        noteAuthFailure(req);
+        return unauthorized(res);
+      }
 
       if (p === '/' || p === '/_status') {
+        // Дашборд — административная поверхность: клиентский API-ключ
+        // (он лежит у Cursor/Cline/любого скрипта) в панель не пускаем.
+        if (p === '/' && !adminOk(req)) {
+          return forbidden(res, 'admin_key_required', 'HTML-дашборд доступен только с админским ключом (admin.key). Клиентский API-ключ не даёт доступа к панели.');
+        }
         const s = {
           startedAt: stats.startedAt,
           requests: stats.requests,
@@ -1569,74 +2064,86 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
         });
       }
 
+      // ---- веб-аккаунты: управление без правки config.json руками ----
+      // Cookie никогда не возвращается наружу: только признак наличия.
+      if (p === '/_web/accounts') {
+        if (!adminOk(req)) {
+          return forbidden(res, 'admin_key_required', 'Управление веб-аккаунтами доступно только с админским ключом (admin.key).');
+        }
+        if (req.method === 'GET') {
+          const ws = webBridge.summary ? webBridge.summary() : {};
+          return sendJson(res, 200, {
+            activeAccount: config.geminiWeb.activeAccount || '',
+            accounts: (config.geminiWeb.accounts || []).map((a) => ({
+              name: a.name,
+              label: a.label || '',
+              proxy: a.proxy || '',
+              authUser: a.authUser,
+              thinkMode: a.thinkMode || null,
+              temporaryChats: a.temporaryChats === true,
+              hasCookie: !!a.cookie,
+              hasCookieFile: !!a.cookie_file,
+              stats: (ws.accounts || []).find((x) => x.name === a.name) || null,
+            })),
+          });
+        }
+        if (req.method !== 'POST') {
+          res.setHeader('allow', 'GET, POST');
+          return sendJson(res, 405, { error: { message: 'Используйте GET или POST', type: 'invalid_request_error' } });
+        }
+        const readAcct = await readBodyOrRespond(req, res);
+        if (!readAcct.ok) return;
+        let acctBody;
+        try { acctBody = parseRequestBody(readAcct.raw); } catch {
+          return sendJson(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+        }
+        return await handleWebAccountAction(res, acctBody);
+      }
+
       if (req.method === 'POST' && p === '/_config') {
-        let parsed = {};
+        if (!adminOk(req)) {
+          return forbidden(res, 'admin_key_required', 'Изменение настроек доступно только с админским ключом (admin.key). Клиентский API-ключ даёт доступ только к /v1*.');
+        }
         const readCfg = await readBodyOrRespond(req, res);
         if (!readCfg.ok) return;
+        let parsed;
         try {
           parsed = parseRequestBody(readCfg.raw);
         } catch {
           return sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
         }
-        if (parsed.safeMode && typeof parsed.safeMode === 'object') {
-          guard.updateConfig(parsed.safeMode);
-          config.safeMode = { ...(config.safeMode || {}), ...parsed.safeMode };
-        }
-        if (parsed.geminiWeb && typeof parsed.geminiWeb === 'object') {
-          webBridge.updateConfig(parsed.geminiWeb);
-          config.geminiWeb = { ...(config.geminiWeb || {}), ...parsed.geminiWeb };
-        }
-        if (parsed.network && typeof parsed.network === 'object') {
-          config.network = { ...(config.network || {}), ...parsed.network };
-        }
-        if (parsed.agent && typeof parsed.agent === 'object') {
-          // Исполнитель создаётся на каждый запрос — изменения применяются сразу.
-          const prev = config.agent && typeof config.agent === 'object' ? config.agent : {};
-          const incoming = { ...parsed.agent };
-          if (incoming.planner && typeof incoming.planner === 'object') {
-            incoming.planner = { ...planner.DEFAULT_SETTINGS, ...(prev.planner || {}), ...incoming.planner };
-          } else {
-            delete incoming.planner;
-          }
-          config.agent = { ...agent.DEFAULTS, ...prev, ...incoming };
-          delete config.agent.autoAgent;
-          config.agent.allowWebAgent = config.agent.allowWebAgent === true;
-          config.agent.planner = { ...planner.DEFAULT_SETTINGS, ...(prev.planner || {}), ...(incoming.planner || {}) };
-        }
-        if (Array.isArray(parsed.dnsServers)) {
-          config.dnsServers = parsed.dnsServers;
-        }
-        if (parsed.network || parsed.geminiWeb || Array.isArray(parsed.dnsServers)) {
-          network.updateConfig(config);
-        }
-        if (parsed.safeMode || parsed.geminiWeb || parsed.network || parsed.agent || Array.isArray(parsed.dnsServers)) {
-          // не пишем config.json в тестовом окружении (persistConfig: false)
-          if (config.persistConfig !== false) {
-            const cfgPath = path.join(ROOT, 'config.json');
-            try {
-              const current = fs.existsSync(cfgPath) ? readJsonFile(cfgPath) : {};
-              if (parsed.safeMode) current.safeMode = { ...(current.safeMode || {}), ...parsed.safeMode };
-              if (parsed.geminiWeb) current.geminiWeb = { ...(current.geminiWeb || {}), ...parsed.geminiWeb };
-              if (parsed.network) current.network = { ...(current.network || {}), ...parsed.network };
-              if (parsed.agent) {
-                const prev = current.agent && typeof current.agent === 'object' ? current.agent : {};
-                const next = { ...prev, ...parsed.agent };
-                delete next.autoAgent;
-                if (parsed.agent.planner && typeof parsed.agent.planner === 'object') {
-                  next.planner = { ...planner.DEFAULT_SETTINGS, ...(prev.planner || {}), ...parsed.agent.planner };
-                }
-                next.allowWebAgent = next.allowWebAgent === true;
-                current.agent = next;
-              }
-              if (Array.isArray(parsed.dnsServers)) current.dnsServers = parsed.dnsServers;
-              backupFile(cfgPath);
-              writeFileAtomic(cfgPath, JSON.stringify(current, null, 2));
-            } catch (e) {
-              console.error('Failed to save config.json:', e);
-            }
+
+        // Белый список полей: опасные флаги агента (allowDelete/allowShell/
+        // allowAbsolutePaths/auditFile) и секреты не принимаются из HTTP никогда.
+        const patch = configLib.patchConfig(config, parsed);
+        Object.assign(config, patch.config);
+
+        // Применяем к живым объектам. Исполнитель агента создаётся на каждый
+        // запрос, поэтому его настройки подхватываются сами.
+        guard.updateConfig(config.safeMode);
+        webBridge.updateConfig(config.geminiWeb);
+        network.updateConfig(config);
+
+        if (patch.applied.length) {
+          // В файл пишем нормализованный конфиг целиком: миграции и дефолты не
+          // теряются, неизвестные ключи сохраняются (deepMerge в lib/config).
+          // apiKey/adminKey живут в этом же объекте, поэтому не пропадают.
+          // Путь — DATA_DIR: в Docker /app только для чтения.
+          const saveErr = saveConfigFile();
+          if (saveErr) {
+            return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${saveErr.message}`, type: 'internal_error' } });
           }
         }
-        const reply = { ok: true, safeMode: guard.cfg, network: network.summary() };
+
+        const reply = {
+          ok: true,
+          applied: patch.applied,
+          ignored: patch.ignored,
+          warnings: patch.warnings,
+          restartRequired: patch.ignored.filter((k) => /allowDelete|allowShell|allowAbsolutePaths|auditFile/.test(k)),
+          safeMode: guard.cfg,
+          network: network.summary(),
+        };
         if (webBridge.summary) reply.geminiWeb = webBridge.summary();
         return sendJson(res, 200, reply);
       }
@@ -1662,8 +2169,10 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       }
 
       if (req.method === 'POST' && p === '/v1/chat/completions') return await handleOpenAIChat(req, res);
+      if (req.method === 'POST' && p === '/v1/messages') return await handleAnthropicMessages(req, res);
+      if (req.method === 'POST' && p === '/v1/messages/count_tokens') return await handleAnthropicCountTokens(req, res);
 
-      sendJson(res, 404, { error: { message: `Нет пути ${p}. Доступно: /v1/chat/completions, /v1/models, /v1/models/{id}, /v1beta/models, /v1beta/models/{m}:generateContent|streamGenerateContent|countTokens` } });
+      sendJson(res, 404, { error: { message: `Нет пути ${p}. Доступно: /v1/chat/completions, /v1/messages, /v1/messages/count_tokens, /v1/models, /v1/models/{id}, /v1beta/models, /v1beta/models/{m}:generateContent|streamGenerateContent|countTokens` } });
     } catch (e) {
       if (e && e.code === 'client_disconnected') {
         pushLog({ kind: 'http', status: 499, error: 'client disconnected' });
@@ -1687,9 +2196,10 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
     console.error(`  ! Порт ${config.port}: ${e.message}`);
     if (e.code === 'EADDRINUSE') console.error('    Уже занят. Поменяй "port" в config.json.');
   });
-  server.listen(config.port, config.host);
+  const listen = envListen(config);
+  server.listen(listen.port, listen.host);
 
-  return { server, tokens, catalog, upstream, config, network };
+  return { server, tokens, catalog, upstream, config, network, guard, webBridge };
 }
 
 // ---------------------------------------------------------------- CLI
@@ -1698,7 +2208,7 @@ function main() {
   const cmd = process.argv[2];
   let loaded;
   try {
-    loaded = loadConfig();
+    loaded = loadConfig(DATA_DIR);
   } catch (e) {
     console.error(`\n  ! ${e.message}\n`);
     process.exit(1);
@@ -1712,7 +2222,7 @@ function main() {
   }
 
   if (cmd === 'models') {
-    const authFile = path.join(ROOT, 'auth.json');
+    const authFile = path.join(DATA_DIR, 'auth.json');
     const network = new NetworkManager(config);
     const tokens = new TokenManager(authFile, { network });
     const catalog = new ModelCatalog(config.upstreamHost, {
@@ -1738,22 +2248,50 @@ function main() {
     return;
   }
 
+  // 0.0.0.0 — это «слушать всё»; в подсказке должен быть реальный адрес.
+  const eff = envListen(config);
+  const bannerHost = !eff.host || eff.host === '0.0.0.0' || eff.host === '::' ? '127.0.0.1' : eff.host;
   console.log(`
   ANTIGRAVITY API — OpenAI & Gemini Compatible Gateway
   ────────────────────────────────────────────────────────────────────────
-  Base URL (OpenAI):   http://127.0.0.1:${config.port}/v1
-  Base URL (Gemini):   http://127.0.0.1:${config.port}/v1beta
-  API Key File:        apikey.txt (Key: ${config.apiKey.slice(0, 10)}...)
+  Base URL (OpenAI):   http://${bannerHost}:${eff.port}/v1
+  Base URL (Gemini):   http://${bannerHost}:${eff.port}/v1beta
+  API Key File:        ${path.join(DATA_DIR, 'apikey.txt')}${config.apiKey ? '' : ' (не создан)'}
+  Admin Key File:      ${path.join(DATA_DIR, ADMIN_KEY_FILE)} (панель, /_config, веб-аккаунты)
+  Data Directory:      ${DATA_DIR}
   Upstream Gateway:    ${config.upstreamHost}
-  Web Dashboard:       http://127.0.0.1:${config.port}/
+  Web Dashboard:       http://${bannerHost}:${eff.port}/
 `);
 
   if (created) console.log('  Created config.json and apikey.txt (API key generated).\n');
-  start(config);
+  const runtime = start(config);
 
-  const stop = () => process.exit(0);
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
+  let stopping = false;
+  const stop = (signal) => {
+    if (stopping) return;
+    stopping = true;
+    console.log(`
+  ${signal}: останавливаюсь, дожидаюсь текущих запросов…`);
+    try { runtime.guard.flush(); } catch {}
+    try { runtime.webBridge.closeAllSockets?.(); } catch {}
+    const hard = setTimeout(() => {
+      console.log('  Активные соединения не закрылись за 8 c — завершаю принудительно.');
+      try { runtime.guard.flush(); } catch {}
+      try { runtime.server.closeAllConnections(); } catch {}
+      process.exit(0);
+    }, 8000);
+    if (hard.unref) hard.unref();
+    runtime.server.close(() => {
+      clearTimeout(hard);
+      try { runtime.guard.flush(); } catch {}
+      process.exit(0);
+    });
+    // новые соединения больше не принимаются, но keep-alive висящие сокеты
+    // нужно закрыть сами — иначе close() не дождётся.
+    setTimeout(() => { try { runtime.server.closeIdleConnections(); } catch {} }, 500).unref?.();
+  };
+  process.on('SIGINT', () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
 }
 
 if (require.main === module) main();
