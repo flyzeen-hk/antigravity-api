@@ -13,7 +13,16 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const {
-  createExecutor, parseToolCallBlocks, extractToolCalls, buildSystemPrompt, runAgentLoop, TOOL_SPECS, TOOL_ALIASES,
+  createExecutor,
+  parseToolCallBlocks,
+  extractToolCalls,
+  buildSystemPrompt,
+  runAgentLoop,
+  TOOL_SPECS,
+  TOOL_ALIASES,
+  isSystemPath,
+  isDangerousWriteName,
+  toolResultForModel,
 } = require('../lib/agent');
 const { removeTree } = require('../lib/safe_files');
 
@@ -175,14 +184,19 @@ const ex = createExecutor({ workspaceRoot: tmp, auditFile: path.join(projectDir,
   r = await ex.execute('write_to_file', { path: 'Carbon/inside.txt', content: 'ok' });
   ok(r.ok === true && fs.existsSync(path.join(tmp, 'Carbon', 'inside.txt')), 'write_to_file -> write_file (алиас Cline)');
 
-  // extractToolCalls: сырой JSON без фенса
-  let ext = extractToolCalls('Создаю папку.\n{"name": "bash", "arguments": {"command": "New-Item -ItemType Directory -Path \\"Carbon\\""}}\nГотово.');
-  ok(ext.toolCalls.length === 1 && ext.toolCalls[0].function.name === 'bash', 'сырой JSON-вызов распознан');
-  ok(!ext.cleanText.includes('"command"'), 'вызов вырезан из текста');
+  // extractToolCalls: сырой JSON без фенса больше НЕ исполняется.
+  // Цитата из файла/пользовательского текста не должна запускать инструмент.
+  let ext = extractToolCalls('Создаю папку.\n' + JSON.stringify({ name: 'bash', arguments: { command: 'mkdir Carbon' } }) + '\nГотово.');
+  ok(ext.toolCalls.length === 0, 'сырой JSON без фенса не считается вызовом');
+  ok(ext.cleanText.includes('"arguments"'), 'сырой JSON остаётся текстом, а не вырезается');
 
-  // ```json-фенс
-  ext = extractToolCalls('```json\n{"name": "write_file", "arguments": {"path": "a.txt", "content": "x"}}\n```');
-  ok(ext.toolCalls.length === 1 && ext.toolCalls[0].function.name === 'write_file', 'вызов в ```json-фенсе распознан');
+  // ```tool_call-фенс с алиасом bash — рабочий путь
+  ext = extractToolCalls('```tool_call\n' + JSON.stringify({ name: 'bash', arguments: { command: 'echo 1' } }) + '\n```');
+  ok(ext.toolCalls.length === 1 && ext.toolCalls[0].function.name === 'bash', 'вызов в ```tool_call-фенсе распознан (алиас bash)');
+
+  // Дубликат того же вызова в одном ответе исполняется один раз
+  ext = extractToolCalls('```tool_call\n' + JSON.stringify({ name: 'create_dir', arguments: { path: 'a' } }) + '\n```\n```tool_call\n' + JSON.stringify({ name: 'create_dir', arguments: { path: 'a' } }) + '\n```');
+  ok(ext.toolCalls.length === 1, 'одинаковые вызовы схлопываются в один');
 
   // Неизвестное имя инструмента НЕ считается вызовом (остаётся текстом)
   ext = extractToolCalls('Пример: {"name": "nuke", "arguments": {}}');
@@ -197,8 +211,8 @@ const ex = createExecutor({ workspaceRoot: tmp, auditFile: path.join(projectDir,
   const selfCorrectingChat = async (msgs) => {
     step2++;
     if (step2 === 1) {
-      // ровно то, что видел пользователь: сырой JSON с bash + PowerShell, без фенса
-      return { content: '{"name": "bash", "arguments": {"command": "New-Item -ItemType Directory -Path \\"Carbon2\\""}}' };
+      // модель зовёт bash (алиас run_command) через фенс и получает отказ
+      return { content: 'Пробую терминал.\n```tool_call\n' + JSON.stringify({ name: 'bash', arguments: { command: 'mkdir Carbon2' } }) + '\n```' };
     }
     // [...msgs] — копия, чтобы не мутировать convo цикла
     const toolMsg = [...msgs].reverse().find(m => m.role === 'tool');
@@ -332,6 +346,46 @@ const ex = createExecutor({ workspaceRoot: tmp, auditFile: path.join(projectDir,
   ok(r.ok === false, 'чтение D:\\Windows\\... заблокировано');
   r = await exAbs.execute('create_dir', { path: path.join(outside, 'ok-dir') });
   ok(r.ok === true, 'обычный путь вне системных папок разрешён');
+
+  console.log('== 8. Защита домашних каталогов, автозапуска и исполняемых файлов');
+  const home = os.homedir();
+  const mustBlock = [
+    path.join(home, '.ssh', 'authorized_keys'),
+    path.join(home, '.gnupg', 'gpg.conf'),
+    path.join(process.env.APPDATA || home, 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'x.lnk'),
+    path.join(outside, '.git', 'hooks', 'pre-commit'),
+    path.join('C:/', 'ProgramData', 'evil.txt'),
+  ];
+  for (const target of mustBlock) {
+    ok(isSystemPath(target) === true, 'защищённый путь: ' + target.replace(home, '~'));
+  }
+  ok(isSystemPath(path.join(outside, 'docs', 'notes.txt')) === false, 'обычный текстовый путь не защищён');
+  ok(isDangerousWriteName(path.join(outside, 'run.ps1')) === true, '.ps1 считается опасным для записи вне workspace');
+  ok(isDangerousWriteName(path.join(outside, 'notes.md')) === false, '.md не опасен');
+
+  r = await exAbs.execute('write_file', { path: path.join(outside, 'evil.ps1'), content: 'Remove-Item -Recurse -Force C:' });
+  ok(r.ok === false && /(запрещен|исполняем)/i.test(r.error), 'запись .ps1 вне workspace запрещена: ' + String(r.error || '').slice(0, 60));
+  r = await exAbs.execute('write_file', { path: path.join(home, '.ssh', 'authorized_keys'), content: 'ssh-rsa AAAA' });
+  ok(r.ok === false, 'запись в ~/.ssh запрещена даже с allowAbsolutePaths');
+
+  // Внутри workspace исполняемые файлы разрешены: это песочница задачи.
+  r = await exAbs.execute('write_file', { path: 'tool.ps1', content: 'Write-Host ok' });
+  ok(r.ok === true, 'внутри workspace .ps1 разрешён');
+
+  console.log('== 9. Бюджет tool-результата: JSON остаётся валидным');
+  const bigStdout = 'x'.repeat(100000);
+  const funneled = toolResultForModel({ ok: true, stdout: bigStdout, exit_code: 0 });
+  let parsedBig = null;
+  try { parsedBig = JSON.parse(funneled); } catch { parsedBig = null; }
+  ok(parsedBig !== null, 'обрезанный результат — валидный JSON');
+  ok(funneled.length <= 24000 && parsedBig.truncated === true, 'в результат добавлен truncated и он в бюджете: ' + funneled.length);
+  ok(typeof parsedBig.stdout === 'string' && parsedBig.stdout.length < bigStdout.length, 'stdout обрезан по полю, а не по строке JSON');
+  ok(JSON.parse(toolResultForModel({ ok: true, content: 'small' })).content === 'small', 'маленький результат проходит без изменений');
+
+  console.log('== 10. Системный промпт: данные из инструментов недоверенные');
+  const prompt = buildSystemPrompt({ workspace: tmp, toolNames: TOOL_SPECS.map((t) => t.function.name), allowDelete: false, allowShell: false, allowAbsolutePaths: false });
+  ok(/UNTRUSTED DATA/.test(prompt), 'в промпте есть правило про недоверенные данные');
+  ok(/Outside the workspace only text files/.test(prompt), 'промпт предупреждает про ограничения записи вне workspace');
 
   removeTree(outside);
   removeTree(tmp2);

@@ -1,0 +1,24 @@
+.git
+.gitignore
+node_modules
+backups
+*.log
+# секреты никогда не попадают в образ
+auth.json
+apikey.txt
+admin.key
+cookie.txt
+cookies.txt
+config.json
+usage.json
+*.bundle
+__pycache__
+*.pyc
+assets
+test
+scripts
+app.py
+window_guard.py
+requirements.txt
+install.bat
+run.bat

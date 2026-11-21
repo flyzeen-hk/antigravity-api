@@ -203,6 +203,27 @@ def test_diagnostic_waiting_animation():
     print("ok: анимация ожидания в диагностическом чате")
 
 
+def test_foreign_process_on_port():
+    """Панель не должна убивать чужой процесс, занявший порт."""
+    d = use_tmp_base()
+    original = app.process_command_line
+    try:
+        app.process_command_line = lambda pid: (
+            "node C:\other\project\server.js" if pid == 111
+            else "python app.py" if pid == 222
+            else ""
+        )
+        assert app.is_our_server(111) is False, "чужой server.js вне проекта"
+        assert app.is_our_server(222) is False, "процесс без server.js"
+        assert app.is_our_server(None) is False and app.is_our_server(0) is False
+        own = "node " + os.path.join(d, "server.js").replace("\\", "/")
+        app.process_command_line = lambda pid: own if pid == 333 else ""
+        assert app.is_our_server(333) is True, "свой server.js в BASE"
+    finally:
+        app.process_command_line = original
+    print("ok: чужой процесс на порту не считается своим")
+
+
 if __name__ == "__main__":
     try:
         test_read_config()
@@ -214,6 +235,7 @@ if __name__ == "__main__":
         test_redaction_survives_damaged_config()
         test_panel_helpers()
         test_diagnostic_waiting_animation()
+        test_foreign_process_on_port()
     finally:
         for path in TMP_DIRS:
             shutil.rmtree(path, ignore_errors=True)

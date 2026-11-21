@@ -2,10 +2,10 @@
 
 // Focused offline regressions; no servers, real credentials or external requests.
 const assert = require('assert/strict');
-const { parseRequestBody, validateOpenAI, validateGemini, sseData, upstreamErrorBody, sendApiError } = require('./http_helpers');
-const { fetchWithFallback, netWhy } = require('./fetch_fallback');
-const { GeminiStreamToOpenAI } = require('./translate');
-const { GeminiWebBridge } = require('./web_bridge');
+const { parseRequestBody, validateOpenAI, validateGemini, sseData, upstreamErrorBody, sendApiError } = require('../lib/http_helpers');
+const { fetchWithFallback, netWhy } = require('../lib/fetch_fallback');
+const { GeminiStreamToOpenAI } = require('../lib/translate');
+const { GeminiWebBridge } = require('../lib/web_bridge');
 
 async function main() {
   let passed = 0;

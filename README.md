@@ -95,6 +95,29 @@ python app.py                         # panel; press Start API Server
 node server.js                        # reads auth.json, serves on 127.0.0.1:8317
 ```
 
+### Docker
+
+Headless, no Python and no panel. Only the gateway:
+
+```bash
+mkdir -p data && cp auth.json data/            # cloud/* models need OAuth tokens
+cp cookie.txt data/ 2>/dev/null                # optional: enables web/* models
+docker compose up -d
+cat data/apikey.txt                            # the generated client key
+curl -s http://127.0.0.1:8317/_health
+```
+
+Notes that matter:
+
+- The port is published on `127.0.0.1` only. The gateway is not meant to be exposed to a network
+  without `adminKey` and TLS in front of it.
+- `AG_DATA_DIR=/data` keeps `config.json`, `apikey.txt`, `auth.json`, `usage.json` and `backups/` in
+  the volume; the image itself carries no secrets.
+- OAuth cannot be completed inside the container — `auth.json` has to be produced on the host
+  (`python scripts/extract_token.py`) and mounted.
+- Without `auth.json` only `web/*` models and the local endpoints work.
+- `AG_HOST` / `AG_PORT` override `config.json`, which is how the container listens on `0.0.0.0`.
+
 ---
 
 ## First run
@@ -153,6 +176,21 @@ All endpoints except `/_health` require the key. Three ways are accepted:
 | GET | `/v1/models` | Both namespaces in one list |
 | GET | `/v1/models/{id}` | Single model; `404 model_not_found` if absent |
 
+### Anthropic-compatible
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/messages` | Claude Code, Cline, Continue, Zed; `stream: true` gives `message_start … message_stop` |
+| POST | `/v1/messages/count_tokens` | Local estimate (~3.5 chars/token), no Google call |
+
+`x-api-key: <KEY>` and `Authorization: Bearer <KEY>` both work, so an Anthropic client
+can point at this gateway with `ANTHROPIC_BASE_URL=http://127.0.0.1:8317`.
+Model names are mapped automatically: `claude-sonnet-4-5-20250929` → `cloud/claude-sonnet-4-5-20250929`.
+Non-Claude ids pass through unchanged, so `claude-*`-style clients can also reach Gemini models.
+
+CORS: `OPTIONS` preflight returns `204` with `access-control-allow-*` for the requesting
+origin, so browser clients (Open WebUI, LibreChat, your own page) can call the gateway directly.
+
 ### Gemini native
 
 | Method | Path | Notes |
@@ -170,16 +208,32 @@ All endpoints except `/_health` require the key. Three ways are accepted:
 | GET | `/_status` | Counters, tokens, network summary, agent settings |
 | GET | `/_limits`, `/_quota` | Quotas; calls Google, can be slow on a cold start |
 | GET | `/_network/test` | Probes Cloud Code, OAuth and Gemini Web routes |
-| POST | `/_config` | Hot-updates Safe Mode, network and agent settings |
+| POST | `/_config` | Hot-updates Safe Mode, network and agent settings (admin key only) |
+| GET/POST | `/_web/accounts` | Manage Gemini-web accounts: `add` / `update` / `activate` / `remove` (admin key only) |
 | POST | `/api/diagnostics/chat` | One-shot probe with a diagnostic error contract |
 
 ### Error behaviour worth knowing
 
 - **Validation is local.** A missing `model` or empty `messages` returns `400` without contacting Google.
-- **Oversized bodies return `413`** (`body_too_large`) above 64 MB, and the connection is closed rather than drained.
+- **Oversized bodies return `413`** (`body_too_large`) above 16 MB (`AG_MAX_BODY_BYTES`). The check runs on
+  `content-length` before any body is read, and streamed bodies are drained after the response so the client
+  actually sees the 413 instead of a reset.
 - **Client disconnect cancels the upstream request** and is logged as `499`, not as a server error.
 - **A prompt blocked by Google** returns normally with `finish_reason: content_filter` and `promptFeedback`, not a 500.
 - **Region blocks** surface as `region_not_supported` / `LOCATION_REJECTED 1060`. That is about the egress IP, not your account or cookie.
+- **Brute-forcing the key is blocked.** 20 wrong keys from one address within a minute return
+  `429 too_many_auth_failures` with `Retry-After`, and the address stays blocked for 5 minutes.
+
+### Managing web accounts over HTTP
+
+```bash
+curl -H "Authorization: Bearer <ADMIN_KEY>" http://127.0.0.1:8317/_web/accounts
+curl -X POST -H "Authorization: Bearer <ADMIN_KEY>" -H "content-type: application/json"   -d '{"action":"add","name":"personal","cookie":"SAPISID=...; __Secure-1PSID=...","label":"Pro"}'   http://127.0.0.1:8317/_web/accounts
+```
+
+Cookies are write-only: responses report `hasCookie`/`hasCookieFile` and never echo the value.
+`update` without `cookie` keeps the stored one; `remove` of the active account moves the pointer to
+the next entry. Changes are written to `config.json` immediately (with a backup) and applied live.
 
 ---
 
@@ -300,6 +354,31 @@ All six route to the same `modelId` with two thinking depths, so the difference 
 A `cookie.txt` next to the program works too. There are no automatic extraction buttons by design.
 
 Without a cookie the bridge still starts and the models are listed, but requests are made anonymously and Google usually downgrades or refuses them. `GET /_config` reports `cookieSet: false` in that state.
+
+### Multiple accounts
+
+One gateway, several Google cookies. Each entry has its own cookie, optional proxy,
+`authUser` and label:
+
+```json
+{
+  "geminiWeb": {
+    "accounts": [
+      { "name": "personal", "cookie_file": "cookie-personal.txt", "label": "Pro", "proxy": "" },
+      { "name": "work", "cookie_file": "cookie-work.txt", "label": "Workspace", "proxy": "http://127.0.0.1:7890" }
+    ],
+    "activeAccount": "personal",
+    "autoRotateOn429": true
+  }
+}
+```
+
+- The active account is used until it fails. `401`/`403` (dead cookie) always moves to the next
+  account and retries once; `429` does so only with `autoRotateOn429: true`.
+- A failed account cools down (10 min for auth errors, 2 min for a 429) and is skipped by rotation.
+- `GET /_status` → `geminiWeb.accounts[]` shows `active`, `requests`, `errors`, `cooldownUntil`,
+  `lastError` per account; the dashboard shows the same as a single line.
+- With `accounts: []` the single `cookie`/`cookie_file` keeps working exactly as before.
 
 ### Limitations, stated plainly
 
