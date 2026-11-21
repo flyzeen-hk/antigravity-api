@@ -621,7 +621,154 @@ function start(config) {
     return adminOk(req) || authOk(req);
   }
 
-  function unauthorized(res) {
+  // Сохранение config.json: нормализованный объект целиком, с бэкапом.
+  // Путь — DATA_DIR: в Docker /app только для чтения.
+  function saveConfigFile() {
+    if (config.persistConfig === false) return null;
+    try {
+      const cfgPath = path.join(DATA_DIR, 'config.json');
+      backupFile(cfgPath);
+      writeFileAtomic(cfgPath, JSON.stringify(config, null, 2));
+      return null;
+    } catch (e) {
+      console.error('Failed to save config.json:', e);
+      return e;
+    }
+  }
+
+  // Мутация списка веб-аккаунтов: add | update | remove | activate.
+  // Секреты наружу не отдаём, в ответе только имена, статусы и предупреждения.
+  async function handleWebAccountAction(res, body) {
+    const action = String(body.action || 'add').toLowerCase();
+    const name = String(body.name || '').trim().slice(0, 80);
+    if (!['add', 'update', 'remove', 'activate'].includes(action)) {
+      return sendJson(res, 400, { error: { message: 'action: add | update | remove | activate', type: 'invalid_request_error' } });
+    }
+    if (!name) {
+      return sendJson(res, 400, { error: { message: 'name: обязательное поле', type: 'invalid_request_error' } });
+    }
+
+    const list = (config.geminiWeb.accounts || []).map((a) => ({ ...a }));
+    const idx = list.findIndex((a) => a.name.toLowerCase() === name.toLowerCase());
+    const warnings = [];
+
+    if (action === 'remove' || action === 'activate') {
+      if (idx < 0) {
+        return sendJson(res, 404, { error: { message: `Аккаунт "${name}" не найден`, type: 'not_found_error' } });
+      }
+      if (action === 'remove') list.splice(idx, 1);
+    } else {
+      const cookie = typeof body.cookie === 'string' ? body.cookie.trim() : '';
+      const cookieFile = typeof body.cookie_file === 'string' ? body.cookie_file.trim()
+        : (typeof body.cookieFile === 'string' ? body.cookieFile.trim() : '');
+      if (action === 'add' && idx >= 0) {
+        return sendJson(res, 409, { error: { message: `Аккаунт "${name}" уже есть (action=update)`, type: 'invalid_request_error' } });
+      }
+      if (action === 'update' && idx < 0) {
+        return sendJson(res, 404, { error: { message: `Аккаунт "${name}" не найден`, type: 'not_found_error' } });
+      }
+      const prev = idx >= 0 ? list[idx] : { name };
+      // Пустая cookie при update означает «не менять», а не «стереть».
+      const nextCookie = cookie || prev.cookie || '';
+      const nextCookieFile = cookieFile || prev.cookie_file || '';
+      if (!nextCookie && !nextCookieFile) {
+        return sendJson(res, 400, { error: {
+          message: 'Нужна cookie или cookie_file: без них аккаунт бесполезен',
+          type: 'invalid_request_error',
+        } });
+      }
+      if (cookie && !/SAPISID|__Secure-1PSID|__Secure-3PSID/.test(cookie)) {
+        warnings.push('в cookie нет SAPISID/__Secure-1PSID — веб-запросы, скорее всего, вернут 401/403');
+      }
+      const next = {
+        name,
+        cookie: nextCookie,
+        cookie_file: nextCookieFile,
+        proxy: typeof body.proxy === 'string' ? body.proxy.trim() : (prev.proxy || ''),
+        authUser: Number.isInteger(body.authUser) ? body.authUser : (prev.authUser ?? null),
+        label: typeof body.label === 'string' ? body.label.trim().slice(0, 80) : (prev.label || ''),
+        thinkMode: body.thinkMode === 'extended' || body.thinkMode === 'default' ? body.thinkMode : (prev.thinkMode ?? null),
+        temporaryChats: typeof body.temporaryChats === 'boolean' ? body.temporaryChats : (prev.temporaryChats === true),
+      };
+      if (idx >= 0) list[idx] = next; else list.push(next);
+    }
+
+    let activeAccount = config.geminiWeb.activeAccount || '';
+    if (action === 'activate') activeAccount = name;
+    if (action === 'remove' && activeAccount.toLowerCase() === name.toLowerCase()) activeAccount = '';
+
+    const patch = configLib.patchConfig(config, { geminiWeb: { accounts: list, activeAccount } });
+    Object.assign(config, patch.config);
+    webBridge.updateConfig(config.geminiWeb);
+    const saveErr = saveConfigFile();
+    if (saveErr) {
+      return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${saveErr.message}`, type: 'internal_error' } });
+    }
+    const ws = webBridge.summary ? webBridge.summary() : {};
+    return sendJson(res, 200, {
+      ok: true,
+      action,
+      activeAccount: config.geminiWeb.activeAccount || '',
+      accounts: ws.accounts || [],
+      warnings: [...warnings, ...patch.warnings],
+    });
+  }
+
+  // ---- защита от перебора ключа ----
+  // Ключ короткий и лежит в файле, но шлюз слушает localhost и по нему ходят
+  // скрипты: без счётчика ошибок любой локальный процесс мог бы перебирать
+  // ключ со скоростью тысяч попыток в секунду.
+  const AUTH_FAIL = { maxFailures: 20, windowMs: 60_000, blockMs: 300_000 };
+  const authFails = new Map(); // ip -> { count, firstAt, blockedUntil }
+
+  function clientIp(req) {
+    const raw = (req.socket && req.socket.remoteAddress) || 'unknown';
+    return raw.replace(/^::ffff:/, '');
+  }
+
+  function authBlocked(req) {
+    const st = authFails.get(clientIp(req));
+    if (!st) return 0;
+    const now = Date.now();
+    if (st.blockedUntil > now) return st.blockedUntil;
+    if (now - st.firstAt > AUTH_FAIL.windowMs) authFails.delete(clientIp(req));
+    return 0;
+  }
+
+  function noteAuthFailure(req) {
+    const ip = clientIp(req);
+    const now = Date.now();
+    let st = authFails.get(ip);
+    if (!st || now - st.firstAt > AUTH_FAIL.windowMs) st = { count: 0, firstAt: now, blockedUntil: 0 };
+    st.count += 1;
+    if (st.count >= AUTH_FAIL.maxFailures) {
+      st.blockedUntil = now + AUTH_FAIL.blockMs;
+      st.count = 0;
+      st.firstAt = now;
+      pushLog({ kind: 'security', status: 429, error: `auth brute-force from ${ip}, blocked ${AUTH_FAIL.blockMs / 1000}s` });
+    }
+    authFails.set(ip, st);
+    // Чистим старые записи, чтобы Map не рос бесконечно.
+    if (authFails.size > 512) {
+      for (const [key, v] of authFails) {
+        if (v.blockedUntil < now && now - v.firstAt > AUTH_FAIL.windowMs) authFails.delete(key);
+      }
+    }
+  }
+
+  function unauthorized(res, blockedUntil = 0) {
+    if (blockedUntil) {
+      res.writeHead(429, {
+        'content-type': 'application/json; charset=utf-8',
+        'retry-after': String(Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000))),
+      });
+      res.end(JSON.stringify({ error: {
+        message: 'Слишком много неверных ключей с этого адреса. Повторите позже.',
+        type: 'rate_limit_error',
+        code: 'too_many_auth_failures',
+      } }));
+      return;
+    }
     res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer' });
     res.end(JSON.stringify({ error: { message: 'Неверный API-ключ. Возьми его из apikey.txt', type: 'invalid_request_error' } }));
   }
@@ -644,6 +791,7 @@ function start(config) {
     const t0 = Date.now();
     try {
       if (!statusOk(req)) {
+        noteAuthFailure(req);
         throw diagnosticError(401, 'invalid_api_key', 'Неверный или отсутствующий ключ приложения. Проверьте Authorization: Bearer и актуальный ключ в apikey.txt.', 'auth');
       }
       if (req.method !== 'POST') {
@@ -1778,7 +1926,12 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       if (p === '/_health') return sendJson(res, 200, { ok: true, uptime: process.uptime() });
       if (p === '/api/diagnostics/chat') return await handleDiagnosticChat(req, res);
 
-      if (!statusOk(req)) return unauthorized(res);
+      const blockedUntil = authBlocked(req);
+      if (blockedUntil) return unauthorized(res, blockedUntil);
+      if (!statusOk(req)) {
+        noteAuthFailure(req);
+        return unauthorized(res);
+      }
 
       if (p === '/' || p === '/_status') {
         // Дашборд — административная поверхность: клиентский API-ключ
@@ -1848,6 +2001,42 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
         });
       }
 
+      // ---- веб-аккаунты: управление без правки config.json руками ----
+      // Cookie никогда не возвращается наружу: только признак наличия.
+      if (p === '/_web/accounts') {
+        if (!adminOk(req)) {
+          return forbidden(res, 'admin_key_required', 'Управление веб-аккаунтами доступно только с админским ключом (admin.key).');
+        }
+        if (req.method === 'GET') {
+          const ws = webBridge.summary ? webBridge.summary() : {};
+          return sendJson(res, 200, {
+            activeAccount: config.geminiWeb.activeAccount || '',
+            accounts: (config.geminiWeb.accounts || []).map((a) => ({
+              name: a.name,
+              label: a.label || '',
+              proxy: a.proxy || '',
+              authUser: a.authUser,
+              thinkMode: a.thinkMode || null,
+              temporaryChats: a.temporaryChats === true,
+              hasCookie: !!a.cookie,
+              hasCookieFile: !!a.cookie_file,
+              stats: (ws.accounts || []).find((x) => x.name === a.name) || null,
+            })),
+          });
+        }
+        if (req.method !== 'POST') {
+          res.setHeader('allow', 'GET, POST');
+          return sendJson(res, 405, { error: { message: 'Используйте GET или POST', type: 'invalid_request_error' } });
+        }
+        const readAcct = await readBodyOrRespond(req, res);
+        if (!readAcct.ok) return;
+        let acctBody;
+        try { acctBody = parseRequestBody(readAcct.raw); } catch {
+          return sendJson(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+        }
+        return await handleWebAccountAction(res, acctBody);
+      }
+
       if (req.method === 'POST' && p === '/_config') {
         if (!adminOk(req)) {
           return forbidden(res, 'admin_key_required', 'Изменение настроек доступно только с админским ключом (admin.key). Клиентский API-ключ даёт доступ только к /v1*.');
@@ -1872,17 +2061,14 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
         webBridge.updateConfig(config.geminiWeb);
         network.updateConfig(config);
 
-        if (config.persistConfig !== false && patch.applied.length) {
+        if (patch.applied.length) {
           // В файл пишем нормализованный конфиг целиком: миграции и дефолты не
           // теряются, неизвестные ключи сохраняются (deepMerge в lib/config).
           // apiKey/adminKey живут в этом же объекте, поэтому не пропадают.
-          try {
-            const cfgPath = path.join(ROOT, 'config.json');
-            backupFile(cfgPath);
-            writeFileAtomic(cfgPath, JSON.stringify(config, null, 2));
-          } catch (e) {
-            console.error('Failed to save config.json:', e);
-            return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${e.message}`, type: 'internal_error' } });
+          // Путь — DATA_DIR: в Docker /app только для чтения.
+          const saveErr = saveConfigFile();
+          if (saveErr) {
+            return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${saveErr.message}`, type: 'internal_error' } });
           }
         }
 

@@ -208,7 +208,8 @@ origin, so browser clients (Open WebUI, LibreChat, your own page) can call the g
 | GET | `/_status` | Counters, tokens, network summary, agent settings |
 | GET | `/_limits`, `/_quota` | Quotas; calls Google, can be slow on a cold start |
 | GET | `/_network/test` | Probes Cloud Code, OAuth and Gemini Web routes |
-| POST | `/_config` | Hot-updates Safe Mode, network and agent settings |
+| POST | `/_config` | Hot-updates Safe Mode, network and agent settings (admin key only) |
+| GET/POST | `/_web/accounts` | Manage Gemini-web accounts: `add` / `update` / `activate` / `remove` (admin key only) |
 | POST | `/api/diagnostics/chat` | One-shot probe with a diagnostic error contract |
 
 ### Error behaviour worth knowing
@@ -220,6 +221,19 @@ origin, so browser clients (Open WebUI, LibreChat, your own page) can call the g
 - **Client disconnect cancels the upstream request** and is logged as `499`, not as a server error.
 - **A prompt blocked by Google** returns normally with `finish_reason: content_filter` and `promptFeedback`, not a 500.
 - **Region blocks** surface as `region_not_supported` / `LOCATION_REJECTED 1060`. That is about the egress IP, not your account or cookie.
+- **Brute-forcing the key is blocked.** 20 wrong keys from one address within a minute return
+  `429 too_many_auth_failures` with `Retry-After`, and the address stays blocked for 5 minutes.
+
+### Managing web accounts over HTTP
+
+```bash
+curl -H "Authorization: Bearer <ADMIN_KEY>" http://127.0.0.1:8317/_web/accounts
+curl -X POST -H "Authorization: Bearer <ADMIN_KEY>" -H "content-type: application/json"   -d '{"action":"add","name":"personal","cookie":"SAPISID=...; __Secure-1PSID=...","label":"Pro"}'   http://127.0.0.1:8317/_web/accounts
+```
+
+Cookies are write-only: responses report `hasCookie`/`hasCookieFile` and never echo the value.
+`update` without `cookie` keeps the stored one; `remove` of the active account moves the pointer to
+the next entry. Changes are written to `config.json` immediately (with a backup) and applied live.
 
 ---
 
