@@ -1,8 +1,9 @@
 # Antigravity API — локальный шлюз в контейнере.
 #
-# ВАЖНО: cloud/* модели требуют auth.json (OAuth-токены) — монтируйте его с
-# хоста, внутри контейнера OAuth-браузер пройти нельзя. Без auth.json
-# работают только web/* модели (нужна cookie) и /_health, /_status.
+# cloud/* модели требуют auth.json (OAuth-токены) — монтируйте его с хоста,
+# внутри контейнера OAuth-браузер пройти нельзя.
+# Только веб-модели: запустите с AG_NO_CLOUD=1 — auth.json не нужен, cloud/*
+# отключаются, в /v1/models остаются web/*.
 FROM node:22-alpine
 
 # curl нужен для healthcheck, tini — чтобы SIGTERM доходил до node.

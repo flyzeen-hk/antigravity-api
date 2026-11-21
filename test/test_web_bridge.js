@@ -798,9 +798,32 @@ async function accountTests() {
   console.log('  ok  мультиаккаунт: выбор, cooldown, ротация на 429/401, совместимость');
 }
 
+// В Docker cookie.txt лежит в томе данных, а не рядом с кодом: относительный
+// путь из cookie/cookie_file должен находиться в AG_DATA_DIR.
+function dataDirCookieTests() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-cookie-data-'));
+  const prev = process.env.AG_DATA_DIR;
+  process.env.AG_DATA_DIR = dir;
+  try {
+    fs.writeFileSync(path.join(dir, 'cookie.txt'), 'SAPISID=abc123; __Secure-1PSID=xyz');
+    const b = new GeminiWebBridge({ enabled: true, cookie: 'cookie.txt' });
+    const resolved = b._resolveCookieFile('cookie.txt');
+    assert.ok(resolved && resolved.startsWith(dir), 'относительный путь не найден в AG_DATA_DIR: ' + resolved);
+    assert.ok(b.getLoadedCookie().cookieStr.includes('SAPISID=abc123'), 'cookie не прочитана из AG_DATA_DIR');
+    // JSON-форма с cookie_file тоже должна искать в томе данных.
+    const b2 = new GeminiWebBridge({ enabled: true, cookie: '{"cookie_file":"cookie.txt"}' });
+    assert.ok(b2.getLoadedCookie().cookieStr.includes('SAPISID=abc123'), 'JSON cookie_file не найден в AG_DATA_DIR');
+    console.log('  ok  cookie.txt и cookie_file находятся в AG_DATA_DIR (Docker)');
+  } finally {
+    if (prev === undefined) delete process.env.AG_DATA_DIR; else process.env.AG_DATA_DIR = prev;
+    try { removeTree(dir); } catch {}
+  }
+}
+
 runErrorRegressions().then(runRouteRegressions).then(async () => {
   await accountTests();
   languageTests();
+  dataDirCookieTests();
   console.log('ALL GEMINI 4 WEB BRIDGE UNIT TESTS PASSED!');
 }).catch(error => {
   console.error(error);

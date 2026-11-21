@@ -23,6 +23,7 @@ const NODE_TESTS = [
   ['файловые инструменты агента', 'test/agent_tools_test.js'],
   ['веб-мост Gemini', 'test/test_web_bridge.js'],
   ['диагностика', 'test/test_diagnostics.js'],
+  ['режим только веб-моделей (AG_NO_CLOUD)', 'test/test_web_only.js'],
 ];
 
 const PY_TESTS = [

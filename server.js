@@ -46,6 +46,11 @@ const ROOT = __dirname; // код
 // Данные (config.json, apikey.txt, auth.json, usage.json, backups/) можно
 // вынести из папки с кодом: нужно для Docker, где /app только для чтения.
 const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT;
+
+// AG_NO_CLOUD=1 — режим «только веб-модели»: контейнеру без auth.json не нужен
+// OAuth-токен Antigravity. cloud/* отвечают понятной ошибкой, /v1/models
+// показывает только web/*.
+const CLOUD_DISABLED = /^(1|true|yes)$/i.test(String(process.env.AG_NO_CLOUD || '').trim());
 const ADMIN_KEY_FILE = 'admin.key';
 
 // Единственный источник истины по дефолтам — lib/config/defaults.js.
@@ -404,11 +409,30 @@ function start(config) {
   // Ищем локальный relay (AGUnlocker) сразу, не дожидаясь первого cloud-запроса.
   if (network.autoDetect) network.autoDetect();
   const authFile = process.env.AG_AUTH_FILE || path.join(DATA_DIR, 'auth.json');
-  if (!fs.existsSync(authFile)) {
-    console.log(`\n  ! Не найден ${authFile} — сначала: python scripts\\extract_token.py\n`);
-    process.exit(1);
+  let tokens;
+  if (CLOUD_DISABLED) {
+    // Заглушка: любой вызов cloud-пути даёт 503 с явной причиной, а не падение
+    // на старте из-за отсутствующего auth.json.
+    const cloudOff = () => {
+      const e = new Error('cloud-модели отключены (AG_NO_CLOUD=1). Работают только web/* модели.');
+      e.status = 503;
+      e.code = 'cloud_disabled';
+      return e;
+    };
+    tokens = {
+      projectId: '',
+      email: '',
+      getAccessToken: async () => { throw cloudOff(); },
+      summary: () => ({ email: '', projectId: '', expiresAt: 0, hasRefreshToken: false }),
+    };
+  } else {
+    if (!fs.existsSync(authFile)) {
+      console.log(`\n  ! Не найден ${authFile} — сначала: python scripts\\extract_token.py`);
+      console.log('    Либо запустите без cloud: AG_NO_CLOUD=1 (только web-модели).\n');
+      process.exit(1);
+    }
+    tokens = new TokenManager(authFile, { network });
   }
-  const tokens = new TokenManager(authFile, { network });
   const catalog = new ModelCatalog(config.upstreamHost, {
     project: tokens.projectId,
     userAgent: config.userAgent,
@@ -442,7 +466,24 @@ function start(config) {
     } catch {}
   }
 
-  const webBridge = new GeminiWebBridge({ ...(config.geminiWeb || {}), network, onCookieRotated: persistRotatedCookie });
+  // Переключение аккаунта из-за 429/401 фиксируем в конфиге: иначе рестарт
+  // вернёт исходный аккаунт, который как раз и отказал.
+  function persistActiveAccount(name) {
+    try {
+      config.geminiWeb = { ...(config.geminiWeb || {}), activeAccount: name };
+      if (config.persistConfig !== false) {
+        const cfgPath = path.join(DATA_DIR, 'config.json');
+        backupFile(cfgPath);
+        writeFileAtomic(cfgPath, JSON.stringify(config, null, 2));
+      }
+    } catch {}
+  }
+
+  const webBridge = new GeminiWebBridge({
+    ...(config.geminiWeb || {}), network,
+    onCookieRotated: persistRotatedCookie,
+    onAccountSwitch: persistActiveAccount,
+  });
   webBridge.ensureBlFresh(true).catch(() => {}); // фоновое обновление BL-версии, best-effort
   const netSummary = network.summary();
   if (netSummary.active) {
@@ -906,6 +947,10 @@ function start(config) {
     if (!parsed.ok) {
       return anthropicError(res, 404, 'not_found_error', `model: неизвестная модель "${modelName}". Список: GET /v1/models`);
     }
+    if (CLOUD_DISABLED) {
+      return anthropicError(res, 400, 'invalid_request_error',
+        'Anthropic /v1/messages работает только через cloud-модели, а они отключены (AG_NO_CLOUD=1).');
+    }
     if (parsed.namespace === providers.WEB) {
       // У веб-канала нет нативного function calling и thinking-блоков,
       // поэтому /v1/messages для web/* не притворяется рабочим.
@@ -1041,6 +1086,16 @@ function start(config) {
     };
   }
 
+  function cloudDisabledError() {
+    return {
+      error: {
+        message: 'cloud-модели отключены (AG_NO_CLOUD=1). Используйте web/<alias> модели или уберите AG_NO_CLOUD.',
+        type: 'invalid_request_error',
+        code: 'cloud_disabled',
+      },
+    };
+  }
+
   function webAgentDisabledError() {
     return {
       error: {
@@ -1101,6 +1156,7 @@ function start(config) {
     const model = parsed.baseId;
     const requestedModel = parsed.displayId;
     const useWeb = parsed.namespace === providers.WEB;
+    if (!useWeb && CLOUD_DISABLED) return sendJson(res, 400, cloudDisabledError());
 
     // Web-модель при выключенном мосте — та же ошибка, что и в обычном пути.
     if (useWeb && !webBridge.isWebModel(model)) {
@@ -1141,11 +1197,18 @@ function start(config) {
       extraTools: plannerActive ? ['ask_planner'] : [],
     });
 
+    // Клиент мог закрыть вкладку: без сигнала веб-агент продолжает генерировать
+    // и жечь лимит аккаунта до таймаута.
+    const webAc = new AbortController();
+    const onWebClose = () => { if (!res.writableEnded) webAc.abort(); };
+    res.once('close', onWebClose);
+
     // Web-мост: каждая итерация — один веб-запрос с полным transcript'ом.
     // Такая эмуляция протокола текстом — VERY unreliable (лимит длины ответа).
     const chatWeb = async (msgs) => {
+      if (webAc.signal.aborted) throw Object.assign(new Error('client disconnected'), { code: 'client_disconnected' });
       const out = await webBridge.handleOpenAIChat(
-        { model, messages: msgs, tools: agent.TOOL_SPECS }, false, null);
+        { model, messages: msgs, tools: agent.TOOL_SPECS }, false, null, { signal: webAc.signal });
       const m = out.choices?.[0]?.message || {};
       return { content: m.content || '', tool_calls: m.tool_calls || [], usage: out.usage, upstream_model: out.upstream_model };
     };
@@ -1333,6 +1396,7 @@ function start(config) {
       parsed = (await resolveFlatModel(body.model.trim())) || parsed;
     }
     if (!parsed.ok) return sendNamespaceError(res, parsed);
+    if (parsed.namespace === providers.CLOUD && CLOUD_DISABLED) return sendJson(res, 400, cloudDisabledError());
     const stream = !!body.stream;
 
     // Агентный режим — только явные триггеры: суффикс -agent у модели,
@@ -1517,6 +1581,7 @@ function start(config) {
     const model = parsedModel.baseId;
     const displayModel = parsedModel.displayId;
     const isWeb = parsedModel.namespace === providers.WEB;
+    if (!isWeb && CLOUD_DISABLED) return sendJson(res, 400, cloudDisabledError());
 
     if (method === 'countTokens') {
       if (isWeb) {
@@ -1703,7 +1768,7 @@ function start(config) {
 
   async function buildOpenAIModels() {
     let data = [];
-    try {
+    if (!CLOUD_DISABLED) try {
       const models = await catalog.list(() => tokens.getAccessToken());
       data = [...models.entries()].map(([id, m]) => ({
         id: providers.formatModel(providers.CLOUD, id),
@@ -1740,7 +1805,7 @@ function start(config) {
 
   async function buildGeminiModels() {
     const models = [];
-    try {
+    if (!CLOUD_DISABLED) try {
       const upstreamModels = await catalog.list(() => tokens.getAccessToken());
       for (const [id, m] of upstreamModels.entries()) {
         models.push({
@@ -2025,6 +2090,22 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       }
 
       if (p === '/_limits' || p === '/_quota') {
+        if (CLOUD_DISABLED) {
+          // Без OAuth-токена квоты Cloud Code недоступны: отдаём локальные
+          // счётчики и состояние веб-моста, чтобы панель не висела.
+          const reply = {
+            local: guard.summary(),
+            account: { error: 'cloud_disabled' },
+            models: [],
+            modelsError: 'cloud-модели отключены (AG_NO_CLOUD=1)',
+            quotaFamilies: {},
+            serverQuotas: null,
+            config: { safeMode: guard.cfg },
+            geminiWeb: webBridge.summary ? webBridge.summary() : null,
+            network: network.summary(),
+          };
+          return sendJson(res, 200, p === '/_quota' ? { serverQuotas: null } : reply);
+        }
         // Независимые запросы — параллельно: иначе холодный вызов ждёт Google
         // последовательно (15с+15с), а GUI сдаётся раньше. Кэш: квоты 30с, аккаунт 300с.
         const quotaP = upstream.getQuotaSummary();

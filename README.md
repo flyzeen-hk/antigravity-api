@@ -111,9 +111,13 @@ Notes that matter:
 
 - The container listens on `0.0.0.0` **inside** the container, but compose publishes it to `127.0.0.1:8317` on the host only.
 - `AG_HOST` and `AG_PORT` apply to the current run and are **not** written into `config.json`.
-- `cookie.txt` is looked up next to the code, in the working directory and in `AG_DATA_DIR`, so `data/cookie.txt` works.
+- `cookie.txt` and `cookie_file` paths are looked up next to the code, in the working directory **and in `AG_DATA_DIR`**, so `data/cookie.txt` and `cookie_file: "cookie-work.txt"` both work.
 - The container runs as uid 1000 with a read-only root filesystem; if `./data` was created by root, fix it with `chown -R 1000:1000 data` (compose already sets `user: "1000:1000"`).
-- Without `auth.json` the server exits with a clear message; only `web/` models need a cookie.
+- **Web-only mode:** set `AG_NO_CLOUD=1` to run without `auth.json`. `cloud/*` then answers `400 cloud_disabled`, `/v1/models` lists only `web/*`, and quotas show as unavailable instead of hanging.
+
+```bash
+AG_NO_CLOUD=1 docker compose up -d    # only web models, no Antigravity session
+```
 
 ---
 
@@ -579,7 +583,13 @@ cp auth.json cookie.txt data/         # cookie.txt нужен только дл�
 docker compose up -d
 ```
 
-В `data/` появятся `config.json`, `apikey.txt` (клиентский ключ), `admin.key` (панель и `/_config`), `usage.json`, `backups/`, `agent_workspace/` и `agent_audit.jsonl`. Контейнер слушает `0.0.0.0` только внутри, наружу опубликован `127.0.0.1:8317`. `AG_HOST` и `AG_PORT` действуют на текущий запуск и **не записываются** в `config.json`. Если `./data` создан от root, выполните `chown -R 1000:1000 data`.
+В `data/` появятся `config.json`, `apikey.txt` (клиентский ключ), `admin.key` (панель и `/_config`), `usage.json`, `backups/`, `agent_workspace/` и `agent_audit.jsonl`. Контейнер слушает `0.0.0.0` только внутри, наружу опубликован `127.0.0.1:8317`. `AG_HOST` и `AG_PORT` действуют на текущий запуск и **не записываются** в `config.json`. Пути `cookie.txt` и `cookie_file` ищутся рядом с кодом, в рабочей папке **и в `AG_DATA_DIR`**, поэтому `data/cookie.txt` и `cookie_file: "cookie-work.txt"` работают. Если `./data` создан от root, выполните `chown -R 1000:1000 data`.
+
+**Только веб-модели, без `auth.json`:** запустите с `AG_NO_CLOUD=1`. Тогда `cloud/*` отвечают `400 cloud_disabled`, `/v1/models` показывает только `web/*`, а квоты сообщают о недоступности вместо зависания.
+
+```bash
+AG_NO_CLOUD=1 docker compose up -d    # только веб-модели, без сессии Antigravity
+```
 
 ## Первый запуск
 
