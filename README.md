@@ -95,6 +95,26 @@ python app.py                         # panel; press Start API Server
 node server.js                        # reads auth.json, serves on 127.0.0.1:8317
 ```
 
+### Docker
+
+The image contains only the Node gateway — no panel, no Python. All mutable state lives in the `data` volume.
+
+```bash
+mkdir -p data
+cp auth.json cookie.txt data/         # cookie.txt only if you use web/ models
+docker compose up -d
+```
+
+What appears in `data/`: `config.json`, `apikey.txt` (client key), `admin.key` (panel and `/_config`), `usage.json`, `backups/`, `agent_workspace/` and `agent_audit.jsonl`.
+
+Notes that matter:
+
+- The container listens on `0.0.0.0` **inside** the container, but compose publishes it to `127.0.0.1:8317` on the host only.
+- `AG_HOST` and `AG_PORT` apply to the current run and are **not** written into `config.json`.
+- `cookie.txt` is looked up next to the code, in the working directory and in `AG_DATA_DIR`, so `data/cookie.txt` works.
+- The container runs as uid 1000 with a read-only root filesystem; if `./data` was created by root, fix it with `chown -R 1000:1000 data` (compose already sets `user: "1000:1000"`).
+- Without `auth.json` the server exits with a clear message; only `web/` models need a cookie.
+
 ---
 
 ## First run
@@ -137,13 +157,15 @@ Rules that are easy to trip over:
 
 ## Endpoints
 
-All endpoints except `/_health` require the key. Three ways are accepted:
+All endpoints except `/_health` require a key. Two keys exist: the client key from `apikey.txt` and the admin key from `admin.key`. Three ways to pass the client key:
 
 ```bash
 -H "Authorization: Bearer <KEY>"      # OpenAI style
 -H "x-goog-api-key: <KEY>"            # Gemini SDK style
 ?key=<KEY>                            # query style
 ```
+
+The **admin key** (header `x-admin-key` or `Authorization: Bearer`) is required for `/_config`, the HTML dashboard and web-account management. It is generated on first run into `admin.key` next to `apikey.txt` and is never returned by the API.
 
 ### OpenAI-compatible
 
@@ -161,6 +183,13 @@ All endpoints except `/_health` require the key. Three ways are accepted:
 | POST | `/v1beta/models/{m}:streamGenerateContent` | Add `?alt=sse` for SSE framing |
 | POST | `/v1beta/models/{m}:countTokens` | For `web/` models this is a local estimate, not a Google call |
 | GET | `/v1beta/models/{m}` | Model metadata |
+
+### Anthropic-compatible
+
+| Method | Path | Notes |
+|---|---|---|
+| POST | `/v1/messages` | Claude-style body (`messages`, `system`, `max_tokens`); streaming and tools supported |
+| POST | `/v1/messages/count_tokens` | Token estimate for the same body shape |
 
 ### Local
 
@@ -486,6 +515,16 @@ python app.py                         # панель; нажмите Start API S
 node server.js                        # читает auth.json, слушает 127.0.0.1:8317
 ```
 
+**Docker.** В образе только Node-шлюз, без панели и Python; всё изменяемое — в томе `data`.
+
+```bash
+mkdir -p data
+cp auth.json cookie.txt data/         # cookie.txt нужен только для web/ моделей
+docker compose up -d
+```
+
+В `data/` появятся `config.json`, `apikey.txt` (клиентский ключ), `admin.key` (панель и `/_config`), `usage.json`, `backups/`, `agent_workspace/` и `agent_audit.jsonl`. Контейнер слушает `0.0.0.0` только внутри, наружу опубликован `127.0.0.1:8317`. `AG_HOST` и `AG_PORT` действуют на текущий запуск и **не записываются** в `config.json`. Если `./data` создан от root, выполните `chown -R 1000:1000 data`.
+
 ## Первый запуск
 
 1. Запустите панель (`python app.py`, `run.bat` или ярлык). Она открывается на **английском**; кнопки **RU / EN** в шапке переключают язык.
@@ -531,6 +570,10 @@ node server.js                        # читает auth.json, слушает 1
 ```
 
 **OpenAI-совместимые:** `POST /v1/chat/completions` (включая `"stream": true` и `tool_calls` для `cloud/`), `GET /v1/models`, `GET /v1/models/{id}`.
+
+**Anthropic-совместимые:** `POST /v1/messages` (стриминг и инструменты), `POST /v1/messages/count_tokens`.
+
+**Ключи.** Клиентский ключ лежит в `apikey.txt`; для `/_config`, HTML-дашборда и управления веб-аккаунтами нужен отдельный `admin.key` (заголовок `x-admin-key`), он создаётся при первом запуске и никогда не отдаётся через API.
 
 **Gemini-нативные:** `POST /v1beta/models/{m}:generateContent`, `:streamGenerateContent` (добавьте `?alt=sse` для SSE-кадров), `:countTokens`, `GET /v1beta/models/{m}`. Для моделей `web/` счётчик токенов — локальная оценка, а не вызов Google.
 
