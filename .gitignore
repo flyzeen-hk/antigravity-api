@@ -1,6 +1,7 @@
 # Secrets & local authentication (CRITICAL: NEVER COMMIT)
 auth.json
 apikey.txt
+admin.key
 config.json
 usage.json
 cookie.txt
@@ -55,3 +56,6 @@ Desktop.ini
 
 # Third-party reference source, not part of this project
 gemini_web2api_reference.py
+
+# Docker data volume (mount point for /data)
+data/
