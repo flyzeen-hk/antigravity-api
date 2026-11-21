@@ -22,6 +22,7 @@ const PORT_OAUTH = 9531;
 const PORT_UPSTREAM = 9532;
 const PORT_API = 9533;
 const KEY = 'test-key-123';
+const ADMIN_KEY = 'test-admin-key-456';
 
 let passed = 0;
 let failed = 0;
@@ -86,6 +87,7 @@ function api(port, method, p, body, headers = {}) {
 }
 
 const AUTH = () => ({ authorization: 'Bearer ' + KEY });
+const AUTH_ADMIN = () => ({ authorization: 'Bearer ' + ADMIN_KEY });
 
 // ---------- моки ----------
 
@@ -279,6 +281,9 @@ async function main() {
   const usageFile = path.join(os.tmpdir(), 'ag-test-usage-' + Date.now() + '.json');
   fs.writeFileSync(usageFile, JSON.stringify({ days: {}, cooldowns: {} }));
   process.env.AG_USAGE_FILE = usageFile;
+  // Тесты передают agent.workspaceRoot во временных папках: разрешаем песочнице
+  // работать в пределах %TEMP% (в проде база — DATA_DIR).
+  process.env.AG_WORKSPACE_BASE = os.tmpdir();
 
   const api1 = start({
     port: PORT_API,
@@ -286,6 +291,7 @@ async function main() {
     upstreamHost: `http://127.0.0.1:${PORT_UPSTREAM}`,
     userAgent: 'antigravity-test/1.0',
     apiKey: KEY,
+    adminKey: ADMIN_KEY,
     includeThoughts: false,
     requestTimeoutMs: 30000,
     retries: 0,
@@ -309,6 +315,7 @@ async function main() {
   await new Promise((r) => setTimeout(r, 250));
 
   const A = (p, method = 'GET', body = null, headers = AUTH()) => api(PORT_API, method, p, body, headers);
+  const ADM = (p, method = 'GET', body = null) => api(PORT_API, method, p, body, AUTH_ADMIN());
 
   await ok('auth: неверный ключ -> 401', async () => {
     const r = await api(PORT_API, 'GET', '/v1/models', null, { authorization: 'Bearer wrong' });
@@ -351,6 +358,138 @@ async function main() {
     assert.strictEqual(j.choices[0].finish_reason, 'stop');
     assert.deepStrictEqual(j.usage, { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 });
     assert.ok(j.id.startsWith('chatcmpl-ag-'));
+  });
+
+  await ok('config: normalize({}) возвращает рабочие дефолты, а не пустоту', async () => {
+    const configLib = require('../lib/config');
+    const { config } = configLib.normalize({});
+    assert.strictEqual(config.upstreamHost, 'https://daily-cloudcode-pa.googleapis.com');
+    assert.strictEqual(config.upstreamFallbackHost, 'https://cloudcode-pa.googleapis.com');
+    assert.ok(config.userAgent, 'userAgent задан');
+    assert.ok(config.requestTimeoutMs > 0 && config.retries >= 0);
+    assert.strictEqual(config.port, 8317);
+    assert.strictEqual(config.agent.enabled, true, 'агент включён по умолчанию');
+    assert.strictEqual(config.safeMode.enabled, false, 'Safe Mode выключен по умолчанию');
+    // пользовательские значения перекрывают дефолты, а не затирают соседние
+    const merged = configLib.normalize({ port: 9000, agent: { maxIterations: 5 } }).config;
+    assert.strictEqual(merged.port, 9000);
+    assert.strictEqual(merged.agent.maxIterations, 5);
+    assert.strictEqual(merged.upstreamHost, 'https://daily-cloudcode-pa.googleapis.com');
+  });
+
+  await ok('anthropic: /v1/messages non-stream -> текст, usage, stop_reason', async () => {
+    const r = await A('/v1/messages', 'POST', {
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 64,
+      system: 'ты — тест',
+      messages: [{ role: 'user', content: 'привет' }],
+    });
+    assert.strictEqual(r.status, 200, r.text);
+    const j = JSON.parse(r.text);
+    assert.strictEqual(j.type, 'message');
+    assert.strictEqual(j.role, 'assistant');
+    assert.match(j.id, /^msg_/);
+    assert.ok(j.content.some((b) => b.type === 'text' && b.text.includes('Привет')), JSON.stringify(j.content));
+    assert.strictEqual(j.stop_reason, 'end_turn');
+    assert.deepStrictEqual(j.usage, { input_tokens: 11, output_tokens: 7 });
+    // запрос ушёл в апстрим как обычный Gemini-запрос
+    assert.strictEqual(mockUp.state.lastBody.model, 'claude-sonnet-4-5-20250929');
+    assert.strictEqual(mockUp.state.lastBody.request.systemInstruction.parts[0].text, 'ты — тест');
+    assert.strictEqual(mockUp.state.lastBody.request.generationConfig.maxOutputTokens, 64);
+  });
+
+  await ok('anthropic: ключ принимается и как x-api-key', async () => {
+    const r = await api(PORT_API, 'POST', '/v1/messages', {
+      model: 'cloud/gemini-3-flash', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }],
+    }, { 'x-api-key': KEY, 'anthropic-version': '2023-06-01' });
+    assert.strictEqual(r.status, 200, r.text);
+    const bad = await api(PORT_API, 'POST', '/v1/messages', {
+      model: 'cloud/gemini-3-flash', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }],
+    }, { 'x-api-key': 'sk-ant-wrong' });
+    assert.strictEqual(bad.status, 401);
+  });
+
+  await ok('anthropic: стрим идёт событиями message_start -> delta -> message_stop', async () => {
+    const r = await A('/v1/messages', 'POST', {
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 64,
+      stream: true,
+      messages: [{ role: 'user', content: 'привет' }],
+    });
+    assert.strictEqual(r.status, 200, r.text);
+    assert.match(r.text, /event: message_start/);
+    const events = r.text.split('\n\n').filter(Boolean).map((chunk) => {
+      const type = (chunk.match(/^event: (.+)$/m) || [])[1];
+      const data = (chunk.match(/^data: (.+)$/m) || [])[1];
+      return { type, data: data ? JSON.parse(data) : null };
+    });
+    const order = events.map((e) => e.type);
+    assert.strictEqual(order[0], 'message_start');
+    assert.ok(order.indexOf('content_block_delta') > 0);
+    assert.strictEqual(order[order.length - 2], 'message_delta');
+    assert.strictEqual(order[order.length - 1], 'message_stop');
+    const text = events.filter((e) => e.type === 'content_block_delta' && e.data.delta.type === 'text_delta')
+      .map((e) => e.data.delta.text).join('');
+    assert.strictEqual(text, 'Привет, мир');
+    // message_start уходит сразу, usage приходит с последним чанком апстрима
+    assert.strictEqual(events[0].data.message.usage.output_tokens, 0);
+    const delta = events[order.length - 2].data;
+    assert.strictEqual(delta.delta.stop_reason, 'end_turn');
+    assert.deepStrictEqual(delta.usage, { input_tokens: 11, output_tokens: 7 });
+  });
+
+  await ok('anthropic: tool_use в ответе + схема инструмента очищается', async () => {
+    const r = await A('/v1/messages', 'POST', {
+      model: 'claude-sonnet-4-5-20250929',
+      max_tokens: 128,
+      messages: [{ role: 'user', content: 'CALL_TOOL' }],
+      tools: [{
+        name: 'get_weather',
+        description: 'погода',
+        input_schema: { $schema: 'http://json-schema.org/draft-07/schema#', additionalProperties: false, type: 'object', properties: { city: { type: 'string' } }, required: ['city'] },
+      }],
+      tool_choice: { type: 'auto' },
+    });
+    assert.strictEqual(r.status, 200, r.text);
+    const j = JSON.parse(r.text);
+    const tool = j.content.find((b) => b.type === 'tool_use');
+    assert.ok(tool, JSON.stringify(j.content));
+    assert.strictEqual(tool.name, 'get_weather');
+    assert.deepStrictEqual(tool.input, { city: 'Москва' });
+    assert.strictEqual(j.stop_reason, 'tool_use');
+    const decl = mockUp.state.lastBody.request.tools[0].functionDeclarations[0];
+    assert.strictEqual(decl.parameters.$schema, undefined, '$schema вычищен');
+    assert.strictEqual(decl.parameters.additionalProperties, undefined, 'additionalProperties вычищен');
+    assert.strictEqual(mockUp.state.lastBody.request.toolConfig.functionCallingConfig.mode, 'AUTO');
+  });
+
+  await ok('anthropic: count_tokens и валидация входа', async () => {
+    const c = await A('/v1/messages/count_tokens', 'POST', {
+      model: 'claude-sonnet-4-5-20250929', messages: [{ role: 'user', content: 'привет мир' }],
+    });
+    assert.strictEqual(c.status, 200, c.text);
+    assert.ok(JSON.parse(c.text).input_tokens >= 1);
+
+    const noMax = await A('/v1/messages', 'POST', { model: 'claude-sonnet-4-5-20250929', messages: [{ role: 'user', content: 'x' }] });
+    assert.strictEqual(noMax.status, 400);
+    assert.strictEqual(JSON.parse(noMax.text).error.type, 'invalid_request_error');
+
+    const noMsg = await A('/v1/messages', 'POST', { model: 'claude-sonnet-4-5-20250929', max_tokens: 8 });
+    assert.strictEqual(noMsg.status, 400);
+
+    const noModel = await A('/v1/messages', 'POST', { max_tokens: 8, messages: [{ role: 'user', content: 'x' }] });
+    assert.strictEqual(noModel.status, 400);
+    assert.strictEqual(JSON.parse(noModel.text).type, 'error', 'ошибка в Anthropic-формате');
+  });
+
+  await ok('CORS: preflight OPTIONS отдаёт 204 и заголовки', async () => {
+    const r = await api(PORT_API, 'OPTIONS', '/v1/chat/completions', null, {
+      origin: 'http://localhost:3000',
+      'access-control-request-headers': 'authorization,content-type',
+    });
+    assert.strictEqual(r.status, 204);
+    assert.strictEqual(r.headers['access-control-allow-origin'], 'http://localhost:3000');
+    assert.match(String(r.headers['access-control-allow-headers']), /authorization/);
   });
 
   await ok('chat/completions: перевод запроса (system, роли, параметры)', async () => {
@@ -594,7 +733,7 @@ async function main() {
   });
 
   await ok('/_config: динамическое изменение лимитов Safe Mode', async () => {
-    const r = await A('/_config', 'POST', { safeMode: { maxRequestsPerMinute: 42, maxRequestsPerDay: 555 } });
+    const r = await ADM('/_config', 'POST', { safeMode: { maxRequestsPerMinute: 42, maxRequestsPerDay: 555 } });
     assert.strictEqual(r.status, 200, r.text);
     const j = JSON.parse(r.text);
     assert.strictEqual(j.ok, true);
@@ -603,7 +742,7 @@ async function main() {
   });
 
   await ok('/_config: сетевые настройки применяются на лету и редактируются', async () => {
-    const on = await A('/_config', 'POST', {
+    const on = await ADM('/_config', 'POST', {
       network: { proxy: '', dohUrl: '', dnsServers: ['1.1.1.1'], useEnvProxy: false },
       dnsServers: ['1.1.1.1'],
     });
@@ -613,7 +752,7 @@ async function main() {
     assert.deepStrictEqual(j.network.dnsServers, ['1.1.1.1']);
     assert.strictEqual(j.network.proxy, '');
 
-    const off = await A('/_config', 'POST', {
+    const off = await ADM('/_config', 'POST', {
       network: { proxy: '', dohUrl: '', dnsServers: [], useEnvProxy: false },
       dnsServers: [],
     });
@@ -707,7 +846,7 @@ async function main() {
   });
 
   await ok('web-bridge config toggles advertise and hide Gemini 4 models', async () => {
-    const off = await A('/_config', 'POST', { geminiWeb: { enabled: false } });
+    const off = await ADM('/_config', 'POST', { geminiWeb: { enabled: false } });
     assert.strictEqual(off.status, 200, off.text);
     let j = JSON.parse(off.text);
     assert.strictEqual(j.ok, true);
@@ -723,7 +862,7 @@ async function main() {
     assert.strictEqual(JSON.parse(bad.text).error.type, 'invalid_request_error');
     assert.strictEqual(JSON.parse(bad.text).error.code, 'web_bridge_disabled');
 
-    const on = await A('/_config', 'POST', { geminiWeb: { enabled: true, cookie: 'SAPISID=test-cookie-value; OTHER=1', temporaryChats: true } });
+    const on = await ADM('/_config', 'POST', { geminiWeb: { enabled: true, cookie: 'SAPISID=test-cookie-value; OTHER=1', temporaryChats: true } });
     j = JSON.parse(on.text);
     assert.strictEqual(j.geminiWeb.enabled, true);
     assert.strictEqual(j.geminiWeb.cookieSet, true, 'cookieSet не поднялся');
@@ -737,28 +876,96 @@ async function main() {
     assert.strictEqual(JSON.parse(lim.text).geminiWeb.enabled, true, '/_limits не отдаёт geminiWeb');
 
     // вернуть нейтральное состояние моста для следующих тестов
-    const reset = await A('/_config', 'POST', { geminiWeb: { cookie: '', temporaryChats: false } });
+    const reset = await ADM('/_config', 'POST', { geminiWeb: { cookie: '', temporaryChats: false } });
     assert.strictEqual(JSON.parse(reset.text).geminiWeb.cookieSet, false);
+  });
+
+  await ok('/_config и /_web/accounts: клиентский ключ не админ', async () => {
+    const cfg = await A('/_config', 'POST', { safeMode: { maxRequestsPerMinute: 5 } });
+    assert.strictEqual(cfg.status, 403, 'клиентский ключ не должен менять конфиг');
+    assert.strictEqual(JSON.parse(cfg.text).error.code, 'admin_key_required');
+    const accounts = await A('/_web/accounts');
+    assert.strictEqual(accounts.status, 403, 'клиентский ключ не должен видеть аккаунты');
+    const dash = await A('/');
+    assert.strictEqual(dash.status, 403, 'HTML-дашборд не для клиентского ключа');
+    const status = await A('/_status');
+    assert.strictEqual(status.status, 200, '/_status остаётся доступен на чтение');
+    assert.ok(JSON.parse(status.text).network, '/_status отдаёт сводку сети для клиентского ключа');
+  });
+
+  await ok('/_web/accounts: add / update / activate / remove без правки config.json', async () => {
+    const empty = await ADM('/_web/accounts');
+    assert.strictEqual(empty.status, 200, empty.text);
+    assert.deepStrictEqual(JSON.parse(empty.text).accounts, []);
+
+    const add = await ADM('/_web/accounts', 'POST', {
+      action: 'add', name: 'personal', label: 'Pro',
+      cookie: 'SAPISID=secret-one; __Secure-1PSID=x',
+    });
+    assert.strictEqual(add.status, 200, add.text);
+    const addJ = JSON.parse(add.text);
+    assert.strictEqual(addJ.accounts.length, 1);
+    assert.strictEqual(addJ.accounts[0].name, 'personal');
+    assert.strictEqual(addJ.accounts[0].hasCookie, true);
+    assert.ok(!/secret-one/.test(add.text), 'cookie не должна утекать в ответ');
+
+    const dup = await ADM('/_web/accounts', 'POST', { action: 'add', name: 'personal', cookie: 'SAPISID=x' });
+    assert.strictEqual(dup.status, 409, 'дубликат имени отклоняется');
+
+    const noCookie = await ADM('/_web/accounts', 'POST', { action: 'add', name: 'empty' });
+    assert.strictEqual(noCookie.status, 400, 'аккаунт без cookie бесполезен');
+
+    const second = await ADM('/_web/accounts', 'POST', {
+      action: 'add', name: 'work', cookie: 'SAPISID=secret-two', proxy: 'http://127.0.0.1:7890',
+    });
+    assert.strictEqual(second.status, 200, second.text);
+    assert.strictEqual(JSON.parse(second.text).accounts.length, 2);
+
+    // update без cookie не стирает прежнюю
+    const upd = await ADM('/_web/accounts', 'POST', { action: 'update', name: 'personal', label: 'личный' });
+    assert.strictEqual(upd.status, 200, upd.text);
+    const afterUpd = JSON.parse(upd.text).accounts.find((a) => a.name === 'personal');
+    assert.strictEqual(afterUpd.label, 'личный');
+    assert.strictEqual(afterUpd.hasCookie, true, 'cookie сохранилась при update');
+
+    const act = await ADM('/_web/accounts', 'POST', { action: 'activate', name: 'work' });
+    assert.strictEqual(act.status, 200, act.text);
+    assert.strictEqual(JSON.parse(act.text).activeAccount, 'work');
+    assert.strictEqual(JSON.parse(act.text).accounts.find((a) => a.name === 'work').active, true);
+
+    const bad = await ADM('/_web/accounts', 'POST', { action: 'nope', name: 'work' });
+    assert.strictEqual(bad.status, 400);
+
+    const rm = await ADM('/_web/accounts', 'POST', { action: 'remove', name: 'work' });
+    assert.strictEqual(rm.status, 200, rm.text);
+    assert.strictEqual(JSON.parse(rm.text).accounts.length, 1);
+    assert.notStrictEqual(JSON.parse(rm.text).activeAccount, 'work', 'активный аккаунт переехал');
+
+    const list = await ADM('/_web/accounts');
+    assert.strictEqual(JSON.parse(list.text).accounts.length, 1);
+    // чистим за собой, чтобы не влиять на соседние тесты
+    await ADM('/_web/accounts', 'POST', { action: 'remove', name: 'personal' });
+    assert.deepStrictEqual(JSON.parse((await ADM('/_web/accounts')).text).accounts, []);
   });
 
   await ok('web-bridge: cookie_file загружается при пустом cookie (как сохраняет GUI)', async () => {
     const file = path.join(__dirname, '..', 'test_cookie_file_runtime.txt');
     fs.writeFileSync(file, 'SAPISID=file-cookie-sapisid; SID=s;');
     try {
-      const r = await A('/_config', 'POST', {
+      const r = await ADM('/_config', 'POST', {
         geminiWeb: { cookie: '', cookie_file: 'test_cookie_file_runtime.txt' },
       });
       assert.strictEqual(r.status, 200, r.text);
       assert.strictEqual(JSON.parse(r.text).geminiWeb.cookieSet, true,
         'cookie_file проигнорирован при пустом cookie');
 
-      const missing = await A('/_config', 'POST', {
+      const missing = await ADM('/_config', 'POST', {
         geminiWeb: { cookie: '', cookie_file: 'missing_cookie_file_runtime.txt' },
       });
       assert.strictEqual(JSON.parse(missing.text).geminiWeb.cookieSet, false,
         'несуществующий файл не должен считаться cookie');
 
-      const reset = await A('/_config', 'POST', { geminiWeb: { cookie: '', cookie_file: '' } });
+      const reset = await ADM('/_config', 'POST', { geminiWeb: { cookie: '', cookie_file: '' } });
       assert.strictEqual(JSON.parse(reset.text).geminiWeb.cookieSet, false);
     } finally {
       try { fs.unlinkSync(file); } catch {}
@@ -954,7 +1161,7 @@ async function main() {
       assert.strictEqual(blockedBuiltin.status, 400, blockedBuiltin.text);
       assert.strictEqual(JSON.parse(blockedBuiltin.text).error.code, 'web_agent_disabled');
 
-      const on = await A('/_config', 'POST', { agent: { allowWebAgent: true } });
+      const on = await ADM('/_config', 'POST', { agent: { allowWebAgent: true } });
       assert.strictEqual(on.status, 200, on.text);
 
       const run = await A('/v1/chat/completions', 'POST', { model: 'web/gemini-4-argon-agent', messages: [{ role: 'user', content: 'test' }] });
@@ -970,6 +1177,34 @@ async function main() {
     } finally {
       GeminiWebBridge.prototype.sendStreamRequestResilient = orig;
       await A('/_config', 'POST', { agent: { allowWebAgent: false } });
+    }
+  });
+
+  await ok('cloud -agent stream: прогресс инструментов приходит до финального контента', async () => {
+    const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-agent-sse-'));
+    try {
+      const t0 = Date.now();
+      const r = await A('/v1/chat/completions', 'POST', {
+        model: 'cloud/echo-model-agent',
+        stream: true,
+        messages: [{ role: 'user', content: 'AGENT_WRITE' }],
+        agent: { workspaceRoot: ws, maxIterations: 3 },
+      });
+      assert.strictEqual(r.status, 200, r.text);
+      assert.ok(Date.now() - t0 < 5000, 'агент не ждёт конца работы в тишине');
+      const frames = r.text.split('\n\n').filter((x) => x.startsWith('data: '));
+      const parsed = frames.map((f) => f.slice(6)).filter((d) => d !== '[DONE]').map((d) => JSON.parse(d));
+      const events = parsed.filter((c) => c.agent_event).map((c) => c.agent_event);
+      assert.ok(events.some((e) => e.type === 'tool_start' && e.tool === 'write_file'), JSON.stringify(events));
+      assert.ok(events.some((e) => e.type === 'tool_end' && e.ok === true && e.ms >= 0), JSON.stringify(events));
+      const idxStart = parsed.findIndex((c) => c.agent_event && c.agent_event.type === 'tool_start');
+      const idxContent = parsed.findIndex((c) => c.choices && c.choices[0].delta && c.choices[0].delta.content);
+      assert.ok(idxStart < idxContent, 'событие инструмента пришло раньше ответа');
+      assert.strictEqual(parsed[parsed.length - 1].choices[0].finish_reason, 'stop');
+      assert.ok(r.text.trimEnd().endsWith('data: [DONE]'), 'стрим закрыт [DONE]');
+      assert.strictEqual(fs.readFileSync(path.join(ws, 'agent-loop.txt'), 'utf8'), 'native-loop');
+    } finally {
+      fs.rmSync(ws, { recursive: true, force: true });
     }
   });
 
@@ -1113,12 +1348,10 @@ async function main() {
     fs.unlinkSync(sf);
   });
 
-  await ok('413: тело больше лимита -> понятный ответ, а не обрыв', async () => {
-    // 64 МБ + 1 МБ строится виртуально; Content-Length честный.
-    const total = 64 * 1024 * 1024 + 1024 * 1024;
-    const head = '{"model":"cloud/echo-model","messages":[{"role":"user","content":"';
-    const tail = '"}]}';
-    const filler = new ArrayBuffer(1024 * 1024);
+  await ok('413: превышение Content-Length отбивается до чтения тела', async () => {
+    // Сервер обязан отдать 413 по одному заголовку, не вычитывая 17 МБ,
+    // и не рвать сокет так, чтобы клиент увидел «socket hang up».
+    const total = 17 * 1024 * 1024;
     const r = await new Promise((resolve) => {
       let settled = false;
       const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
@@ -1132,29 +1365,47 @@ async function main() {
         res.on('error', () => finish({ status: 0 }));
       });
       req.on('error', () => finish({ status: -1 }));
-      // Сервер сбросит соединение, как только превысит лимит — не ждём ответа вечно.
-      const timer = setTimeout(() => { req.destroy(); }, 8000);
+      const timer = setTimeout(() => { req.destroy(); finish({ status: -2 }); }, 5000);
       req.on('close', () => clearTimeout(timer));
-      req.write(head);
-      let sent = head.length;
+      req.flushHeaders(); // тело не отправляем: проверяем именно проверку заголовка
+    });
+    assert.strictEqual(r.status, 413, 'ожидался 413, получено: ' + r.status);
+    const j = JSON.parse(r.text);
+    assert.strictEqual(j.error.code, 'body_too_large');
+    assert.match(j.error.message, /МБ/);
+  });
+
+  await ok('413: потоковое тело без Content-Length тоже не вешает соединение', async () => {
+    const total = 17 * 1024 * 1024;
+    const r = await new Promise((resolve) => {
+      let settled = false;
+      const finish = (v) => { if (!settled) { settled = true; resolve(v); } };
+      const req = http.request({
+        host: '127.0.0.1', port: PORT_API, path: '/v1/chat/completions', method: 'POST',
+        headers: { ...AUTH(), 'content-type': 'application/json' }, // chunked
+      }, (res) => {
+        const ch = [];
+        res.on('data', (c) => ch.push(c));
+        res.on('end', () => finish({ status: res.statusCode }));
+        res.on('error', () => finish({ status: 0 }));
+      });
+      // Обрыв допустим (клиент не дочитал ответ), зависание — нет.
+      req.on('error', () => setTimeout(() => finish({ status: -1 }), 500));
+      const timer = setTimeout(() => { req.destroy(); finish({ status: -2 }); }, 8000);
+      req.on('close', () => clearTimeout(timer));
+      const chunk = Buffer.alloc(1024 * 1024, 97);
+      let sent = 0;
       const pump = () => {
-        while (sent < total - tail.length) {
+        while (sent < total) {
           if (req.destroyed) return;
-          const chunk = Buffer.from(filler).subarray(0, Math.min(1024 * 1024, total - tail.length - sent));
           sent += chunk.length;
           if (!req.write(chunk)) { req.once('drain', pump); return; }
         }
-        req.end(tail);
+        req.end();
       };
       pump();
     });
-    // Либо явный 413, либо сброс сокета после ответа — но не зависание и не падение.
-    assert.ok(r.status === 413 || r.status === 0 || r.status === -1, 'status ' + r.status);
-    if (r.status === 413) {
-      const j = JSON.parse(r.text);
-      assert.strictEqual(j.error.code, 'body_too_large');
-      assert.match(j.error.message, /64 МБ/);
-    }
+    assert.ok(r.status === 413 || r.status === 0 || r.status === -1, 'нет ответа и нет обрыва: ' + r.status);
   });
 
   await ok('отмена: клиент отключается во время стрима -> апстрим обрывается, в лог 499', async () => {
@@ -1194,6 +1445,24 @@ async function main() {
     req.destroy();
     const aborted = await Promise.race([closedByServer, new Promise((r) => setTimeout(() => r(false), 3000))]);
     assert.strictEqual(aborted, true, 'апстрим-соединение не закрылось за 3 с');
+  });
+
+  // ВАЖНО: этот тест блокирует 127.0.0.1 на 5 минут — он идёт последним.
+  await ok('security: перебор ключа блокируется 429 too_many_auth_failures', async () => {
+    let lastStatus = 0;
+    let lastBody = null;
+    for (let n = 0; n < 21; n++) {
+      const r = await api(PORT_API, 'GET', '/v1/models', null, { authorization: 'Bearer guess-' + n });
+      lastStatus = r.status;
+      lastBody = r.text;
+      if (r.status === 429) break;
+    }
+    assert.strictEqual(lastStatus, 429, 'после 20 неверных ключей должен быть 429');
+    assert.strictEqual(JSON.parse(lastBody).error.code, 'too_many_auth_failures');
+    // блокировка по адресу: правильный ключ во время неё тоже получает 429
+    const good = await A('/v1/models');
+    assert.strictEqual(good.status, 429, 'правильный ключ во время блокировки тоже 429');
+    assert.ok(Number(good.headers['retry-after']) > 0, 'есть Retry-After');
   });
 
   console.log(`\nИтого: ${passed} ok, ${failed} fail`);

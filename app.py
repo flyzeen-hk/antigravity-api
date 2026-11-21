@@ -557,6 +557,33 @@ def pid_on_port(port=None):
     return None
 
 
+def process_command_line(pid):
+    """Командная строка процесса — нужна, чтобы не убить чужой сервер на нашем порту."""
+    try:
+        if sys.platform == "win32":
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-CimInstance Win32_Process -Filter 'ProcessId=%d').CommandLine" % int(pid)],
+                capture_output=True, timeout=10,
+            )
+            return _decode_console(res.stdout).strip()
+        with open("/proc/%d/cmdline" % int(pid), "rb") as fh:
+            return fh.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+
+def is_our_server(pid):
+    """Наш ли процесс занимает порт: сверяем командную строку с путём проекта."""
+    if not pid:
+        return False
+    cmd = process_command_line(pid).replace("\\", "/").lower()
+    if not cmd or "server.js" not in cmd:
+        return False
+    base = os.path.abspath(BASE).replace("\\", "/").lower()
+    return base in cmd
+
+
 def is_running():
     try:
         http_get("/_health", timeout=1.2)
@@ -1587,13 +1614,30 @@ class SettingsDialog(tk.Toplevel):
 
     def _save(self):
         new_safe = {"enabled": self.var_enabled.get()}
+        # Те же границы, что в lib/config/schema.js: иначе maxConcurrent=0
+        # навсегда вешает все запросы в очереди guard, а отрицательный интервал
+        # превращается в случайный 429.
+        limits = {
+            "maxRequestsPerMinute": (1, 10_000_000), "maxRequestsPerHour": (1, 10_000_000),
+            "maxRequestsPerDay": (1, 10_000_000), "maxRequestsPerWeek": (1, 10_000_000),
+            "minIntervalMs": (0, 10_000_000), "jitterMs": (0, 10_000_000),
+            "maxConcurrent": (1, 1024), "maxTokensPerDay": (0, 10 ** 12),
+            "maxTokensPerWeek": (0, 10 ** 12), "cooldownAfter429Ms": (0, 10 ** 12),
+            "maxCooldownMs": (0, 10 ** 12),
+        }
         for k, var in self.entries.items():
             val = var.get().strip().replace(" ", "").replace("_", "")
             try:
-                new_safe[k] = int(val)
+                num = int(val)
             except ValueError:
                 self.status_lbl.configure(text=T(f"Некорректное число для {k}", f"Invalid number for {k}"), fg=DANGER)
                 return
+            low, high = limits.get(k, (0, 10 ** 12))
+            if not low <= num <= high:
+                self.status_lbl.configure(
+                    text=T(f"{k}: допустимо от {low} до {high}", f"{k}: allowed range is {low}..{high}"), fg=DANGER)
+                return
+            new_safe[k] = num
 
         # Gemini 4 Unlock (Web Bridge)
         cookie_val = self.web_cookie_text.get("1.0", "end").strip()
@@ -2559,10 +2603,47 @@ class App(tk.Tk):
         except Exception:
             pass
         if was_running:
-            self.after(700, self.start_server)
             self.status_text.configure(text=T(f"Порт {port}: перезапуск сервера…", f"Port {port}: restarting server…"), fg=WARNING)
+            # Слепо стартовать через 700 мс нельзя: старый процесс может ещё
+            # держать порт, а новый — упасть с EADDRINUSE и остаться зомби.
+            self._await_restart(port, current, 0, 0)
         else:
             self.status_text.configure(text=T(f"Порт {port} сохранён. Запустите сервер.", f"Port {port} saved. Start the server."), fg=SUCCESS)
+
+    def _await_restart(self, new_port, old_port, phase, attempts):
+        # phase 0 — ждём, пока порт освободится; phase 1 — ждём /_health.
+        if phase == 0:
+            if not self._port_free(new_port) and attempts < 30:
+                self.after(200, lambda: self._await_restart(new_port, old_port, 0, attempts + 1))
+                return
+            self.start_server()
+            self.after(300, lambda: self._await_restart(new_port, old_port, 1, 0))
+            return
+        if is_running():
+            self._poll_status()
+            return
+        if attempts < 60:
+            self.after(250, lambda: self._await_restart(new_port, old_port, 1, attempts + 1))
+            return
+        self._rollback_port(old_port, new_port)
+
+    def _rollback_port(self, old_port, new_port):
+        global PORT, BASE_URL
+        cfg = read_config()
+        if cfg is not None:
+            cfg["port"] = old_port
+            save_config(cfg)
+        PORT = old_port
+        BASE_URL = f"http://127.0.0.1:{old_port}/v1"
+        self.port_var.set(str(old_port))
+        self.url_var.set(BASE_URL)
+        try:
+            self._refresh_example()
+        except Exception:
+            pass
+        self.status_text.configure(
+            text=T(f"Сервер не поднялся на порту {new_port}. Порт возвращён на {old_port}.",
+                   f"Server did not start on port {new_port}. Port reverted to {old_port}."), fg=DANGER)
 
     def toggle_server(self):
         if is_running():
@@ -2616,7 +2697,9 @@ class App(tk.Tk):
             self.proc = None
         else:
             pid = pid_on_port()
-            if pid:
+            # Порт может занимать чужой процесс (другой проект, другой gateway):
+            # его нельзя убивать. Останавливаем только свой server.js.
+            if pid and is_our_server(pid):
                 try:
                     if sys.platform == "win32":
                         subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
@@ -2625,6 +2708,10 @@ class App(tk.Tk):
                         os.kill(pid, signal.SIGTERM)
                 except Exception:
                     pass
+            elif pid:
+                self.status_text.configure(
+                    text=T("ПОРТ ЗАНЯТ ЧУЖИМ ПРОЦЕССОМ", "PORT BUSY (FOREIGN PROCESS)"), fg=DANGER)
+                return
         self.status_text.configure(text=T("ОСТАНОВЛЕН", "STOPPED"), fg=DANGER)
 
     # ---------------- Windows Startup ----------------
