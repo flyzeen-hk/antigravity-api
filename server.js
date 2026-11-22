@@ -526,6 +526,51 @@ function start(config) {
     try { res.body.destroy?.(); } catch {}
   }
 
+  // Модели вроде gemini-4-hydrogen-sonar тратят ~160 токенов на размышления даже
+  // на «2+2», а max_tokens клиента ограничивает ОБЩИЙ бюджет. При max_tokens=64
+  // видимого текста не остаётся: приходит пустой ответ с finish=length.
+  // Диагностика не ставит лимит, поэтому там всё работает. Добавляем запас на
+  // размышления и один повтор, если его всё равно не хватило.
+  const OUTPUT_HEADROOM = 256;
+
+  function applyOutputHeadroom(requestObj) {
+    const gc = requestObj && requestObj.generationConfig;
+    if (!gc || !Number.isFinite(gc.maxOutputTokens)) return requestObj;
+    const want = Math.round(gc.maxOutputTokens);
+    if (want <= 0) return requestObj;
+    gc.maxOutputTokens = Math.min(65536, want + OUTPUT_HEADROOM);
+    return requestObj;
+  }
+
+  function retryRequestWithBudget(requestObj, extra = 2048) {
+    let clone;
+    try { clone = JSON.parse(JSON.stringify(requestObj)); } catch { return null; }
+    const gc = clone.generationConfig = { ...(clone.generationConfig || {}) };
+    const cur = Number(gc.maxOutputTokens) || 0;
+    if (!cur) return null;
+    const next = Math.min(65536, cur + extra);
+    if (next <= cur) return null;
+    gc.maxOutputTokens = next;
+    return clone;
+  }
+
+  function openAIAnswerEmpty(out) {
+    const choice = out && out.choices && out.choices[0];
+    return !!choice && !String(choice.message?.content || '').trim() && choice.finish_reason === 'length';
+  }
+
+  function geminiAnswerEmpty(merged) {
+    const cand = merged && merged.candidates && merged.candidates[0];
+    if (!cand || cand.finishReason !== 'MAX_TOKENS') return false;
+    const parts = cand.content?.parts || [];
+    return !parts.some((p) => !p.thought && typeof p.text === 'string' && p.text.trim());
+  }
+
+  function anthropicAnswerEmpty(out) {
+    if (!out || out.stop_reason !== 'max_tokens') return false;
+    return !(out.content || []).some((b) => b.type === 'text' && String(b.text || '').trim());
+  }
+
   // Клиент ушёл (закрыл чат/вкладку) — незачем держать запрос к Google.
   // 'close' на res приходит и после нормального res.end(); отменяем только
   // незавершённый ответ.
@@ -961,6 +1006,7 @@ function start(config) {
     let requestObj;
     try {
       ({ requestObj } = anthropic.anthropicToGeminiRequest(body));
+      applyOutputHeadroom(requestObj);
     } catch (e) {
       return anthropicError(res, e.status || 400, 'invalid_request_error', e.message);
     }
@@ -993,7 +1039,25 @@ function start(config) {
             if (!data || data === '[DONE]') continue;
             saw.push(parseUpstreamData(data));
           }
-          const out = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw) }, modelName);
+          let out = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw) }, modelName);
+          if (anthropicAnswerEmpty(out)) {
+            const retryObj = retryRequestWithBudget(requestObj);
+            if (retryObj) {
+              const again = await withRetry429(() => upstream.generateWithRetry(parsed.baseId, retryObj, { signal: ac.signal }));
+              if (again.ok) {
+                const saw2 = [];
+                for await (const data of sseData(bodyWhileConnected(res, again.body))) {
+                  if (!data || data === '[DONE]') continue;
+                  saw2.push(parseUpstreamData(data));
+                }
+                const out2 = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw2) }, modelName);
+                if (!anthropicAnswerEmpty(out2)) {
+                  out = out2;
+                  pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, retry: 'max_tokens', provider: providers.CLOUD });
+                }
+              }
+            }
+          }
           guard.reportUsage(out.usage.input_tokens + out.usage.output_tokens);
           pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, provider: providers.CLOUD });
           return sendJson(res, 200, out);
@@ -1007,10 +1071,14 @@ function start(config) {
         const conv = new anthropic.AnthropicStream(modelName, { includeThinking: !!config.includeThoughts });
         // message_start нужен сразу: клиенты показывают «печатает» до первого чанка.
         for (const evt of conv.startMessage()) res.write(anthropic.formatSse(evt));
+        let anyText = false;
         try {
           for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
             if (!data || data === '[DONE]') continue;
             const resp = parseUpstreamData(data);
+            for (const p of (resp.response ?? resp).candidates?.[0]?.content?.parts || []) {
+              if (!p.thought && typeof p.text === 'string' && p.text) anyText = true;
+            }
             for (const evt of conv.push(resp.response ?? resp)) res.write(anthropic.formatSse(evt));
           }
         } catch (e) {
@@ -1021,6 +1089,12 @@ function start(config) {
           return;
         }
         for (const evt of conv.finish()) res.write(anthropic.formatSse(evt));
+        if (!anyText) {
+          res.write('event: error\ndata: ' + JSON.stringify({ type: 'error', error: {
+            type: 'api_error',
+            message: 'Модель израсходовала max_tokens на размышления и не вернула текст. Увеличьте max_tokens и повторите.',
+          } }) + '\n\n');
+        }
         res.end();
         guard.reportUsage(conv.usageTokens);
         pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, stream: true, provider: providers.CLOUD });
@@ -1217,7 +1291,7 @@ function start(config) {
     // assistant.tool_calls и role:"tool") транслируются в functionCall/
     // functionResponse с thought signatures. Никакой текстовой склейки.
     const chatCloud = async (msgs) => {
-      const requestObj = openAIToGeminiRequest({ messages: msgs, tools: toolsForLoop });
+      const requestObj = applyOutputHeadroom(openAIToGeminiRequest({ messages: msgs, tools: toolsForLoop }));
       const ac = new AbortController();
       const onClose = () => { if (!res.writableEnded) ac.abort(); };
       res.once('close', onClose);
@@ -1461,7 +1535,7 @@ function start(config) {
     }
 
     const model = parsed.baseId;
-    const requestObj = openAIToGeminiRequest(body);
+    const requestObj = applyOutputHeadroom(openAIToGeminiRequest(body));
     // reasoning_effort/thinking -> generationConfig.thinkingConfig (только если
     // config.thinking.mapReasoningEffort=true: поддержка зависит от апстрима).
     applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
@@ -1488,7 +1562,25 @@ function start(config) {
             if (!data || data === '[DONE]') continue;
             saw.push(parseUpstreamData(data));
           }
-          const out = aggregateGeminiChunks(saw, parsed.displayId);
+          let out = aggregateGeminiChunks(saw, parsed.displayId);
+          if (openAIAnswerEmpty(out)) {
+            const retryObj = retryRequestWithBudget(requestObj);
+            if (retryObj) {
+              const again = await withRetry429(() => upstream.generateWithRetry(model, retryObj, { signal: ac.signal }));
+              if (again.ok) {
+                const saw2 = [];
+                for await (const data of sseData(bodyWhileConnected(res, again.body))) {
+                  if (!data || data === '[DONE]') continue;
+                  saw2.push(parseUpstreamData(data));
+                }
+                const out2 = aggregateGeminiChunks(saw2, parsed.displayId);
+                if (!openAIAnswerEmpty(out2)) {
+                  out = out2;
+                  pushLog({ kind: 'openai', model: parsed.displayId, status: 200, ms: Date.now() - t0, retry: 'max_tokens', provider: providers.CLOUD });
+                }
+              }
+            }
+          }
           guard.reportUsage(out.usage?.total_tokens);
           pushLog({ kind: 'openai', model: parsed.displayId, status: 200, ms: Date.now() - t0, provider: providers.CLOUD });
           sendJson(res, 200, out);
@@ -1497,13 +1589,24 @@ function start(config) {
 
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
         const conv = new GeminiStreamToOpenAI(parsed.displayId, { includeThoughts: !!config.includeThoughts });
+        let anyContent = false;
         try {
           for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
             if (!data || data === '[DONE]') continue;
             parseUpstreamData(data);
-            for (const chunk of conv.pushData(data)) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            for (const chunk of conv.pushData(data)) {
+              if (chunk.choices?.[0]?.delta?.content) anyContent = true;
+              res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+            }
           }
           for (const chunk of conv.finishChunks()) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          if (!anyContent) {
+            // Бюджет ушёл на размышления: пустой поток клиенту ничего не объяснит.
+            res.write(`data: ${JSON.stringify({ error: {
+              message: 'Модель израсходовала max_tokens на размышления и не вернула текст. Увеличьте max_tokens (например, до 1024) и повторите.',
+              type: 'api_error', code: 'empty_reasoning_budget',
+            } })}\n\n`);
+          }
           res.write('data: [DONE]\n\n');
         } catch (e) {
           // Обрыв на нашей стороне — это уход клиента, а не сбой апстрима.
@@ -1571,6 +1674,7 @@ function start(config) {
     if (!read.ok) return;
     const body = parseRequestBody(read.raw);
     const requestObj = body.request ?? body; // можно прислать и обёрнутый, и чистый GenerateContentRequest
+    applyOutputHeadroom(requestObj);
     validateGemini(requestObj);
 
     let parsedModel = providers.parseModel(rawModel);
@@ -1700,7 +1804,24 @@ function start(config) {
               seen.push(parseUpstreamData(data));
             }
           }
-          const mergedResp = mergeGeminiResponse(seen);
+          let mergedResp = mergeGeminiResponse(seen);
+          if (geminiAnswerEmpty(mergedResp)) {
+            const retryObj = retryRequestWithBudget(requestObj);
+            if (retryObj) {
+              const again = await withRetry429(() => upstream.generateWithRetry(model, retryObj, { signal: ac.signal }));
+              if (again.ok) {
+                const seen2 = [];
+                for await (const data of sseData(bodyWhileConnected(res, again.body))) {
+                  if (data && data !== '[DONE]') seen2.push(parseUpstreamData(data));
+                }
+                const merged2 = mergeGeminiResponse(seen2);
+                if (!geminiAnswerEmpty(merged2)) {
+                  mergedResp = merged2;
+                  pushLog({ kind: 'gemini', model: displayModel, status: 200, ms: Date.now() - t0, retry: 'max_tokens', provider: providers.CLOUD });
+                }
+              }
+            }
+          }
           guard.reportUsage(mergedResp.usageMetadata?.totalTokenCount);
           pushLog({ kind: 'gemini', model: displayModel, status: 200, ms: Date.now() - t0, provider: providers.CLOUD });
           return sendJson(res, 200, mergedResp);
@@ -1708,13 +1829,23 @@ function start(config) {
 
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
         let lastUsage = null;
+        let anyText = false;
         for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
           if (!data || data === '[DONE]') continue;
           const j = parseUpstreamData(data);
           // разворачиваем обёртку {"response": ...} -> чистый Gemini-формат
           const inner = j.response ?? j;
           if (inner.usageMetadata) lastUsage = inner.usageMetadata;
+          for (const p of inner.candidates?.[0]?.content?.parts || []) {
+            if (!p.thought && typeof p.text === 'string' && p.text) anyText = true;
+          }
           res.write(`data: ${JSON.stringify(inner)}\n\n`);
+        }
+        if (!anyText) {
+          res.write(`data: ${JSON.stringify({ error: {
+            message: 'Модель израсходовала maxOutputTokens на размышления и не вернула текст. Увеличьте лимит и повторите.',
+            type: 'api_error', code: 'empty_reasoning_budget',
+          } })}\n\n`);
         }
         res.end();
         guard.reportUsage(lastUsage ? lastUsage.totalTokenCount ?? ((lastUsage.promptTokenCount ?? 0) + (lastUsage.candidatesTokenCount ?? 0)) : undefined);

@@ -474,6 +474,7 @@ Facts worth stating explicitly:
 | Web models return empty or garbled text | Cookie expired, wrong account, or cookie not bound to this browser | Re-copy the Cookie header; check `GET /_config` → `cookieSet` |
 | Web request redirects to a Google «sorry» page | Google verification triggered by the egress IP | Change proxy/egress; the bridge reports `web_verification_required` |
 | Answers truncated mid-file | Model reply length cap, not the gateway | Ask for chunked writing: `write_file` then `append_file` |
+| Empty answer with a small `max_tokens` | Thinking models spend the whole budget on reasoning (Hydrogen Sonar uses ~160 tokens even for "2+2") | The gateway adds 256 tokens of headroom and retries once; if it is still empty, raise `max_tokens` (1024 is a safe value) |
 | `413 body_too_large` | Request above 64 MB | Send less in one request |
 | `499` in the log | The client disconnected | Nothing to fix; the upstream request was cancelled |
 | Port already in use | Another program or an old server on 8317 | Change the port in the Connection tab |
@@ -809,6 +810,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 | Веб-модели отдают пустой или битый текст | Куки истекли, не тот аккаунт или куки не привязана к этому браузеру | Скопируйте заголовок Cookie заново; проверьте `GET /_config` → `cookieSet` |
 | Веб-запрос уводит на страницу Google «sorry» | Google сработала проверка по выходному IP | Смените прокси/выход; мост сообщает `web_verification_required` |
 | Ответ обрывается на середине файла | Лимит длины ответа модели, а не шлюза | Просите писать частями: `write_file`, затем `append_file` |
+| Пустой ответ при маленьком `max_tokens` | Думающие модели тратят весь бюджет на рассуждения (Hydrogen Sonar — ~160 токенов даже на «2+2») | Шлюз добавляет 256 токенов запаса и делает один повтор; если всё равно пусто — поднимите `max_tokens` (1024 — безопасное значение) |
 | `413 body_too_large` | Запрос больше 64 МБ | Отправьте меньше за один раз |
 | `499` в журнале | Клиент отключился | Чинить нечего; запрос к Google отменён |
 | Порт занят | Другая программа или старый сервер на 8317 | Смените порт на вкладке Connection |

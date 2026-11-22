@@ -240,6 +240,20 @@ function startMockUpstream() {
         return;
       }
 
+      // Модель тратит весь max_tokens на размышления (как gemini-4-hydrogen-sonar
+      // на коротком вопросе) — видимого текста нет, finish=MAX_TOKENS.
+      if (text.includes('BUDGET_TEST')) {
+        const gc = body.request?.generationConfig || {};
+        if ((gc.maxOutputTokens || 0) < 1000) {
+          send({ response: { candidates: [{ content: { role: 'model', parts: [{ text: 'долго думаю', thought: true }] }, finishReason: 'MAX_TOKENS' }], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 3, thoughtsTokenCount: 156, totalTokenCount: 164 } } });
+          res.end();
+          return;
+        }
+        send({ response: { candidates: [{ content: { role: 'model', parts: [{ text: 'Готовый ответ' }] }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: 5, candidatesTokenCount: 2, totalTokenCount: 7 } } });
+        res.end();
+        return;
+      }
+
       if (model === 'echo-model' || isCallTool) {
         send({ response: { candidates: [{ content: { role: 'model', parts: [{ thought: true, text: 'думаю...' }] } }] } });
         if (isCallTool) {
@@ -395,7 +409,8 @@ async function main() {
     // запрос ушёл в апстрим как обычный Gemini-запрос
     assert.strictEqual(mockUp.state.lastBody.model, 'claude-sonnet-4-5-20250929');
     assert.strictEqual(mockUp.state.lastBody.request.systemInstruction.parts[0].text, 'ты — тест');
-    assert.strictEqual(mockUp.state.lastBody.request.generationConfig.maxOutputTokens, 64);
+    // max_tokens + 256 запаса на размышления (см. applyOutputHeadroom).
+    assert.strictEqual(mockUp.state.lastBody.request.generationConfig.maxOutputTokens, 64 + 256);
   });
 
   await ok('anthropic: ключ принимается и как x-api-key', async () => {
@@ -510,7 +525,7 @@ async function main() {
     assert.strictEqual(sent.request.contents[0].role, 'user');
     assert.strictEqual(sent.request.contents[0].parts[0].text, 'вопрос');
     assert.strictEqual(sent.request.contents[1].role, 'model');
-    assert.strictEqual(sent.request.generationConfig.maxOutputTokens, 123);
+    assert.strictEqual(sent.request.generationConfig.maxOutputTokens, 123 + 256);
     assert.deepStrictEqual(sent.request.generationConfig.stopSequences, ['STOP']);
     assert.strictEqual(mockUp.state.lastUA, 'antigravity-test/1.0');
     assert.match(mockUp.state.lastAuth, /^Bearer mock-access-/);
@@ -703,6 +718,18 @@ async function main() {
     const nj = JSON.parse(native.text);
     assert.deepStrictEqual(nj.candidates, []);
     assert.strictEqual(nj.promptFeedback.blockReason, 'PROHIBITED_CONTENT');
+  });
+
+  await ok('бюджет размышлений: маленький max_tokens не даёт пустой ответ', async () => {
+    // Без запаса модель тратит все 64 токена на thoughts и отдаёт пустой текст.
+    const r = await A('/v1/chat/completions', 'POST', {
+      model: 'cloud/echo-model', max_tokens: 64,
+      messages: [{ role: 'user', content: 'BUDGET_TEST' }],
+    });
+    assert.strictEqual(r.status, 200, r.text);
+    const j = JSON.parse(r.text);
+    assert.ok(String(j.choices[0].message.content).trim().length > 0, 'ответ не должен быть пустым: ' + r.text);
+    assert.strictEqual(j.choices[0].finish_reason, 'stop');
   });
 
   await ok('авто-refresh: access_token запрошен при старте', async () => {
