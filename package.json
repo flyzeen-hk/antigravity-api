@@ -1,6 +1,6 @@
 {
   "name": "antigravity-api",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Turn your Google Antigravity account into a full OpenAI/Gemini-compatible API key (local gateway to daily-cloudcode-pa.googleapis.com)",
   "main": "server.js",
   "scripts": {

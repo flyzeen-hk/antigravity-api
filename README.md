@@ -114,6 +114,7 @@ Notes that matter:
 - `cookie.txt` and `cookie_file` paths are looked up next to the code, in the working directory **and in `AG_DATA_DIR`**, so `data/cookie.txt` and `cookie_file: "cookie-work.txt"` both work.
 - The container runs as uid 1000 with a read-only root filesystem; if `./data` was created by root, fix it with `chown -R 1000:1000 data` (compose already sets `user: "1000:1000"`).
 - **Web-only mode:** set `AG_NO_CLOUD=1` to run without `auth.json`. `cloud/*` then answers `400 cloud_disabled`, `/v1/models` lists only `web/*`, and quotas show as unavailable instead of hanging.
+- **Reasoning headroom:** `outputHeadroomTokens` (default 256, `AG_OUTPUT_HEADROOM` overrides) is added on top of the client's `max_tokens` so thinking models still return visible text. Set it to `0` to send the limit exactly as the client asked.
 
 ```bash
 AG_NO_CLOUD=1 docker compose up -d    # only web models, no Antigravity session
@@ -429,9 +430,9 @@ If your client needs a model list before it will connect, use `GET /v1/models`; 
 The panel is split by provider, because the two have nothing in common but the API:
 
 - **Cloud Code** — account, quotas, cloud model list, and the detected Antigravity products (Antigravity, Antigravity IDE, Antigravity CLI, Antigravity for VS Code). The list is informational: only the app/IDE storage provides the token.
-- **Gemini Web** — bridge state, cookie, web models, thinking depth, temporary chats.
-- **Connection** — base URL, key, cURL example, port, autostart.
-- **Settings & Limits** — **Cloud** (Safe Mode), **Web**, **Agent** (web agent permission, planner, workspace), **Network**, **Usage**.
+- **Gemini Web** — bridge state, cookie, web models, thinking depth, temporary chats, and **multiple Google accounts** (add with own cookie/proxy//u/ index, activate, optional rotation on 429).
+- **Connection** — base URL, Anthropic endpoint, key, cURL example, port, autostart.
+- **Settings & Limits** — **Cloud** (Safe Mode), **Web**, **Agent** (web agent permission, planner, workspace), **Network**, **Usage**. The window title and header show the running version.
 
 Facts worth stating explicitly:
 
@@ -780,6 +781,8 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 - **Разрешения агента — не автозапуск.** Включение веб-агента или планировщика только даёт разрешение; ничего не запускается, пока запрос не попросит об этом через `-agent`, `"agent": true` или `"tools": "builtin"`.
 - **Опасные флаги агента в панели только для чтения.** `allowDelete`, `allowShell` и `allowAbsolutePaths` меняются только в `config.json` и требуют перезапуска.
 - **Порт меняется** на вкладке Connection. Сохранение перезапускает сервер; занятый другой программой порт будет отклонён.
+- **Несколько аккаунтов Google** — в **Настройки → Gemini Web**: добавить аккаунт со своей cookie, прокси и индексом `/u/`, активировать, при желании включить ротацию на 429. При 401/403 мост всегда пробует следующий аккаунт, активный сохраняется.
+- **Save & Apply** отправляет изменения работающему серверу с `admin.key`, поэтому они применяются без перезапуска (в ответе видно, применилось ли). Версия приложения показана в заголовке окна и панели.
 - **Без перезапуска применяются** Safe Mode, сеть и параметры агента; перезапуск нужен только для опасных флагов выше.
 
 **Сеть:**

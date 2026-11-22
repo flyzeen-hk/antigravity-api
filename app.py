@@ -461,6 +461,26 @@ def read_api_key():
         return ""
 
 
+def read_admin_key():
+    """admin.key защищает /_config, дашборд и управление веб-аккаунтами."""
+    try:
+        with open(os.path.join(BASE, "admin.key"), encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def read_app_version():
+    try:
+        with open(os.path.join(BASE, "package.json"), encoding="utf-8") as f:
+            return str(json.load(f).get("version") or "0.0.0")
+    except Exception:
+        return "0.0.0"
+
+
+APP_VERSION = read_app_version()
+
+
 CFG = read_config() or {}
 PORT = config_port(CFG)
 BASE_URL = f"http://127.0.0.1:{PORT}/v1"
@@ -474,19 +494,27 @@ CONFIG_DAMAGED_MSG = (
 )
 
 
-def http_get(path, timeout=2.0, with_key=False):
+def http_get(path, timeout=2.0, with_key=False, admin=False):
     headers = {}
     if with_key and API_KEY:
         headers["Authorization"] = "Bearer " + API_KEY
+    if admin:
+        key = read_admin_key()
+        if key:
+            headers["x-admin-key"] = key
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
-def http_post(path, data, timeout=3.0, with_key=False):
+def http_post(path, data, timeout=3.0, with_key=False, admin=False):
     headers = {"Content-Type": "application/json"}
     if with_key and API_KEY:
         headers["Authorization"] = "Bearer " + API_KEY
+    if admin:
+        key = read_admin_key()
+        if key:
+            headers["x-admin-key"] = key
     payload = json.dumps(data).encode("utf-8")
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}{path}", data=payload, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -616,6 +644,49 @@ def format_reset_time(iso_str):
 
 
 # ==================== DIAGNOSTIC CHAT ====================
+
+
+# Сервер отвечает по-русски (диагностика, guard). В английском интерфейсе
+# показываем свой текст по коду ошибки, а не русскую строку.
+ERROR_TEXT = {
+    "model_not_available": ("Модель отсутствует в каталоге API-пути. Обновите список моделей.",
+                            "The model is not in the API catalog. Refresh the model list."),
+    "model_required": ("Выберите модель из списка.", "Choose a model from the list."),
+    "message_required": ("Введите непустое сообщение.", "Enter a non-empty message."),
+    "invalid_body": ("Тело запроса должно быть JSON-объектом.", "The request body must be a JSON object."),
+    "invalid_json": ("Сервер вернул некорректный JSON.", "The server returned invalid JSON."),
+    "input_too_long": ("Слишком длинный запрос.", "The request is too long."),
+    "upstream_timeout": ("Истекло время ожидания Google.", "Google timed out."),
+    "upstream_rate_limited": ("Google ограничил частоту или квота исчерпана.",
+                              "Google rate-limited the request or the quota is exhausted."),
+    "upstream_auth_failed": ("Google отклонил авторизацию. Проверьте вход и куки.",
+                             "Google rejected authorization. Check the sign-in and cookies."),
+    "region_not_supported": ("Выходной IP в неподдерживаемом регионе — смените прокси.",
+                             "The egress IP is in an unsupported region — change the proxy."),
+    "web_bridge_disabled": ("Веб-мост выключен.", "The web bridge is disabled."),
+    "web_agent_disabled": ("Агентский режим веб-моделей выключен (allowWebAgent).",
+                           "Web-model agent mode is disabled (allowWebAgent)."),
+    "local_rate_limited": ("Запрос остановлен локальным Safe Mode.", "The request was stopped by local Safe Mode."),
+    "cloud_disabled": ("cloud-модели отключены (AG_NO_CLOUD=1).", "cloud models are disabled (AG_NO_CLOUD=1)."),
+    "empty_response": ("Google не вернул текст ответа.", "Google returned no answer text."),
+    "empty_reasoning_budget": ("Модель потратила лимит на размышления. Увеличьте max_tokens.",
+                               "The model spent the limit on reasoning. Increase max_tokens."),
+    "model_catalog_unavailable": ("Каталог моделей недоступен — проверьте соединение.",
+                                  "The model catalog is unavailable — check the connection."),
+    "upstream_connection_failed": ("Не удалось соединиться с Google — проверьте прокси и DNS.",
+                                   "Could not connect to Google — check the proxy and DNS."),
+    "server_unavailable": ("Локальный сервер не отвечает — запустите его.",
+                           "The local server is not responding — start it."),
+    "server_disconnected": ("Сервер прервал соединение — проверьте, что он работает.",
+                            "The server dropped the connection — make sure it is running."),
+    "client_timeout": ("Время ожидания истекло.", "Timed out."),
+}
+
+
+def localized_error_message(error):
+    code = str((error or {}).get("code") or "")
+    pair = ERROR_TEXT.get(code)
+    return T(*pair) if pair else None
 
 
 def diagnostic_safe_text(value):
@@ -874,7 +945,7 @@ class DiagnosticChatDialog(tk.Toplevel):
                      "upstream": "provider request", "response": "response processing"}
         stages = stages_en if UI_LANG == "en" else stages_ru
         fallback_stage = T("обработка ответа", "response processing")
-        message = error.get("message")
+        message = localized_error_message(error) or error.get("message")
         if not isinstance(message, str) or not message.strip():
             message = T("Сервер не сообщил причину ошибки. Проверьте его версию и параметры подключения.",
                         "The server did not report a reason. Check its version and connection settings.")
@@ -1016,6 +1087,9 @@ class SettingsDialog(tk.Toplevel):
         self._safe = config_section(self._cfg, "safeMode")
         self._web = config_section(self._cfg, "geminiWeb")
         self._agent = config_section(self._cfg, "agent")
+        # Мультиаккаунт: список редактируется в памяти и пишется в config.json.
+        self._accounts = [dict(a) for a in (self._web.get("accounts") or []) if isinstance(a, dict)]
+        self._active_account = str(self._web.get("activeAccount") or "")
         self._build_ui()
 
     def _build_ui(self):
@@ -1231,6 +1305,77 @@ class SettingsDialog(tk.Toplevel):
         tk.Entry(u_body, textvariable=self.var_web_bl, bg=PANEL_SUBTLE, fg=TEXT_PRIMARY,
                  relief="flat", insertbackground=ACCENT, font=("Consolas", 8),
                  highlightbackground=BORDER, highlightthickness=1).pack(fill="x")
+
+        # 2.5b Multi-account rotation
+        acc_card = tk.Frame(web_root, bg=PANEL, highlightbackground=BORDER, highlightthickness=1)
+        acc_card.pack(fill="x", pady=(0, 12))
+        ac_head = tk.Frame(acc_card, bg=PANEL)
+        ac_head.pack(fill="x", padx=14, pady=(10, 6))
+        tk.Label(ac_head, text=T("НЕСКОЛЬКО АККАУНТОВ GOOGLE (РОТАЦИЯ)", "MULTIPLE GOOGLE ACCOUNTS (ROTATION)"),
+                 bg=PANEL, fg=ACCENT_CYAN, font=("Segoe UI", 8, "bold")).pack(side="left")
+        tk.Frame(acc_card, bg=BORDER, height=1).pack(fill="x", padx=14, pady=(0, 8))
+
+        ac_body = tk.Frame(acc_card, bg=PANEL)
+        ac_body.pack(fill="x", padx=14, pady=(0, 12))
+        tk.Label(ac_body, text=T("При 401/403 мост переключается на следующий аккаунт; при 429 — только если включена авто-ротация. Куки не показываются в API и логах.",
+                                 "On 401/403 the bridge switches to the next account; on 429 only when auto-rotation is on. Cookies are never exposed by the API or logs."),
+                 bg=PANEL, fg=TEXT_DIM, font=("Segoe UI", 8), wraplength=480, justify="left").pack(anchor="w", pady=(0, 6))
+
+        list_row = tk.Frame(ac_body, bg=PANEL)
+        list_row.pack(fill="x")
+        self.acc_list = tk.Listbox(list_row, height=4, bg=PANEL_SUBTLE, fg=TEXT_PRIMARY, relief="flat",
+                                   highlightbackground=BORDER, highlightthickness=1,
+                                   font=("Consolas", 8), exportselection=False)
+        self.acc_list.pack(side="left", fill="x", expand=True)
+        self.acc_list.bind("<<ListboxSelect>>", lambda e: self._acc_load_fields())
+        acc_btns = tk.Frame(list_row, bg=PANEL)
+        acc_btns.pack(side="left", padx=(8, 0))
+        action_button(acc_btns, T("Добавить / обновить", "Add / update"), self._acc_upsert, compact=True).pack(fill="x")
+        action_button(acc_btns, T("Активировать", "Activate"), self._acc_activate, compact=True).pack(fill="x", pady=(4, 0))
+        action_button(acc_btns, T("Удалить", "Remove"), self._acc_remove, compact=True).pack(fill="x", pady=(4, 0))
+
+        row_an = tk.Frame(ac_body, bg=PANEL)
+        row_an.pack(fill="x", pady=(8, 4))
+        tk.Label(row_an, text=T("Имя аккаунта", "Account name"), bg=PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.acc_name = tk.StringVar()
+        tk.Entry(row_an, textvariable=self.acc_name, bg=PANEL_SUBTLE, fg=TEXT_PRIMARY,
+                 relief="flat", insertbackground=ACCENT, font=("Segoe UI", 9),
+                 width=24, highlightbackground=BORDER, highlightthickness=1).pack(side="right")
+
+        tk.Label(ac_body, text=T("Cookie этого аккаунта (SAPISID) или путь к файлу", "Cookie for this account (SAPISID) or a file path"),
+                 bg=PANEL, fg=TEXT_DIM, font=("Segoe UI", 8)).pack(anchor="w", pady=(4, 2))
+        self.acc_cookie = tk.Text(ac_body, bg=PANEL_SUBTLE, fg=TEXT_PRIMARY, relief="flat", height=2,
+                                  font=("Consolas", 8), insertbackground=ACCENT, wrap="char",
+                                  highlightbackground=BORDER, highlightthickness=1)
+        self.acc_cookie.pack(fill="x")
+
+        row_ap = tk.Frame(ac_body, bg=PANEL)
+        row_ap.pack(fill="x", pady=(6, 4))
+        tk.Label(row_ap, text=T("Прокси (необязательно)", "Proxy (optional)"), bg=PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.acc_proxy = tk.StringVar()
+        tk.Entry(row_ap, textvariable=self.acc_proxy, bg=PANEL_SUBTLE, fg=TEXT_PRIMARY,
+                 relief="flat", insertbackground=ACCENT, font=("Consolas", 9), width=24,
+                 highlightbackground=BORDER, highlightthickness=1).pack(side="right")
+
+        row_aa = tk.Frame(ac_body, bg=PANEL)
+        row_aa.pack(fill="x", pady=(0, 4))
+        tk.Label(row_aa, text=T("Индекс /u/ (0 = основной)", "/u/ index (0 = main)"), bg=PANEL, fg=TEXT_MUTED,
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.acc_authuser = tk.StringVar()
+        tk.Entry(row_aa, textvariable=self.acc_authuser, bg=PANEL_SUBTLE, fg=TEXT_PRIMARY,
+                 relief="flat", insertbackground=ACCENT, font=("Consolas", 9), width=8, justify="right",
+                 highlightbackground=BORDER, highlightthickness=1).pack(side="right")
+
+        self.var_auto_rotate = tk.BooleanVar(value=bool(self._web.get("autoRotateOn429", False)))
+        tk.Checkbutton(ac_body, text=T("Переключать аккаунт и при 429 (лимит веб-аккаунта)",
+                                       "Also rotate on 429 (web account quota)"),
+                       variable=self.var_auto_rotate, bg=PANEL, fg=TEXT_PRIMARY,
+                       selectcolor=PANEL_SUBTLE, activebackground=PANEL,
+                       activeforeground=TEXT_PRIMARY, highlightthickness=0,
+                       font=("Segoe UI", 9)).pack(anchor="w", fill="x", pady=(4, 0))
+        self._acc_refresh()
 
         # 2.6 Agent & Planner (opt-in) Card
         planner_cfg = self._agent.get("planner") or {}
@@ -1655,7 +1800,10 @@ class SettingsDialog(tk.Toplevel):
                 return
         new_web = {"enabled": self.var_web_enabled.get(), "proxy": proxy_val,
                    "authUser": au_val, "temporaryChats": self.var_web_temp.get(),
-                   "accountLabel": self.var_web_label.get().strip()}
+                   "accountLabel": self.var_web_label.get().strip(),
+                   "accounts": [dict(a) for a in self._accounts],
+                   "activeAccount": self._active_account,
+                   "autoRotateOn429": bool(self.var_auto_rotate.get())}
         if bl_val:
             new_web["bl"] = bl_val
         if cookie_val:
@@ -1737,7 +1885,8 @@ class SettingsDialog(tk.Toplevel):
         def apply_live():
             if not is_running():
                 return False
-            return bool(http_post("/_config", payload, timeout=3.0, with_key=True).get("ok"))
+            # /_config — админский эндпоинт: клиентского ключа недостаточно.
+            return bool(http_post("/_config", payload, timeout=3.0, with_key=True, admin=True).get("ok"))
 
         def applied(result):
             if self.winfo_exists():
@@ -1754,6 +1903,102 @@ class SettingsDialog(tk.Toplevel):
                 self.on_saved()
 
         self.master._call_async(apply_live, applied)
+
+    # ---------------- Multi-account (web bridge) ----------------
+
+    def _acc_refresh(self, select=None):
+        self.acc_list.delete(0, "end")
+        for a in self._accounts:
+            name = str(a.get("name") or "")
+            marks = []
+            if name == self._active_account:
+                marks.append(T("активен", "active"))
+            if a.get("proxy"):
+                marks.append("proxy")
+            if a.get("cookie") or a.get("cookie_file"):
+                marks.append("cookie")
+            self.acc_list.insert("end", name + (f"  [{', '.join(marks)}]" if marks else ""))
+        if select is not None:
+            for i, a in enumerate(self._accounts):
+                if str(a.get("name")) == select:
+                    self.acc_list.selection_clear(0, "end")
+                    self.acc_list.selection_set(i)
+                    break
+
+    def _acc_selected(self):
+        sel = self.acc_list.curselection()
+        if not sel:
+            return None
+        i = sel[0]
+        return self._accounts[i] if 0 <= i < len(self._accounts) else None
+
+    def _acc_load_fields(self):
+        a = self._acc_selected()
+        if not a:
+            return
+        self.acc_name.set(str(a.get("name") or ""))
+        self.acc_cookie.delete("1.0", "end")
+        self.acc_cookie.insert("1.0", str(a.get("cookie") or a.get("cookie_file") or ""))
+        self.acc_proxy.set(str(a.get("proxy") or ""))
+        au = a.get("authUser")
+        self.acc_authuser.set("" if au is None else str(au))
+
+    def _acc_upsert(self):
+        name = self.acc_name.get().strip()
+        if not name:
+            self.status_lbl.configure(text=T("Укажите имя аккаунта", "Enter an account name"), fg=DANGER)
+            return
+        au_raw = self.acc_authuser.get().strip()
+        try:
+            au = int(au_raw) if au_raw else None
+        except ValueError:
+            self.status_lbl.configure(text=T("authUser: нужно число", "authUser: must be a number"), fg=DANGER)
+            return
+        cookie = self.acc_cookie.get("1.0", "end").strip()
+        entry = {
+            "name": name,
+            "cookie": cookie,
+            "cookie_file": "",
+            "proxy": self.acc_proxy.get().strip(),
+            "authUser": au,
+        }
+        for i, a in enumerate(self._accounts):
+            if str(a.get("name")) == name:
+                self._accounts[i] = {**a, **entry}
+                break
+        else:
+            self._accounts.append(entry)
+        if not self._active_account:
+            self._active_account = name
+        self._acc_refresh(select=name)
+        self.status_lbl.configure(
+            text=T(f"Аккаунт «{name}» готов. Нажмите «Сохранить и применить».",
+                   f"Account “{name}” is ready. Press “Save & Apply”."), fg=SUCCESS)
+
+    def _acc_activate(self):
+        a = self._acc_selected()
+        if not a:
+            self.status_lbl.configure(text=T("Выберите аккаунт в списке", "Select an account in the list"), fg=DANGER)
+            return
+        self._active_account = str(a.get("name") or "")
+        self._acc_refresh(select=self._active_account)
+        self.status_lbl.configure(
+            text=T(f"Активный аккаунт: {self._active_account}", f"Active account: {self._active_account}"),
+            fg=SUCCESS)
+
+    def _acc_remove(self):
+        a = self._acc_selected()
+        if not a:
+            self.status_lbl.configure(text=T("Выберите аккаунт в списке", "Select an account in the list"), fg=DANGER)
+            return
+        name = str(a.get("name") or "")
+        self._accounts = [x for x in self._accounts if str(x.get("name")) != name]
+        if self._active_account == name:
+            self._active_account = str(self._accounts[0].get("name")) if self._accounts else ""
+        self._acc_refresh(select=self._active_account or None)
+        self.status_lbl.configure(
+            text=T(f"Аккаунт «{name}» удалён. Применится после сохранения.",
+                   f"Account “{name}” removed. Applies after saving."), fg=WARNING)
 
     def paste_cookie_from_clipboard(self):
         """Insert cookies from the clipboard (manual DevTools copy)."""
@@ -1799,7 +2044,7 @@ class App(tk.Tk):
         global ACCENT_CYAN
         ACCENT_CYAN = ACCENT
         super().__init__()
-        self.title("Antigravity API")
+        self.title(f"Antigravity API {APP_VERSION}")
         self.configure(bg=BG)
         try:
             main_w = min(1200, max(860, self.winfo_screenwidth() - 80))
@@ -2081,6 +2326,8 @@ class App(tk.Tk):
 
         tk.Label(title_row, text="Antigravity API", bg=BG, fg=TEXT_PRIMARY,
                  font=("Segoe UI", 16, "bold")).pack(side="left")
+        tk.Label(title_row, text=f"v{APP_VERSION}", bg=BG, fg=TEXT_DIM,
+                 font=("Segoe UI", 9)).pack(side="left", padx=(8, 0), pady=(4, 0))
         tk.Label(title_text_box, text=T("Локальный шлюз · OpenAI, Gemini и Claude", "Local gateway · OpenAI, Gemini & Claude"),
                  bg=BG, fg=TEXT_MUTED, font=("Segoe UI", 9)).pack(anchor="w", pady=(3, 0))
 
@@ -2319,6 +2566,25 @@ class App(tk.Tk):
         url_entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
         url_entry.configure(state="readonly", readonlybackground=PANEL_SUBTLE)
         self._copy_button(row1, self.url_var)
+
+        # Anthropic-compatible endpoint (Claude Code, Cline, Zed, etc.)
+        row_anth = tk.Frame(conn, bg=PANEL)
+        row_anth.pack(fill="x", padx=14, pady=(0, 6))
+        tk.Label(row_anth, text="Anthropic", bg=PANEL, fg=TEXT_MUTED, width=12, anchor="w",
+                 font=("Segoe UI", 9)).pack(side="left")
+        self.anth_var = tk.StringVar(value=f"http://127.0.0.1:{PORT}/v1/messages")
+        anth_entry = tk.Entry(row_anth, textvariable=self.anth_var, bg=PANEL_SUBTLE, fg=TEXT_PRIMARY,
+                              relief="flat", insertbackground=ACCENT, font=("Consolas", 9),
+                              highlightbackground=BORDER, highlightthickness=1)
+        anth_entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 6))
+        anth_entry.configure(state="readonly", readonlybackground=PANEL_SUBTLE)
+        self._copy_button(row_anth, self.anth_var)
+        tk.Label(conn, text=T("Anthropic Messages API: тот же API-ключ (x-api-key или Bearer), модели cloud/* "
+                              "(Claude и др.). Счётчик токенов: /v1/messages/count_tokens. Web-модели этот протокол не поддерживают.",
+                              "Anthropic Messages API: same API key (x-api-key or Bearer), cloud/* models "
+                              "(Claude and others). Token count: /v1/messages/count_tokens. Web models do not support this protocol."),
+                 bg=PANEL, fg=TEXT_DIM, font=("Segoe UI", 8), wraplength=560,
+                 justify="left", anchor="w").pack(fill="x", padx=14, pady=(0, 10))
 
         # Port (Base URL is derived from it)
         row1b = tk.Frame(conn, bg=PANEL)
@@ -2598,6 +2864,10 @@ class App(tk.Tk):
         BASE_URL = f"http://127.0.0.1:{port}/v1"
         self.url_var.set(BASE_URL)
         self.port_var.set(str(port))
+        try:
+            self.anth_var.set(f"http://127.0.0.1:{port}/v1/messages")
+        except Exception:
+            pass
         try:
             self._refresh_example()
         except Exception:

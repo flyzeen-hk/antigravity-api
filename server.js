@@ -51,6 +51,15 @@ const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR)
 // OAuth-токен Antigravity. cloud/* отвечают понятной ошибкой, /v1/models
 // показывает только web/*.
 const CLOUD_DISABLED = /^(1|true|yes)$/i.test(String(process.env.AG_NO_CLOUD || '').trim());
+
+// Версия приложения: панель и дашборд показывают её пользователю.
+const APP_VERSION = (() => {
+  try { return String(require('./package.json').version || '0.0.0'); } catch { return '0.0.0'; }
+})();
+
+// Запас к max_tokens клиента на размышления (config.outputHeadroomTokens / AG_OUTPUT_HEADROOM).
+const OUTPUT_HEADROOM_DEFAULT = 256;
+let OUTPUT_HEADROOM = OUTPUT_HEADROOM_DEFAULT;
 const ADMIN_KEY_FILE = 'admin.key';
 
 // Единственный источник истины по дефолтам — lib/config/defaults.js.
@@ -393,6 +402,11 @@ class Upstream {
 
 function start(config) {
   config.userAgent = resolveCloudCodeUserAgent(config.userAgent);
+  // Запас на размышления: config.outputHeadroomTokens (0 = выключить) или AG_OUTPUT_HEADROOM.
+  const envHead = process.env.AG_OUTPUT_HEADROOM;
+  const headRaw = envHead != null && envHead !== '' ? Number(envHead) : Number(config.outputHeadroomTokens);
+  OUTPUT_HEADROOM = Number.isFinite(headRaw)
+    ? Math.max(0, Math.min(8192, Math.round(headRaw))) : OUTPUT_HEADROOM_DEFAULT;
   // В контейнере том может быть смонтирован root'ом: без записи сервер упадёт
   // позже и непонятно где. Лучше сказать прямо при старте.
   try {
@@ -531,18 +545,17 @@ function start(config) {
   // видимого текста не остаётся: приходит пустой ответ с finish=length.
   // Диагностика не ставит лимит, поэтому там всё работает. Добавляем запас на
   // размышления и один повтор, если его всё равно не хватило.
-  const OUTPUT_HEADROOM = 256;
-
   function applyOutputHeadroom(requestObj) {
     const gc = requestObj && requestObj.generationConfig;
     if (!gc || !Number.isFinite(gc.maxOutputTokens)) return requestObj;
     const want = Math.round(gc.maxOutputTokens);
-    if (want <= 0) return requestObj;
+    if (want <= 0 || OUTPUT_HEADROOM <= 0) return requestObj;
     gc.maxOutputTokens = Math.min(65536, want + OUTPUT_HEADROOM);
     return requestObj;
   }
 
   function retryRequestWithBudget(requestObj, extra = 2048) {
+    if (OUTPUT_HEADROOM <= 0) return null;
     let clone;
     try { clone = JSON.parse(JSON.stringify(requestObj)); } catch { return null; }
     const gc = clone.generationConfig = { ...(clone.generationConfig || {}) };
@@ -2129,7 +2142,7 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
 .empty{color:var(--dim);font-size:13px;padding:10px 0}
 .footer{color:var(--dim);font-size:12px;margin-top:4px}
 </style></head><body><div class="wrap">
-<div class="header"><span class="dot"></span><h1>ANTIGRAVITY <span class="api">API</span></h1></div>
+<div class="header"><span class="dot"></span><h1>ANTIGRAVITY <span class="api">API</span> <span style="font-size:12px;opacity:.55;font-weight:400">v${esc(APP_VERSION)}</span></h1></div>
 <p class="sub">Локальный OpenAI-совместимый шлюз · модели неймспейснуты: <code>cloud/&lt;id&gt;</code> и <code>web/&lt;alias&gt;</code> · автообновление каждые 5 с</p>
 <div class="pills">
 <span class="pill">Started <b>${esc(stats.startedAt)}</b></span>
@@ -2199,6 +2212,7 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
           return forbidden(res, 'admin_key_required', 'HTML-дашборд доступен только с админским ключом (admin.key). Клиентский API-ключ не даёт доступа к панели.');
         }
         const s = {
+          version: APP_VERSION,
           startedAt: stats.startedAt,
           requests: stats.requests,
           errors: stats.errors,

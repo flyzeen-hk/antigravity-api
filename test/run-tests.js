@@ -787,7 +787,9 @@ async function main() {
 
     const status = await A('/_status');
     assert.strictEqual(status.status, 200);
-    assert.ok(JSON.parse(status.text).network, '/_status не отдаёт network');
+    const statusJson = JSON.parse(status.text);
+    assert.ok(statusJson.network, '/_status не отдаёт network');
+    assert.match(String(statusJson.version || ''), /^\d+\.\d+\.\d+$/, '/_status должен отдавать версию');
   });
 
   await ok('web-bridge unit: тесты lib/web_bridge.js (child process)', () =>
