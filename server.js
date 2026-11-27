@@ -366,6 +366,9 @@ class Upstream {
         authSource: this.tokens.authSource || null,
         fetchedAt: new Date().toISOString(),
       };
+      if (this._accInfo.project && !this.tokens.projectId && this.catalog) {
+        this.catalog.project = this._accInfo.project;
+      }
       this._accInfoAt = Date.now();
       return this._accInfo;
     } catch (e) {
@@ -378,7 +381,8 @@ class Upstream {
     if (!force && this._quotaSummary && Date.now() - this._quotaSummaryAt < 30000) return this._quotaSummary;
     try {
       const token = await this.tokens.getAccessToken();
-      const bodyStr = this.tokens.projectId ? JSON.stringify({ project: this.tokens.projectId }) : '{}';
+      const proj = this.tokens.projectId || this._accInfo?.project || '';
+      const bodyStr = proj ? JSON.stringify({ project: proj }) : '{}';
       const res = await this.upFetch('/v1internal:retrieveUserQuotaSummary', {
         method: 'POST',
         headers: this.headers(token),

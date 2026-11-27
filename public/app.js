@@ -1677,10 +1677,23 @@
       renderInstalls();
     });
 
+    let pendingOAuthUrl = '';
+    const oauthBox = $('oauth-pending-box');
+    const oauthLink = $('oauth-pending-link');
+    const copyOAuthBtn = $('btn-copy-oauth-url');
+    if (copyOAuthBtn) {
+      copyOAuthBtn.addEventListener('click', () => {
+        if (pendingOAuthUrl) copyText(pendingOAuthUrl);
+      });
+    }
+
     const startGoogleOAuthAction = async () => {
       try {
         const res = await api('POST', '/_auth/oauth/start', { openBrowser: true });
-        if (!res || !res.ok) throw new Error('Не удалось запустить Google OAuth');
+        if (!res || !res.ok || !res.authUrl) throw new Error('Не удалось запустить Google OAuth');
+        pendingOAuthUrl = res.authUrl;
+        if (oauthLink) oauthLink.href = pendingOAuthUrl;
+        if (oauthBox) oauthBox.classList.remove('hidden');
         showToast('Открыт браузер для входа в Google. Выберите аккаунт с подпиской.', 'info');
         if (state.oauthPollTimer) clearInterval(state.oauthPollTimer);
         state.oauthPollTimer = setInterval(async () => {
@@ -1689,12 +1702,14 @@
             if (st.status === 'completed') {
               clearInterval(state.oauthPollTimer);
               state.oauthPollTimer = null;
+              if (oauthBox) oauthBox.classList.add('hidden');
               showToast(`Аккаунт подключён: ${st.email || 'Google OAuth'}`, 'ok');
               await loadAllData();
               await Promise.all([refreshLimits({ force: true }), refreshModels({ force: true })]);
             } else if (st.status === 'error' || st.status === 'timeout') {
               clearInterval(state.oauthPollTimer);
               state.oauthPollTimer = null;
+              if (oauthBox) oauthBox.classList.add('hidden');
               showToast(st.error || 'Вход отменён', 'err');
             }
           } catch {}

@@ -128,7 +128,11 @@ function openUiWindow(url, { preferBrowser = false } = {}) {
   }
 
   if (process.platform === 'win32') {
-    const child = spawn('cmd', ['/c', 'start', '', url], { detached: true, stdio: 'ignore', windowsHide: true });
+    const psScript = `Start-Process -FilePath '${String(url).replace(/'/g, "''")}'`;
+    const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+    const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded], {
+      detached: true, stdio: 'ignore', windowsHide: true,
+    });
     child.unref();
   } else if (process.platform === 'darwin') {
     const child = spawn('open', [url], { detached: true, stdio: 'ignore' });

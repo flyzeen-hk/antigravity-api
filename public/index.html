@@ -240,6 +240,13 @@
                 <button id="btn-reload-token" type="button" class="btn btn-ghost btn-sm" data-i18n="overview.reloadToken">Перечитать auth.json</button>
               </div>
             </div>
+            <div id="oauth-pending-box" class="alert alert-info hidden mb-sm">
+              <span data-i18n="overview.oauthPending">Открыто окно входа Google. Завершите авторизацию или откройте ссылку вручную:</span>
+              <div class="btn-group">
+                <a id="oauth-pending-link" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-xs" data-i18n="overview.oauthOpenLink">Открыть ссылку</a>
+                <button id="btn-copy-oauth-url" type="button" class="btn btn-secondary btn-xs" data-i18n="overview.oauthCopyLink">Копировать ссылку</button>
+              </div>
+            </div>
             <div id="guard-summary-bar" class="guard-strip"></div>
           </div>
 
