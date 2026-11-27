@@ -6,7 +6,8 @@
 
   const state = {
     authenticated: false,
-    supervised: false,
+    supervisorManaged: false,
+    serverState: 'connecting', // 'stopped' | 'starting' | 'running' | 'stopping' | 'offline'
     activeTab: 'overview',
     theme: 'dark',
     status: null,
@@ -16,10 +17,12 @@
     usage: null,
     logs: [],
     installs: null,
+    editingInstallKey: '',
     startup: null,
     backups: [],
     webAccounts: { activeAccount: '', accounts: [] },
     models: [],
+    modelsServerStopped: false,
     usageMetric: 'requests',
     usageDays: 14,
     modelFilter: 'all',
@@ -95,7 +98,7 @@
       err.status = res.status;
       err.body = json;
       err.retryAfter = Number(res.headers.get('retry-after')) || (json && json.retryAfterSec) || 0;
-      if (res.status === 401 && url !== '/_auth/session') {
+      if (res.status === 401 && url !== '/_auth/session' && url !== '/_supervisor/status') {
         handleUnauthorized();
       }
       throw err;
@@ -107,8 +110,10 @@
     const target = theme === 'light' ? 'light' : 'dark';
     state.theme = target;
     document.documentElement.setAttribute('data-theme', target);
-    const btn = $('theme-btn');
-    if (btn) btn.textContent = target === 'dark' ? '☾ Dark' : '☀ Light';
+    const label = t(target === 'dark' ? 'actions.themeDark' : 'actions.themeLight');
+    for (const btn of document.querySelectorAll('.theme-toggle-btn')) {
+      btn.textContent = label;
+    }
   }
 
   async function persistUiPref(patch) {
@@ -137,12 +142,59 @@
     return `${r}s`;
   }
 
-  function setStatusPill(kind) {
+  function updateServerControls() {
+    const st = state.serverState;
     const pill = $('live-status-pill');
     const txt = $('live-status-text');
-    if (!pill || !txt) return;
-    pill.className = `status-pill status-${kind}`;
-    txt.textContent = t(`status.${kind}`);
+    const startBtn = $('btn-start-server');
+    const restartBtn = $('btn-restart-server');
+    const stopBtn = $('btn-stop-server');
+
+    if (pill && txt) {
+      let cssClass = 'status-connecting';
+      let labelKey = 'status.connecting';
+      if (st === 'running') {
+        cssClass = 'status-online';
+        labelKey = 'status.online';
+      } else if (st === 'stopped') {
+        cssClass = 'status-stopped';
+        labelKey = 'status.stopped';
+      } else if (st === 'starting') {
+        cssClass = 'status-starting';
+        labelKey = 'status.starting';
+      } else if (st === 'stopping') {
+        cssClass = 'status-starting';
+        labelKey = 'status.stopping';
+      } else if (st === 'offline') {
+        cssClass = 'status-offline';
+        labelKey = 'status.offline';
+      } else if (st === 'reconnecting') {
+        cssClass = 'status-reconnecting';
+        labelKey = 'status.reconnecting';
+      }
+      pill.className = `status-pill ${cssClass}`;
+      txt.textContent = t(labelKey);
+    }
+
+    const busy = st === 'starting' || st === 'stopping';
+    if (startBtn) {
+      startBtn.classList.toggle('hidden', !state.supervisorManaged || st === 'running' || st === 'stopping');
+      startBtn.disabled = busy;
+    }
+    if (restartBtn) {
+      restartBtn.classList.toggle('hidden', st !== 'running');
+      restartBtn.disabled = busy;
+    }
+    if (stopBtn) {
+      stopBtn.classList.toggle('hidden', st !== 'running');
+      stopBtn.disabled = busy;
+    }
+
+    if (st !== 'running') {
+      state.uptimeSyncedAt = 0;
+      state.uptimeBase = 0;
+      if ($('topbar-uptime')) $('topbar-uptime').textContent = '—';
+    }
   }
 
   function switchTab(tabName) {
@@ -183,23 +235,41 @@
   async function refreshModels() {
     if (!state.keys.apiKey) {
       try {
-        const k = await api('GET', '/_keys');
-        state.keys = k;
+        state.keys = await api('GET', '/_keys');
       } catch {}
     }
     try {
       const headers = state.keys.apiKey ? { authorization: `Bearer ${state.keys.apiKey}` } : {};
       const res = await api('GET', '/v1/models', undefined, headers);
       state.models = Array.isArray(res.data) ? res.data : [];
+      state.modelsServerStopped = !!res.serverStopped || state.serverState !== 'running';
       $('nav-models-count').textContent = String(state.models.length);
       renderModels();
       populateChatModelSelect();
+      renderModelAndChatBanners();
     } catch (e) {
       showToast(e.message, 'err');
     }
   }
 
+  async function refreshSupervisorStatus() {
+    try {
+      const sup = await api('GET', '/_supervisor/status');
+      if (sup && sup.managed) {
+        state.supervisorManaged = true;
+        state.serverState = sup.state || 'stopped';
+        updateServerControls();
+        return;
+      }
+    } catch {}
+    state.supervisorManaged = false;
+    state.serverState = 'running';
+    updateServerControls();
+  }
+
   async function loadAllData() {
+    await refreshSupervisorStatus();
+
     const [statusR, configR, keysR, usageR, logsR, installsR, startupR, backupsR, accountsR] = await Promise.allSettled([
       api('GET', '/_status'),
       api('GET', '/_config'),
@@ -214,17 +284,24 @@
 
     if (statusR.status === 'fulfilled') {
       state.status = statusR.value;
-      state.uptimeBase = Number(state.status.uptime) || 0;
-      state.uptimeSyncedAt = Date.now();
+      if (state.status.serverRunning === false) {
+        state.serverState = 'stopped';
+      } else if (!state.supervisorManaged) {
+        state.serverState = 'running';
+      }
+      if (state.serverState === 'running') {
+        state.uptimeBase = Number(state.status.uptime) || 0;
+        state.uptimeSyncedAt = Date.now();
+      }
     }
     if (configR.status === 'fulfilled') {
       state.config = configR.value;
-      if (state.config.theme && state.config.theme !== 'system') applyTheme(state.config.theme);
       if (state.config.language && state.config.language !== getLang()) {
         setLang(state.config.language);
         applyTranslations();
         $('lang-btn').textContent = getLang().toUpperCase();
       }
+      applyTheme(state.config.theme === 'light' ? 'light' : 'dark');
     }
     if (keysR.status === 'fulfilled') state.keys = keysR.value;
     if (usageR.status === 'fulfilled') state.usage = usageR.value;
@@ -234,6 +311,7 @@
     if (backupsR.status === 'fulfilled') state.backups = Array.isArray(backupsR.value.backups) ? backupsR.value.backups : [];
     if (accountsR.status === 'fulfilled') state.webAccounts = accountsR.value;
 
+    updateServerControls();
     renderAll();
 
     await Promise.allSettled([
@@ -246,23 +324,49 @@
     try {
       state.limits = await api('GET', '/_limits');
       renderLimitsAndAuth();
+      renderModelAndChatBanners();
     } catch {}
   }
 
   function openEventStream() {
     closeEventStream();
-    setStatusPill('connecting');
+    if (!state.supervisorManaged) {
+      state.serverState = 'connecting';
+      updateServerControls();
+    }
     const es = new EventSource('/_events');
     state.es = es;
 
-    es.addEventListener('open', () => setStatusPill('online'));
+    es.addEventListener('open', () => {
+      if (!state.supervisorManaged) {
+        state.serverState = 'running';
+        updateServerControls();
+      }
+    });
+
     es.addEventListener('error', () => {
       if (!state.authenticated) return;
-      setStatusPill(es.readyState === EventSource.CLOSED ? 'offline' : 'reconnecting');
+      if (!state.supervisorManaged && state.serverState === 'stopped') return;
+      state.serverState = es.readyState === EventSource.CLOSED ? 'offline' : 'reconnecting';
+      updateServerControls();
+    });
+
+    es.addEventListener('supervisor', async (ev) => {
+      try {
+        const sup = JSON.parse(ev.data);
+        const prev = state.serverState;
+        state.supervisorManaged = true;
+        state.serverState = sup.state || 'stopped';
+        updateServerControls();
+        if (sup.lastError) showToast(sup.lastError, 'err');
+        if (prev !== state.serverState && (state.serverState === 'running' || state.serverState === 'stopped')) {
+          await loadAllData();
+        }
+      } catch {}
     });
 
     es.addEventListener('init', (ev) => {
-      setStatusPill('online');
+      state.serverState = 'running';
       try {
         const data = JSON.parse(ev.data);
         if (data.status) {
@@ -271,13 +375,15 @@
           state.uptimeSyncedAt = Date.now();
         }
         if (Array.isArray(data.logs)) state.logs = data.logs;
+        updateServerControls();
         renderOverviewKpis();
         renderLogsAndTelemetry();
+        renderModelAndChatBanners();
       } catch {}
     });
 
     es.addEventListener('heartbeat', (ev) => {
-      setStatusPill('online');
+      state.serverState = 'running';
       try {
         const hb = JSON.parse(ev.data);
         if (state.status) {
@@ -289,6 +395,7 @@
           state.uptimeSyncedAt = Date.now();
           renderOverviewKpis();
         }
+        updateServerControls();
       } catch {}
     });
 
@@ -327,6 +434,7 @@
     renderInstalls();
     renderBackups();
     renderModels();
+    renderModelAndChatBanners();
     renderWebSection();
     renderConnection();
     renderSettings();
@@ -340,7 +448,7 @@
     $('sidebar-version').textContent = `v${s.version || '2.0.0'}`;
     $('sidebar-listen').textContent = `${s.host || '127.0.0.1'}:${s.port || 8317}`;
     $('sidebar-node').textContent = s.nodeVersion || '—';
-    $('topbar-uptime').textContent = formatUptime(s.uptime || 0);
+    $('topbar-uptime').textContent = state.serverState === 'running' ? formatUptime(s.uptime || 0) : '—';
 
     $('kpi-requests').textContent = fmtCompact(s.requests || 0);
     const guardSum = state.usage && state.usage.summary;
@@ -349,7 +457,7 @@
       : `port ${s.port || 8317}`;
 
     $('kpi-errors').textContent = `${s.errors || 0} / ${s.blocked || 0}`;
-    $('kpi-errors-sub').textContent = s.supervised ? 'Supervised daemon' : 'Direct process';
+    $('kpi-errors-sub').textContent = state.supervisorManaged ? 'UI Supervisor' : (s.supervised ? 'Supervised daemon' : 'Direct process');
 
     if (s.cloudDisabled) {
       $('kpi-cloud-status').innerHTML = `<span class="badge badge-warn">${esc(t('overview.cloudDisabled'))}</span>`;
@@ -378,7 +486,11 @@
 
     const acc = l && l.account;
     const metaEl = $('cloud-account-meta');
-    if (acc && !acc.error) {
+    if (state.serverState !== 'running') {
+      metaEl.textContent = state.status && state.status.tokens && state.status.tokens.configured
+        ? `auth.json OK · ${state.status.tokens.email || t('status.stopped')}`
+        : t('status.stopped');
+    } else if (acc && !acc.error) {
       const parts = [acc.tier || acc.tierId, acc.region, acc.project ? `project: ${acc.project}` : ''].filter(Boolean);
       metaEl.textContent = parts.join(' · ') || '—';
     } else if (state.status && state.status.tokens && state.status.tokens.configured) {
@@ -403,6 +515,42 @@
       chips.push(`<span class="badge badge-err">429 ${esc(fam)}: ${esc(cd)}</span>`);
     }
     bar.innerHTML = chips.join('');
+  }
+
+  function renderModelAndChatBanners() {
+    const cloudErr = (state.limits && state.limits.modelsError && state.limits.account && state.limits.account.error !== 'server_stopped')
+      ? state.limits.modelsError
+      : (state.status && state.status.catalogError);
+    const isStopped = state.serverState !== 'running';
+
+    for (const elId of ['models-health-banner', 'chat-health-banner']) {
+      const box = $(elId);
+      if (!box) continue;
+      if (isStopped) {
+        box.className = 'alert alert-info';
+        box.innerHTML = `
+          <span>${esc(t('models.serverStoppedBanner'))}</span>
+          ${state.supervisorManaged ? `<button type="button" class="btn btn-success btn-sm banner-start-btn">${esc(t('actions.start'))}</button>` : ''}`;
+        box.classList.remove('hidden');
+        const sb = box.querySelector('.banner-start-btn');
+        if (sb) sb.addEventListener('click', startManagedServer);
+      } else if (cloudErr && !state.models.some((m) => m.provider === 'cloud')) {
+        box.className = 'alert alert-warn';
+        box.innerHTML = `
+          <span>${esc(t('models.upstreamErrorBanner', { error: cloudErr }))}</span>
+          <div class="btn-group">
+            <button type="button" class="btn btn-secondary btn-xs banner-net-btn">${esc(t('models.openNetworkSettings'))}</button>
+            <button type="button" class="btn btn-ghost btn-xs banner-retry-btn">${esc(t('actions.refresh'))}</button>
+          </div>`;
+        box.classList.remove('hidden');
+        const nb = box.querySelector('.banner-net-btn');
+        if (nb) nb.addEventListener('click', () => switchTab('settings'));
+        const rb = box.querySelector('.banner-retry-btn');
+        if (rb) rb.addEventListener('click', () => Promise.all([refreshModels(), refreshLimits()]));
+      } else {
+        box.classList.add('hidden');
+      }
+    }
   }
 
   function renderUsageSection() {
@@ -460,26 +608,76 @@
     const items = (state.installs && state.installs.items) || [];
     if (!items.length) { root.innerHTML = '<p class="muted">—</p>'; return; }
 
-    root.innerHTML = items.map((item) => `
-      <div class="account-item">
-        <div class="row-between">
-          <strong>${esc(item.label || item.key)}</strong>
-          <span class="badge ${item.found ? 'badge-ok' : 'badge-neutral'}">${item.found ? 'Found' : 'Missing'}</span>
-        </div>
-        <div class="input-row">
-          <input type="text" data-install-key="${esc(item.key)}" value="${esc(item.path || '')}" placeholder="${esc(item.detectedPath || 'Path...')}">
-          <button type="button" class="btn btn-secondary btn-sm save-install-btn" data-key="${esc(item.key)}">${esc(t('actions.save'))}</button>
-        </div>
-      </div>`).join('');
+    root.innerHTML = items.map((item) => {
+      const isEditing = state.editingInstallKey === item.key;
+      const hasPath = !!item.path;
+      return `
+        <div class="account-item">
+          <div class="row-between">
+            <strong>${esc(item.label || item.key)}</strong>
+            <div class="badge-row">
+              <span class="badge ${item.found ? 'badge-ok' : 'badge-neutral'}">${esc(t(item.found ? 'overview.installFound' : 'overview.installMissing'))}</span>
+              ${item.customPath ? '<span class="badge badge-accent">custom</span>' : ''}
+            </div>
+          </div>
+          <div class="install-path-text">${esc(hasPath ? item.path : t('overview.installNotDetected'))}</div>
+          <div class="btn-group">
+            ${item.found ? `<button type="button" class="btn btn-secondary btn-xs install-open-btn" data-key="${esc(item.key)}">${esc(t('actions.openFolder'))}</button>` : ''}
+            ${hasPath ? `<button type="button" class="btn btn-ghost btn-xs install-copy-btn" data-path="${esc(item.path)}">${esc(t('actions.copy'))}</button>` : ''}
+            ${item.key === 'ide' && item.found ? `<button type="button" class="btn btn-primary btn-xs install-extract-btn">${esc(t('overview.extractToken'))}</button>` : ''}
+            <button type="button" class="btn btn-ghost btn-xs install-edit-btn" data-key="${esc(item.key)}">${esc(isEditing ? t('actions.cancel') : t('actions.editPath'))}</button>
+          </div>
+          ${isEditing ? `
+            <div class="input-row mt-xs">
+              <input type="text" data-install-key="${esc(item.key)}" value="${esc(item.path || '')}" placeholder="${esc(item.detectedPath || 'Path...')}">
+              <button type="button" class="btn btn-primary btn-xs save-install-btn" data-key="${esc(item.key)}">${esc(t('actions.save'))}</button>
+              ${item.customPath ? `<button type="button" class="btn btn-ghost btn-xs reset-install-btn" data-key="${esc(item.key)}">${esc(t('actions.resetAuto'))}</button>` : ''}
+            </div>` : ''}
+        </div>`;
+    }).join('');
 
+    for (const btn of root.querySelectorAll('.install-open-btn')) {
+      btn.addEventListener('click', async () => {
+        try {
+          await api('POST', '/_installs/open', { key: btn.dataset.key });
+        } catch (e) {
+          showToast(e.message, 'err');
+        }
+      });
+    }
+    for (const btn of root.querySelectorAll('.install-copy-btn')) {
+      btn.addEventListener('click', () => copyText(btn.dataset.path));
+    }
+    for (const btn of root.querySelectorAll('.install-extract-btn')) {
+      btn.addEventListener('click', extractIdeTokenAction);
+    }
+    for (const btn of root.querySelectorAll('.install-edit-btn')) {
+      btn.addEventListener('click', () => {
+        state.editingInstallKey = state.editingInstallKey === btn.dataset.key ? '' : btn.dataset.key;
+        renderInstalls();
+      });
+    }
     for (const btn of root.querySelectorAll('.save-install-btn')) {
       btn.addEventListener('click', async () => {
         const key = btn.dataset.key;
         const inp = root.querySelector(`input[data-install-key="${key}"]`);
         try {
           state.installs = await api('POST', '/_installs', { key, path: inp ? inp.value.trim() : '' });
+          state.editingInstallKey = '';
           renderInstalls();
-          showToast('Saved', 'ok');
+          showToast(t('actions.save') + ': OK', 'ok');
+        } catch (e) {
+          showToast(e.message, 'err');
+        }
+      });
+    }
+    for (const btn of root.querySelectorAll('.reset-install-btn')) {
+      btn.addEventListener('click', async () => {
+        try {
+          state.installs = await api('POST', '/_installs', { key: btn.dataset.key, path: '' });
+          state.editingInstallKey = '';
+          renderInstalls();
+          showToast('Auto-detect restored', 'ok');
         } catch (e) {
           showToast(e.message, 'err');
         }
@@ -767,6 +965,9 @@
             <strong>${esc(msg.error.code || 'error')}</strong> (${esc(msg.error.stage || 'request')}): ${esc(msg.error.message || '')}
           </div>`;
       }
+      if (msg.pending && !msg.text) {
+        return `<div class="chat-bubble assistant"><div class="typing-dots" aria-label="Loading"><span></span><span></span><span></span></div></div>`;
+      }
       const diag = msg.diagnostics
         ? `<div class="chat-meta">
             <span>${esc(t('chat.bridgeUsed'))}: <code>${esc(msg.diagnostics.bridge || '—')}</code></span>
@@ -774,7 +975,7 @@
             <span>${esc(t('chat.durationMs'))}: <code>${esc(msg.diagnostics.durationMs ?? '—')}ms</code></span>
           </div>`
         : '';
-      return `<div class="chat-bubble assistant">${renderMarkdownSafe(msg.text || '…')}${diag}</div>`;
+      return `<div class="chat-bubble assistant">${renderMarkdownSafe(msg.text || '')}${diag}</div>`;
     }).join('');
 
     for (const btn of box.querySelectorAll('.code-copy-inline')) {
@@ -801,7 +1002,7 @@
     const stream = $('chat-stream-chk').checked;
 
     state.chatHistory.push({ role: 'user', text: message });
-    const assistantMsg = { role: 'assistant', text: '', diagnostics: null, error: null };
+    const assistantMsg = { role: 'assistant', text: '', pending: true, diagnostics: null, error: null };
     state.chatHistory.push(assistantMsg);
     renderChatMessages();
 
@@ -837,22 +1038,31 @@
             let frame;
             try { frame = JSON.parse(payload); } catch { continue; }
             if (frame.type === 'delta' && frame.text) {
+              assistantMsg.pending = false;
               assistantMsg.text += frame.text;
               renderChatMessages();
             } else if (frame.type === 'done') {
+              assistantMsg.pending = false;
               if (!assistantMsg.text && frame.response) assistantMsg.text = frame.response;
               assistantMsg.diagnostics = frame.diagnostics || null;
               renderChatMessages();
             } else if (frame.type === 'error') {
+              assistantMsg.pending = false;
               assistantMsg.error = frame.error || { message: 'Stream error' };
               renderChatMessages();
             }
           }
         }
+        assistantMsg.pending = false;
+        if (!assistantMsg.text && !assistantMsg.error) {
+          assistantMsg.error = { code: 'empty_stream', stage: 'response', message: t('chat.emptyStreamError') };
+          renderChatMessages();
+        }
       } else {
+        assistantMsg.pending = false;
         const data = await res.json().catch(() => ({}));
         if (!res.ok || data.ok === false) {
-          assistantMsg.error = data.error || { message: `HTTP ${res.status}` };
+          assistantMsg.error = data.error || { code: `http_${res.status}`, stage: 'upstream', message: `HTTP ${res.status}` };
         } else {
           assistantMsg.text = data.response || '';
           assistantMsg.diagnostics = data.diagnostics || null;
@@ -860,6 +1070,7 @@
         renderChatMessages();
       }
     } catch (e) {
+      assistantMsg.pending = false;
       if (e.name === 'AbortError') {
         assistantMsg.text = (assistantMsg.text ? assistantMsg.text + '\n\n' : '') + '[stopped]';
       } else {
@@ -879,7 +1090,7 @@
     const s = state.status || state.config || {};
     const hostRaw = String(s.host || '127.0.0.1').trim();
     const clientHost = (!hostRaw || hostRaw === '0.0.0.0' || hostRaw === '::') ? (window.location.hostname || '127.0.0.1') : hostRaw;
-    const port = s.port || window.location.port || 8317;
+    const port = s.port || 8317;
     return `http://${clientHost}:${port}`;
   }
 
@@ -895,6 +1106,7 @@
     const cfg = state.config || state.status || {};
     $('conn-host-input').value = cfg.host || '127.0.0.1';
     $('conn-port-input').value = cfg.port || 8317;
+    $('panel-autostart-toggle').checked = cfg.autoStartServer === true;
 
     const st = state.startup;
     const toggle = $('autostart-toggle');
@@ -993,7 +1205,64 @@
     el.classList.remove('hidden');
   }
 
+  // ---- Server Lifecycle Actions ----
+
+  async function startManagedServer() {
+    if (!state.supervisorManaged) return;
+    state.serverState = 'starting';
+    updateServerControls();
+    try {
+      await api('POST', '/_supervisor/start', {});
+      state.serverState = 'running';
+      showToast(t('status.online'), 'ok');
+      await loadAllData();
+    } catch (e) {
+      state.serverState = 'stopped';
+      updateServerControls();
+      showToast(e.message, 'err');
+    }
+  }
+
+  async function stopManagedServer() {
+    if (!(await askConfirm(t('confirm.stopTitle'), t('confirm.stopMsg'), true))) return;
+    if (state.supervisorManaged) {
+      state.serverState = 'stopping';
+      updateServerControls();
+      try {
+        await api('POST', '/_supervisor/stop', {});
+        state.serverState = 'stopped';
+        updateServerControls();
+        showToast(t('status.stopped'), 'warn');
+        await loadAllData();
+      } catch (e) {
+        await refreshSupervisorStatus();
+        showToast(e.message, 'err');
+      }
+      return;
+    }
+    await api('POST', '/_server/shutdown', {}).catch(() => {});
+    state.serverState = 'stopped';
+    closeEventStream();
+    updateServerControls();
+    $('headless-stopped-overlay').classList.remove('hidden');
+  }
+
   async function restartAndFollowPort(targetPort) {
+    if (state.supervisorManaged) {
+      state.serverState = 'starting';
+      updateServerControls();
+      try {
+        await api('POST', '/_supervisor/restart', {});
+        state.serverState = 'running';
+        showToast(t('status.online'), 'ok');
+        await loadAllData();
+      } catch (e) {
+        await refreshSupervisorStatus();
+        showToast(e.message, 'err');
+      }
+      return;
+    }
+
     try {
       await api('POST', '/_server/restart', {});
       showToast('Restarting...', 'warn');
@@ -1018,11 +1287,21 @@
           } else {
             await loadAllData();
             openEventStream();
-            showToast('Server restarted!', 'ok');
+            showToast(t('status.online'), 'ok');
           }
         }
       } catch {}
     }, 650);
+  }
+
+  async function extractIdeTokenAction() {
+    try {
+      const res = await api('POST', '/_auth/extract', {});
+      showToast(`Extracted (${res.dbSource || 'IDE'})`, 'ok');
+      await loadAllData();
+    } catch (e) {
+      showToast(e.message, 'err');
+    }
   }
 
   // ---- Event Bindings ----
@@ -1054,6 +1333,21 @@
       }
     });
 
+    $('btn-retry-reconnect').addEventListener('click', async () => {
+      try {
+        const h = await fetch('/_health', { cache: 'no-store' });
+        if (h.ok) {
+          $('headless-stopped-overlay').classList.add('hidden');
+          await loadAllData();
+          openEventStream();
+        } else {
+          showToast(t('status.offline'), 'warn');
+        }
+      } catch {
+        showToast(t('status.offline'), 'warn');
+      }
+    });
+
     $('btn-logout').addEventListener('click', async () => {
       await api('POST', '/_auth/logout', {}).catch(() => {});
       handleUnauthorized();
@@ -1071,6 +1365,8 @@
         setLang(next);
         applyTranslations();
         $('lang-btn').textContent = next.toUpperCase();
+        applyTheme(state.theme);
+        updateServerControls();
         renderAll();
         await persistUiPref({ language: next });
       });
@@ -1084,9 +1380,17 @@
       });
     }
 
+    $('btn-start-server').addEventListener('click', startManagedServer);
+    $('btn-stop-server').addEventListener('click', stopManagedServer);
+    $('btn-restart-server').addEventListener('click', async () => {
+      if (await askConfirm(t('confirm.restartTitle'), t('confirm.restartMsg'), false)) {
+        await restartAndFollowPort((state.status && state.status.port) || 8317);
+      }
+    });
+
     $('btn-refresh-all').addEventListener('click', () => loadAllData().then(() => showToast('Refreshed', 'ok')));
     $('btn-refresh-limits').addEventListener('click', refreshLimits);
-    $('btn-refresh-models').addEventListener('click', refreshModels);
+    $('btn-refresh-models').addEventListener('click', () => Promise.all([refreshModels(), refreshLimits()]));
     $('btn-refresh-installs').addEventListener('click', async () => {
       state.installs = await api('GET', '/_installs');
       renderInstalls();
@@ -1106,31 +1410,7 @@
     $('btn-quick-backup').addEventListener('click', createBackupAction);
     $('btn-create-backup').addEventListener('click', createBackupAction);
 
-    $('btn-restart-server').addEventListener('click', async () => {
-      if (await askConfirm(t('confirm.restartTitle'), t('confirm.restartMsg'), false)) {
-        await restartAndFollowPort((state.status && state.status.port) || 8317);
-      }
-    });
-
-    $('btn-stop-server').addEventListener('click', async () => {
-      if (await askConfirm(t('confirm.stopTitle'), t('confirm.stopMsg'), true)) {
-        await api('POST', '/_server/shutdown', {}).catch(() => {});
-        setStatusPill('offline');
-        closeEventStream();
-        showToast('Server stopped.', 'warn');
-      }
-    });
-
-    $('btn-extract-token').addEventListener('click', async () => {
-      try {
-        const res = await api('POST', '/_auth/extract', {});
-        showToast(`Extracted (${res.dbSource || 'IDE'})`, 'ok');
-        await loadAllData();
-      } catch (e) {
-        showToast(e.message, 'err');
-      }
-    });
-
+    $('btn-extract-token').addEventListener('click', extractIdeTokenAction);
     $('btn-reload-token').addEventListener('click', async () => {
       try {
         await api('POST', '/_auth/reload', {});
@@ -1339,8 +1619,9 @@
       try {
         const res = await api('POST', '/_config', { host, port });
         state.config = await api('GET', '/_config');
+        renderConnection();
         showToast(`Saved (${host}:${port})`, 'ok');
-        if (res.restartRequired && res.restartRequired.length) {
+        if (state.serverState === 'running' && res.restartRequired && res.restartRequired.length) {
           if (await askConfirm(t('confirm.restartTitle'), `Restart now to listen on ${host}:${port}?`, false)) {
             await restartAndFollowPort(port);
           }
@@ -1361,7 +1642,23 @@
       }
     });
 
+    $('panel-autostart-toggle').addEventListener('change', async (e) => {
+      try {
+        await api('POST', '/_config', { autoStartServer: e.target.checked });
+        state.config = await api('GET', '/_config');
+        showToast('Saved', 'ok');
+      } catch (err) {
+        e.target.checked = !e.target.checked;
+        showToast(err.message, 'err');
+      }
+    });
+
     // Settings
+    $('btn-clear-proxy').addEventListener('click', () => {
+      $('set-net-proxy').value = '';
+      showToast('Proxy cleared (click Save to apply)', 'info');
+    });
+
     $('btn-detect-proxy').addEventListener('click', async () => {
       const wrap = $('detected-proxies-wrap');
       try {
@@ -1401,11 +1698,12 @@
       };
       try {
         const res = await api('POST', '/_network/test', { timeout: 6000, network: draftNet });
-        const routesHtml = Object.entries(res.routes || {}).map(([name, info]) => {
+        const routesHtml = (res.routes || []).map((info) => {
           const ok = info && info.ok;
-          return `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${esc(name)}: ${ok ? `OK (${info.ms}ms)` : esc(info && info.error ? info.error : 'ERR')}</span>`;
+          return `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${esc(info.label || info.name)}: ${ok ? `OK (${info.ms}ms, ${info.via})` : esc(info && info.error ? info.error : 'ERR')}</span>`;
         }).join(' ');
-        box.innerHTML = `<div class="badge-row"><span>DNS: <code>${esc(res.dnsMode || 'system')}</code></span><span>Proxy: <code>${esc(res.proxy || 'direct')}</code></span>${routesHtml}</div>`;
+        const proxyWarn = res.proxy && !res.proxy.ok ? `<span class="badge badge-err">Proxy: ${esc(res.proxy.error)}</span>` : '';
+        box.innerHTML = `<div class="badge-row"><span>DNS: <code>${esc(res.dnsMode || 'system')}</code></span>${proxyWarn}${routesHtml}</div>`;
       } catch (e) {
         box.textContent = `Test failed: ${e.message}`;
       }
@@ -1483,22 +1781,24 @@
 
     setInterval(() => {
       if (!state.authenticated) return;
-      if (state.uptimeSyncedAt) {
+      if (state.serverState === 'running' && state.uptimeSyncedAt) {
         const elapsed = Math.floor((Date.now() - state.uptimeSyncedAt) / 1000);
         $('topbar-uptime').textContent = formatUptime(state.uptimeBase + elapsed);
       }
-      tickResetCountdowns($('quota-gauges-root'), t);
+      if (state.serverState === 'running') {
+        tickResetCountdowns($('quota-gauges-root'), t);
+      }
     }, 1000);
 
     setInterval(() => {
-      if (state.authenticated && state.activeTab === 'overview') {
+      if (state.authenticated && state.serverState === 'running' && state.activeTab === 'overview') {
         refreshLimits();
       }
     }, 30000);
 
     try {
       const sess = await api('GET', '/_auth/session');
-      state.supervised = !!sess.supervised;
+      state.supervisorManaged = !!sess.supervised;
       state.authenticated = !!sess.authenticated;
     } catch {
       state.authenticated = false;

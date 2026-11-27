@@ -302,7 +302,9 @@ async function main() {
     // тело не закрываем — проверяем именно пассивный таймаут
   });
   const slowTlsPort = await listen(slowTls);
+  let connectCount = 0;
   const connectProxy = makeHttpProxy();
+  connectProxy.on('connect', () => { connectCount++; });
   const connectPort = await listen(connectProxy);
   const netMgr = new NetworkManager({ network: { proxy: `http://127.0.0.1:${connectPort}`, useEnvProxy: false } });
   process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
@@ -316,9 +318,21 @@ async function main() {
   } finally {
     delete process.env.NODE_TLS_REJECT_UNAUTHORIZED;
   }
+  assert.ok(connectCount >= 1, 'запрос должен идти через CONNECT-прокси, а не напрямую: ' + connectCount);
   assert.ok(bodyErr, 'медленное тело должно оборваться по таймауту');
   assert.ok(Date.now() - started < 5000, 'таймаут сработал за ' + (Date.now() - started) + ' мс');
   assert.ok(/timed out|aborted|socket hang up/i.test(String(bodyErr.message || bodyErr)), 'ошибка таймаута: ' + bodyErr.message);
+
+  // Мёртвый прокси обязан отказать (ECONNREFUSED), а не молча пойти напрямую.
+  const deadSrv = net.createServer();
+  const deadPort = await listen(deadSrv);
+  await new Promise((r) => deadSrv.close(r));
+  const deadMgr = new NetworkManager({ network: { proxy: `http://127.0.0.1:${deadPort}`, useEnvProxy: false } });
+  const deadProbe = await deadMgr.probe(`https://127.0.0.1:${slowTlsPort}/`, 'upstream', 1500);
+  assert.strictEqual(deadProbe.ok, false, 'недоступный прокси не должен молча обходиться напрямую');
+  assert.match(String(deadProbe.error || ''), /ECONNREFUSED|refused|timeout/i);
+  deadMgr.destroyAll();
+  netMgr.destroyAll();
   removeTree(tlsDir);
   console.log('ALL NETWORK UNIT TESTS PASSED!');
 }

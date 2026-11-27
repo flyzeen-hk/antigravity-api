@@ -47,7 +47,7 @@
     return `
       <svg width="86" height="86" viewBox="0 0 86 86" aria-hidden="true">
         <circle cx="43" cy="43" r="${r}" fill="none" stroke="var(--border)" stroke-width="7"></circle>
-        <circle cx="43" cy="43" r="${r}" fill="none" stroke="${color}" stroke-width="7"
+        <circle class="gauge-arc" cx="43" cy="43" r="${r}" fill="none" stroke="${color}" stroke-width="7"
           stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${c.toFixed(1)}"
           transform="rotate(-90 43 43)"></circle>
         <text x="43" y="47" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="700" font-family="var(--font-sans)">${esc(label)}</text>
@@ -62,8 +62,12 @@
     }
 
     const accErr = limitsData.account && limitsData.account.error;
+    if (accErr === 'server_stopped') {
+      container.innerHTML = `<div class="alert alert-info"><span>${esc(t('overview.quotasServerStopped'))}</span></div>`;
+      return;
+    }
     if (accErr === 'cloud_disabled' || accErr === 'auth_missing') {
-      container.innerHTML = `<div class="alert alert-info">${esc(limitsData.modelsError || t('overview.noQuotas'))}</div>`;
+      container.innerHTML = `<div class="alert alert-info"><span>${esc(limitsData.modelsError || t('overview.noQuotas'))}</span></div>`;
       return;
     }
 
@@ -104,7 +108,7 @@
 
     if (!cards.length) {
       const errText = (limitsData.serverQuotas && limitsData.serverQuotas.error) || limitsData.modelsError || t('overview.noQuotas');
-      container.innerHTML = `<div class="alert alert-warn">${esc(errText)}</div>`;
+      container.innerHTML = `<div class="alert alert-warn"><span>${esc(errText)}</span></div>`;
       return;
     }
 
@@ -161,8 +165,8 @@
       return `
         <g class="usage-bar-group" data-date="${esc(r.date)}" data-req="${Number(r.requests) || 0}" data-tok="${Number(r.tokens) || 0}">
           <rect x="${x.toFixed(1)}" y="${padT}" width="${barW.toFixed(1)}" height="${innerH}" fill="transparent"></rect>
-          <rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}"
-            rx="3" fill="${metric === 'tokens' ? 'var(--cyan)' : 'var(--accent)'}" opacity="0.88"></rect>
+          <rect class="usage-bar-rect" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}"
+            rx="3" fill="${metric === 'tokens' ? 'var(--cyan)' : 'var(--accent)'}" opacity="0.86"></rect>
           ${showLabel ? `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 7}" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-family="var(--font-mono)">${esc(dateShort)}</text>` : ''}
         </g>`;
     }).join('');
@@ -243,9 +247,9 @@
         <span class="badge badge-warn">4xx: ${warnCount}</span>
         <span class="badge badge-err">5xx: ${errCount}</span>
         <div style="width:120px;height:8px;background:var(--bg-input);border-radius:99px;overflow:hidden;display:flex;border:1px solid var(--border)">
-          <div style="width:${(okCount / total) * 100}%;background:var(--green)"></div>
-          <div style="width:${(warnCount / total) * 100}%;background:var(--amber)"></div>
-          <div style="width:${(errCount / total) * 100}%;background:var(--red)"></div>
+          <div style="width:${(okCount / total) * 100}%;background:var(--green);transition:width 0.3s ease"></div>
+          <div style="width:${(warnCount / total) * 100}%;background:var(--amber);transition:width 0.3s ease"></div>
+          <div style="width:${(errCount / total) * 100}%;background:var(--red);transition:width 0.3s ease"></div>
         </div>
       </div>
       <div class="badge-row">

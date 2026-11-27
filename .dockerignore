@@ -9,6 +9,8 @@ dist
 *.bak
 *.tmp
 *.corrupt
+.ui-supervisor.json
+.launcher.pid
 # Never bake secrets into container image
 auth.json
 apikey.txt

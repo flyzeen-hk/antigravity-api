@@ -521,6 +521,14 @@ function start(config) {
   }
   const log = [];
   const stats = { startedAt: new Date().toISOString(), requests: 0, errors: 0, blocked: 0 };
+  let lastCatalogError = '';
+  const waitNetworkReady = async () => {
+    if (network && network._autoDnsPromise) {
+      try {
+        await Promise.race([network._autoDnsPromise, new Promise((r) => setTimeout(r, 1500))]);
+      } catch {}
+    }
+  };
   const eventClients = new Set();
 
   const broadcastEvent = (type, payload) => {
@@ -2085,7 +2093,9 @@ function start(config) {
   async function buildOpenAIModels() {
     let data = [];
     if (!CLOUD_DISABLED) try {
+      await waitNetworkReady();
       const models = await catalog.list(() => tokens.getAccessToken());
+      lastCatalogError = '';
       data = [...models.entries()].map(([id, m]) => ({
         id: providers.formatModel(providers.CLOUD, id),
         provider: providers.CLOUD,
@@ -2099,6 +2109,7 @@ function start(config) {
         capabilities: providers.describeModel(providers.CLOUD),
       }));
     } catch (e) {
+      lastCatalogError = redactSecrets(e.message || String(e));
       // каталог аккаунта недоступен — всё равно отдаём web-модели
       console.error('  [models] upstream каталог недоступен:', e.message);
     }
@@ -2122,7 +2133,9 @@ function start(config) {
   async function buildGeminiModels() {
     const models = [];
     if (!CLOUD_DISABLED) try {
+      await waitNetworkReady();
       const upstreamModels = await catalog.list(() => tokens.getAccessToken());
+      lastCatalogError = '';
       for (const [id, m] of upstreamModels.entries()) {
         models.push({
           name: `models/${providers.formatModel(providers.CLOUD, id)}`,
@@ -2135,6 +2148,7 @@ function start(config) {
         });
       }
     } catch (e) {
+      lastCatalogError = redactSecrets(e.message || String(e));
       console.error('  [models] upstream каталог недоступен:', e.message);
     }
     if (webBridge.enabled) {
@@ -2261,6 +2275,7 @@ function start(config) {
       blocked: stats.blocked,
       tokenRefreshes: upstream.refreshCount,
       tokens: tokens.summary(),
+      catalogError: lastCatalogError || null,
       network: network.summary(),
       geminiWeb: webBridge.summary ? webBridge.summary() : null,
       agent: {
@@ -2430,6 +2445,7 @@ function start(config) {
       }
 
       if (p === '/_limits' || p === '/_quota') {
+        await waitNetworkReady();
         if (CLOUD_DISABLED || (typeof tokens.hasCredentials === 'function' && !tokens.hasCredentials())) {
           const reply = {
             local: guard.summary(),
@@ -2454,8 +2470,10 @@ function start(config) {
           (async () => {
             try {
               await catalog.list(() => tokens.getAccessToken());
+              lastCatalogError = '';
             } catch (e) {
               modelsError = e.message;
+              lastCatalogError = redactSecrets(e.message || String(e));
             }
           })(),
         ]);
@@ -2737,6 +2755,12 @@ function start(config) {
           if (!body) return;
           return sendJson(res, 200, installsLib.setInstallPath(DATA_DIR, body.key, body.path));
         }
+      }
+      if (p === '/_installs/open' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const body = await readJsonObj(req, res);
+        if (!body) return;
+        return sendJson(res, 200, installsLib.openInstallFolder(DATA_DIR, body.key));
       }
 
       if (p === '/_startup') {

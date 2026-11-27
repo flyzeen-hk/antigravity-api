@@ -15,6 +15,7 @@ console.log('== test_config');
 ok(configLib.CONFIG_VERSION === 2, 'CONFIG_VERSION === 2');
 ok(configLib.DEFAULTS.theme === 'dark', 'default theme is dark');
 ok(configLib.DEFAULTS.language === 'ru', 'default language is ru');
+ok(configLib.DEFAULTS.autoStartServer === false, 'default autoStartServer is false');
 ok(configLib.DEFAULTS.geminiWeb.cookie_file === '', 'default cookie_file empty string');
 
 const norm = configLib.normalize({
@@ -42,6 +43,7 @@ const patched = configLib.patchConfig(base, {
   host: '0.0.0.0',
   theme: 'light',
   language: 'en',
+  autoStartServer: true,
   outputHeadroomTokens: 512,
   apiKey: 'hacked',
   adminKey: 'hacked2',
@@ -54,6 +56,7 @@ ok(patched.config.port === 8400, 'patchConfig applies port');
 ok(patched.config.host === '0.0.0.0', 'patchConfig applies host');
 ok(patched.config.theme === 'light', 'patchConfig applies theme');
 ok(patched.config.language === 'en', 'patchConfig applies language');
+ok(patched.config.autoStartServer === true, 'patchConfig applies autoStartServer');
 ok(patched.config.outputHeadroomTokens === 512, 'patchConfig applies outputHeadroomTokens');
 ok(patched.config.agent.enabled === false, 'patchConfig applies agent.enabled');
 ok(patched.config.apiKey === 'secret-api', 'apiKey cannot be overwritten via patchConfig');

@@ -32,6 +32,8 @@ agent_audit.jsonl.*
 # Runtime logs & processes
 *.log
 antigravity-api.log
+.ui-supervisor.json
+.launcher.pid
 
 # Dependencies
 node_modules/
