@@ -52,11 +52,10 @@ What it adds on top of the raw APIs:
 
 | Requirement | Why | Notes |
 |---|---|---|
-| **Antigravity desktop app or Antigravity IDE**, signed in | Source of the Cloud Code OAuth session | `scripts/extract_token.py` reads `state.vscdb` from `%APPDATA%\Antigravity IDE`, `%APPDATA%\Antigravity` or `%APPDATA%\antigravity` (macOS and Linux have the equivalent paths; `ANTIGRAVITY_STATE_DB` points it elsewhere). The app does not need to be running — only the stored session is used. **Antigravity CLI and the Antigravity extension for VS Code are detected by the panel but are not a token source.** |
-| **Node.js 18+** | Runs `server.js` | LTS is fine. |
-| **Python 3.10+** | Runs `app.py` (desktop panel), the installer, and the token extraction that fills `auth.json` | On Windows tick **"Add python.exe to PATH"** during install. Once `auth.json` exists, `node server.js` runs without Python — but the panel and re-extraction do need it. |
+| **Antigravity desktop app or Antigravity IDE**, signed in | Source of the Cloud Code OAuth session | `lib/token_extract.js` reads `state.vscdb` cleanly in pure Node.js from `%APPDATA%\Antigravity IDE`, `%APPDATA%\Antigravity` or `%APPDATA%\antigravity` (macOS and Linux use equivalent paths; `ANTIGRAVITY_STATE_DB` points it elsewhere). The app does not need to be running — only the stored session is used. **Antigravity CLI and the Antigravity extension for VS Code are detected in the UI but are not a token source.** |
+| **Node.js 18+** (or consent-based portable bootstrap) | Runs `server.js`, the offline Web Control Panel (`public/`), and all scripts | **Zero Python & zero npm dependencies required.** If Node.js 18+ is missing, `run.bat` / `install.bat` / `run.sh` / `install.sh` ask for your explicit consent before downloading SHA-256 verified portable Node.js 22 LTS into `runtime/node/` (or using `winget`). You can also package an autonomous release with `npm run build:portable`. |
 
-The `web/` bridge needs one more thing, but only if you intend to use web models: a Google account cookie from `gemini.google.com` (see [Gemini Web bridge](#gemini-web-bridge)). Cloud models work without it.
+The `web/` bridge needs one more thing, but only if you intend to use web models: a Google account cookie from `gemini.google.com` (importable via 1-click CDP browser integration in the Web Control Panel or pasted manually; see [Gemini Web bridge](#gemini-web-bridge)). Cloud models work without it.
 
 ---
 
@@ -64,7 +63,7 @@ The `web/` bridge needs one more thing, but only if you intend to use web models
 
 ### Download
 
-Take `antigravity-api-release.zip` from [Releases](https://github.com/flyzeen-hk/antigravity-api/releases) and extract it anywhere, or use `<> Code` → **Download ZIP**, or clone:
+Take the portable archive or source from Releases, or clone:
 
 ```bash
 git clone https://github.com/flyzeen-hk/antigravity-api.git
@@ -73,31 +72,32 @@ cd antigravity-api
 
 ### Windows
 
-Double-click **`install.bat`**. It checks Python and Node.js, installs the Python dependencies from `requirements.txt`, pulls your Antigravity session into `auth.json`, and asks whether to create Desktop and Start Menu shortcuts (answer `y` or `N`).
+Double-click **`install.bat`** (or **`run.bat`** directly). It checks for local `runtime\node\node.exe` or system Node.js 18+ (asking explicit permission before downloading anything if missing), offers to extract your Antigravity session into `auth.json`, creates Desktop and Start Menu shortcuts (`Antigravity API.lnk`), and launches the modern offline **Web Control Panel** in an isolated Edge/Chrome app window (or default browser).
 
 ### macOS / Linux
 
 ```bash
-chmod +x install.sh run.sh
+chmod +x install.sh run.sh update.sh
 ./install.sh
 ./run.sh
 ```
 
-### Manual install
+### Updating with automatic backup
 
-If you prefer to do it yourself:
+Run **`update.bat`** (Windows), **`./update.sh`** (macOS/Linux), or `npm run update`. Every update first creates a complete timestamped snapshot in `_backups/` (full `git bundle` + live state & keys) before pulling from remote. Backups and rollbacks are handled by `scripts/update.js`.
+
+### Manual start
 
 ```bash
-pip install -r requirements.txt       # panel only
-python scripts/extract_token.py       # writes auth.json from the IDE session
-python app.py                         # panel; press Start API Server
-# or, without the panel:
-node server.js                        # reads auth.json, serves on 127.0.0.1:8317
+npm run extract-token   # optional: writes auth.json from the Antigravity IDE session
+npm run ui              # starts background supervisor + opens Web Control Panel
+# or headless gateway only:
+node server.js          # reads auth.json, serves gateway + Web Control Panel on 127.0.0.1:8317
 ```
 
 ### Docker
 
-The image contains only the Node gateway — no panel, no Python. All mutable state lives in the `data` volume.
+The image runs pure Node.js (gateway + offline Web Control Panel, zero Python). All mutable state lives in the `data` volume.
 
 ```bash
 mkdir -p data
@@ -124,10 +124,10 @@ AG_NO_CLOUD=1 docker compose up -d    # only web models, no Antigravity session
 
 ## First run
 
-1. Start the panel (`python app.py`, `run.bat`, or the shortcut). It opens in **English**; **RU / EN** in the header switches languages.
-2. The panel shows the **API key**, the **base URL** (`http://127.0.0.1:8317/v1`), the detected Antigravity account and the current quota percentages.
-3. Press **Start API Server**. The dot turns green when `GET /_health` answers.
-4. Point your client at the base URL with that key.
+1. Start via **`run.bat`** / **`./run.sh`** / Desktop shortcut (or `npm run ui`). The offline Web Control Panel opens in Russian or English (**RU / EN** switches live without reload, Dark/Light theme toggle is in the top bar).
+2. Authenticate using `admin.key` (automatic on local app-window launches via one-time nonce).
+3. Overview shows **live SSE request telemetry**, **5h & Weekly Cloud Code quota gauges with countdowns**, **Usage charts**, detected programs, and backups.
+4. Use the **Connection** tab to copy Base URLs, API key, and client snippets.
 
 Two files appear next to the program on first run and are **never committed**:
 
@@ -471,12 +471,12 @@ Facts worth stating explicitly:
 |---|---|---|
 | Panel stuck on «Loading…» quotas, `Offline (fetch failed)` | Google host unreachable — DNS filtering or DPI | Set a proxy in **Network Transport**; run **Check connection** |
 | `region_not_supported` on `cloud/` | Egress IP not in a supported region | Use a proxy in a supported region; the account and cookie are not the cause |
-| `401` from Cloud Code | Session expired or the IDE account changed | Re-run `python scripts/extract_token.py` |
-| Web models return empty or garbled text | Cookie expired, wrong account, or cookie not bound to this browser | Re-copy the Cookie header; check `GET /_config` → `cookieSet` |
+| `401` from Cloud Code | Session expired or the IDE account changed | Click **Extract from Antigravity IDE** in Overview or run `npm run extract-token` |
+| Web models return empty or garbled text | Cookie expired, wrong account, or cookie not bound to this browser | Use **Open Gemini Browser** + **Import Cookies (CDP)** in Gemini Web tab; check `GET /_config` → `cookieSet` |
 | Web request redirects to a Google «sorry» page | Google verification triggered by the egress IP | Change proxy/egress; the bridge reports `web_verification_required` |
 | Answers truncated mid-file | Model reply length cap, not the gateway | Ask for chunked writing: `write_file` then `append_file` |
 | Empty answer with a small `max_tokens` | Thinking models spend the whole budget on reasoning (Hydrogen Sonar uses ~160 tokens even for "2+2") | The gateway adds 256 tokens of headroom and retries once; if it is still empty, raise `max_tokens` (1024 is a safe value) |
-| `413 body_too_large` | Request above 64 MB | Send less in one request |
+| `413 body_too_large` | Request above limit | Send less in one request |
 | `499` in the log | The client disconnected | Nothing to fix; the upstream request was cancelled |
 | Port already in use | Another program or an old server on 8317 | Change the port in the Connection tab |
 
@@ -486,12 +486,17 @@ Facts worth stating explicitly:
 
 ```bash
 npm test
+npm run check:privacy
 ```
 
-That runs every suite: integration routing and streaming, translation, agent tools, the web bridge, diagnostics, safe file writes, networking, panel config and cookie extraction. Individual suites:
+That runs every suite in pure Node.js: integration routing and streaming, config normalization/patching, security fixes, pure-Node token extraction, proxy auto-detection, model catalog, translation, agent tools, the web bridge, diagnostics, safe file writes, networking, and Web-Only mode. Individual suites:
 
 ```bash
 node test/run-tests.js              # integration: routing, streaming, agent, planner
+node test/test_config.js            # defaults, schema normalization, HTTP patch security
+node test/test_security_and_fixes.js # agent POSIX/device paths, guard history, models, anthropic, web_bridge
+node test/test_token_extract.js     # pure-Node Antigravity IDE token extraction
+node test/test_proxy_detect.js      # local proxy detection & credential masking
 node test/test_translate.js         # OpenAI <-> Gemini conversion
 node test/agent_tools_test.js       # tool specs, sandbox, aliases
 node test/test_web_bridge.js        # web aliases, payload, language detection
@@ -500,15 +505,6 @@ node test/test_safe_files.js        # atomic writes and backups
 node test/test_net.js               # proxy, DNS, timeouts
 node test/test_providers.js         # namespace parsing
 node test/test_planner.js           # planner limits and timeout
-python test/test_app_config.py      # panel config safety
-python test/test_cookie_extract.py  # cookie import from a browser profile
-python test/test_cookie_cdp.py      # cookie import over CDP
-```
-
-Panel smoke test:
-
-```bash
-python app.py --selftest
 ```
 
 ---
@@ -542,42 +538,42 @@ python app.py --selftest
 
 | Требование | Зачем | Замечание |
 |---|---|---|
-| **Antigravity (приложение) или Antigravity IDE** с выполненным входом | Источник OAuth-сессии Cloud Code | `scripts/extract_token.py` читает `state.vscdb` из `%APPDATA%\Antigravity IDE`, `%APPDATA%\Antigravity` или `%APPDATA%\antigravity` (на macOS и Linux пути аналогичные; `ANTIGRAVITY_STATE_DB` задаёт свой). Само приложение не обязательно должно быть запущено — используется только сохранённая сессия. **Antigravity CLI и расширение Antigravity для VS Code панель находит, но источником токена они не являются.** |
-| **Node.js 18+** | Запускает `server.js` | Подойдёт LTS. |
-| **Python 3.10+** | Запускает `app.py` (панель), установщик и извлечение токена в `auth.json` | На Windows отметьте **«Add python.exe to PATH»**. Когда `auth.json` уже есть, `node server.js` работает без Python — а панель и повторное извлечение токена без него нет. |
+| **Antigravity (приложение) или Antigravity IDE** с выполненным входом | Источник OAuth-сессии Cloud Code | `lib/token_extract.js` (чистый Node.js без Python) читает `state.vscdb` из `%APPDATA%\Antigravity IDE`, `%APPDATA%\Antigravity` или `%APPDATA%\antigravity` (на macOS и Linux пути аналогичные; `ANTIGRAVITY_STATE_DB` задаёт свой). Само приложение не обязательно должно быть запущено — используется только сохранённая сессия. **Antigravity CLI и расширение Antigravity для VS Code панель находит, но источником токена они не являются.** |
+| **Node.js 18+** (или автозагрузка с согласия пользователя) | Запускает `server.js`, современную оффлайн-веб-панель и все скрипты | **Python и сторонние npm-пакеты больше не нужны.** Если Node.js 18+ не найден, `run.bat` / `install.bat` / `run.sh` / `install.sh` спрашивают явное разрешение пользователя и (при согласии) скачивают проверенный по SHA-256 портативный Node.js 22 LTS в `runtime/node/` или ставят через `winget`. Сборка автономного архива: `npm run build:portable`. |
 
-Для веб-моста нужен ещё один пункт, но только если вы собираетесь пользоваться веб-моделями: куки аккаунта Google с `gemini.google.com` (см. раздел [Веб-мост Gemini](#веб-мост-gemini)). Моделям `cloud/` куки не нужны.
+Для веб-моста нужен ещё один пункт, но только если вы собираетесь пользоваться веб-моделями: куки аккаунта Google с `gemini.google.com` (импорт в 1 клик через CDP прямо из вкладки Gemini Web или вставка вручную; см. раздел [Веб-мост Gemini](#веб-мост-gemini)). Моделям `cloud/` куки не нужны.
 
 ## Установка
 
-**Скачивание.** Возьмите `antigravity-api-release.zip` со страницы [Releases](https://github.com/flyzeen-hk/antigravity-api/releases) и распакуйте куда удобно, либо нажмите `<> Code` → **Download ZIP**, либо клонируйте:
+**Скачивание.** Возьмите архив с релизом или клонируйте репозиторий:
 
 ```bash
 git clone https://github.com/flyzeen-hk/antigravity-api.git
 cd antigravity-api
 ```
 
-**Windows.** Запустите **`install.bat`**. Он проверит Python и Node.js, поставит зависимости из `requirements.txt`, извлечёт сессию Antigravity в `auth.json` и спросит про ярлыки на Рабочем столе и в меню «Пуск» (`y` или `N`).
+**Windows.** Запустите **`install.bat`** (или сразу **`run.bat`**). Скрипт проверит локальный `runtime\node\node.exe` или системный Node.js 18+ (без вашего согласия ничего не качает), предложит извлечь сессию Antigravity в `auth.json`, создаст ярлыки на Рабочем столе и в меню «Пуск» (`Antigravity API.lnk`) и откроет современную **веб-панель управления** в отдельном окне приложения Edge/Chrome или браузере.
 
 **macOS / Linux:**
 
 ```bash
-chmod +x install.sh run.sh
+chmod +x install.sh run.sh update.sh
 ./install.sh
 ./run.sh
 ```
 
+**Обновление с автоматическим бэкапом.** Запустите **`update.bat`** / **`./update.sh`** / `npm run update`. Перед подтягиванием обновлений скрипт `scripts/update.js` всегда создаёт полный снимок в `_backups/` (bundle репозитория + `config.json`, `auth.json`, ключи, `usage.json` с контрольными суммами).
+
 **Вручную:**
 
 ```bash
-pip install -r requirements.txt       # только для панели
-python scripts/extract_token.py       # создаёт auth.json из сессии IDE
-python app.py                         # панель; нажмите Start API Server
-# или без панели:
-node server.js                        # читает auth.json, слушает 127.0.0.1:8317
+npm run extract-token   # создаёт auth.json из сессии IDE
+npm run ui              # поднимает фоновый супервизор и открывает веб-панель
+# или напрямую headless:
+node server.js          # читает auth.json, обслуживает API и панель на 127.0.0.1:8317
 ```
 
-**Docker.** В образе только Node-шлюз, без панели и Python; всё изменяемое — в томе `data`.
+**Docker.** В образе чистый Node.js (API-шлюз и оффлайн-веб-панель, без Python); всё изменяемое — в томе `data`.
 
 ```bash
 mkdir -p data
@@ -595,10 +591,9 @@ AG_NO_CLOUD=1 docker compose up -d    # только веб-модели, без
 
 ## Первый запуск
 
-1. Запустите панель (`python app.py`, `run.bat` или ярлык). Она открывается на **английском**; кнопки **RU / EN** в шапке переключают язык.
-2. В окне видны **API-ключ**, **Base URL** (`http://127.0.0.1:8317/v1`), найденный аккаунт Antigravity и текущие квоты в процентах.
-3. Нажмите **Start API Server**. Индикатор станет зелёным, когда ответит `GET /_health`.
-4. Укажите Base URL и ключ в своём клиенте.
+1. Запустите панель (`run.bat`, `./run.sh`, ярлык или `npm run ui`). Переключатель **RU / EN** и светлая/тёмная тема работают мгновенно без перезагрузки.
+2. Войдите по ключу из `admin.key` (при запуске через лаунчер вход выполняется автоматически по одноразовому nonce).
+3. На вкладке **Обзор** доступны живой поток запросов по SSE, датчики квот 5h/Weekly с таймером сброса, графики истории и менеджер бэкапов; во вкладке **Подключение** — URL, ключи и готовые сниппеты.
 
 При первом запуске рядом с программой появляются два файла, которые **никогда не коммитятся**:
 
@@ -809,25 +804,30 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 |---|---|---|
 | Панель висит на «Загрузка…» квот, `Offline (fetch failed)` | Хост Google недоступен — фильтрация DNS или DPI | Задайте прокси в **Network Transport** и нажмите **Проверить соединение** |
 | `region_not_supported` на `cloud/` | Выходной IP не из поддерживаемого региона | Прокси в поддерживаемом регионе; аккаунт и куки тут ни при чём |
-| `401` от Cloud Code | Сессия истекла или сменился аккаунт в IDE | Повторно выполните `python scripts/extract_token.py` |
-| Веб-модели отдают пустой или битый текст | Куки истекли, не тот аккаунт или куки не привязана к этому браузеру | Скопируйте заголовок Cookie заново; проверьте `GET /_config` → `cookieSet` |
+| `401` от Cloud Code | Сессия истекла или сменился аккаунт в IDE | Нажмите **Извлечь токен из Antigravity IDE** в панели или `npm run extract-token` |
+| Веб-модели отдают пустой или битый текст | Куки истекли, не тот аккаунт или куки не привязана к этому браузеру | Используйте **Открыть Gemini в браузере** и **Импорт cookie (CDP)** на вкладке Gemini Web; проверьте `GET /_config` → `cookieSet` |
 | Веб-запрос уводит на страницу Google «sorry» | Google сработала проверка по выходному IP | Смените прокси/выход; мост сообщает `web_verification_required` |
 | Ответ обрывается на середине файла | Лимит длины ответа модели, а не шлюза | Просите писать частями: `write_file`, затем `append_file` |
 | Пустой ответ при маленьком `max_tokens` | Думающие модели тратят весь бюджет на рассуждения (Hydrogen Sonar — ~160 токенов даже на «2+2») | Шлюз добавляет 256 токенов запаса и делает один повтор; если всё равно пусто — поднимите `max_tokens` (1024 — безопасное значение) |
-| `413 body_too_large` | Запрос больше 64 МБ | Отправьте меньше за один раз |
+| `413 body_too_large` | Превышен лимит тела запроса | Отправьте меньше за один раз |
 | `499` в журнале | Клиент отключился | Чинить нечего; запрос к Google отменён |
-| Порт занят | Другая программа или старый сервер на 8317 | Смените порт на вкладке Connection |
+| Порт занят | Другая программа или старый сервер на 8317 | Смените порт на вкладке Подключение |
 
 ## Тесты
 
 ```bash
 npm test
+npm run check:privacy
 ```
 
-Запускает все наборы: интеграционные маршруты и стриминг, конвертацию, инструменты агента, веб-мост, диагностику, безопасную запись файлов, сеть, конфиг панели и извлечение куки. По отдельности:
+Запускает все наборы на чистом Node.js: интеграционные маршруты и стриминг, валидацию/патч конфига, фиксы безопасности, извлечение токена IDE, автопоиск прокси, каталог моделей, конвертацию, инструменты агента, веб-мост, диагностику, атомарную запись файлов и сеть. По отдельности:
 
 ```bash
 node test/run-tests.js              # интеграция: маршруты, стриминг, агент, планировщик
+node test/test_config.js            # дефолты, схема и защита HTTP-патча
+node test/test_security_and_fixes.js # POSIX/Windows пути агента, guard.history, models, anthropic, web_bridge
+node test/test_token_extract.js     # извлечение токена IDE без Python
+node test/test_proxy_detect.js      # автопоиск локальных прокси
 node test/test_translate.js         # конвертация OpenAI <-> Gemini
 node test/agent_tools_test.js       # инструменты и песочница
 node test/test_web_bridge.js        # веб-алиасы, payload, определение языка
@@ -836,13 +836,4 @@ node test/test_safe_files.js        # атомарная запись и бэк�
 node test/test_net.js               # прокси, DNS, таймауты
 node test/test_providers.js         # разбор пространств имён
 node test/test_planner.js           # лимиты и таймаут планировщика
-python test/test_app_config.py      # сохранность config.json
-python test/test_cookie_extract.py  # извлечение куки из профиля браузера
-python test/test_cookie_cdp.py      # извлечение куки через CDP
-```
-
-Проверка запуска панели:
-
-```bash
-python app.py --selftest
 ```

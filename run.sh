@@ -1,19 +1,8 @@
 #!/usr/bin/env bash
-# Antigravity API — Linux / macOS Launcher
-set -e
-
-DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$DIR"
-
-echo "========================================================"
-echo "       Antigravity API — Cross-platform Launcher"
-echo "========================================================"
-
-if command -v python3 &>/dev/null; then
-    python3 app.py "$@"
-elif command -v python &>/dev/null; then
-    python app.py "$@"
-else
-    echo "[ERROR] Python 3 не найден в системе!"
-    exit 1
-fi
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=scripts/bootstrap_node.sh
+source "$ROOT/scripts/bootstrap_node.sh"
+ag_ensure_node
+cd "$ROOT"
+exec "$AG_NODE" "$ROOT/scripts/launcher.js" "$@"

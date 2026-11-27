@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Antigravity API — Control Panel</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <!-- Auth Overlay -->
+  <div id="auth-screen" class="auth-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <div class="brand-logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="28" height="28" fill="none">
+            <path d="M16 3L28 9.5V22.5L16 29L4 22.5V9.5L16 3Z" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
+            <path d="M16 9L22 21H10L16 9Z" fill="currentColor" opacity="0.9"/>
+          </svg>
+        </div>
+        <div>
+          <h1 id="auth-title" data-i18n="auth.title">Antigravity API</h1>
+          <p class="muted" data-i18n="auth.subtitle">Панель управления локальным шлюзом</p>
+        </div>
+      </div>
+      <form id="auth-form" class="stack-md">
+        <label class="field">
+          <span data-i18n="auth.adminKeyLabel">Ключ администратора (admin.key)</span>
+          <div class="input-row">
+            <input id="auth-key-input" type="password" autocomplete="current-password" required
+              data-i18n-placeholder="auth.adminKeyPlaceholder" placeholder="Вставьте ключ из admin.key">
+            <button type="button" id="auth-toggle-vis" class="btn btn-ghost btn-icon" title="Show/Hide">
+              <span class="eye-icon">👁</span>
+            </button>
+          </div>
+        </label>
+        <div id="auth-error" class="alert alert-danger hidden"></div>
+        <button id="auth-submit-btn" type="submit" class="btn btn-primary btn-block" data-i18n="auth.loginBtn">Войти в панель</button>
+        <p class="hint" data-i18n="auth.hint">Ключ администратора хранится в файле admin.key в каталоге данных приложения. Обычный клиентский apiKey не открывает настройки.</p>
+      </form>
+      <div class="auth-footer">
+        <button type="button" class="btn btn-ghost btn-sm lang-toggle-btn">RU / EN</button>
+        <button type="button" class="btn btn-ghost btn-sm theme-toggle-btn">Theme</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- App Shell -->
+  <div id="app-shell" class="app-shell hidden">
+    <aside id="sidebar" class="sidebar" aria-label="Navigation">
+      <div class="sidebar-header">
+        <div class="brand-mini">
+          <div class="brand-logo" aria-hidden="true">
+            <svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+              <path d="M16 3L28 9.5V22.5L16 29L4 22.5V9.5L16 3Z" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/>
+              <path d="M16 9L22 21H10L16 9Z" fill="currentColor"/>
+            </svg>
+          </div>
+          <div class="brand-text">
+            <strong>Antigravity API</strong>
+            <span id="sidebar-version" class="badge badge-neutral">v2.0.0</span>
+          </div>
+        </div>
+        <button id="sidebar-collapse-btn" class="btn btn-ghost btn-icon desktop-only" type="button" title="Toggle sidebar">☰</button>
+      </div>
+
+      <nav class="sidebar-nav" role="tablist">
+        <button type="button" class="nav-item active" data-tab="overview">
+          <span class="nav-icon" aria-hidden="true">◈</span>
+          <span class="nav-label" data-i18n="nav.overview">Обзор</span>
+        </button>
+        <button type="button" class="nav-item" data-tab="models">
+          <span class="nav-icon" aria-hidden="true">❖</span>
+          <span class="nav-label" data-i18n="nav.models">Модели</span>
+          <span id="nav-models-count" class="nav-pill">0</span>
+        </button>
+        <button type="button" class="nav-item" data-tab="gemini-web">
+          <span class="nav-icon" aria-hidden="true">✦</span>
+          <span class="nav-label" data-i18n="nav.geminiWeb">Gemini Web</span>
+        </button>
+        <button type="button" class="nav-item" data-tab="chat">
+          <span class="nav-icon" aria-hidden="true">▸</span>
+          <span class="nav-label" data-i18n="nav.chat">Диагностика</span>
+        </button>
+        <button type="button" class="nav-item" data-tab="connection">
+          <span class="nav-icon" aria-hidden="true">⇄</span>
+          <span class="nav-label" data-i18n="nav.connection">Подключение</span>
+        </button>
+        <button type="button" class="nav-item" data-tab="settings">
+          <span class="nav-icon" aria-hidden="true">⚙</span>
+          <span class="nav-label" data-i18n="nav.settings">Настройки</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="side-meta">
+          <div class="side-meta-row">
+            <span class="muted" data-i18n="topbar.listen">Адрес</span>
+            <code id="sidebar-listen">127.0.0.1:8317</code>
+          </div>
+          <div class="side-meta-row">
+            <span class="muted">Node</span>
+            <code id="sidebar-node">—</code>
+          </div>
+        </div>
+        <button id="btn-logout" type="button" class="btn btn-ghost btn-sm btn-block" data-i18n="topbar.logout">Выйти</button>
+      </div>
+    </aside>
+
+    <div class="main-column">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="mobile-menu-btn" type="button" class="btn btn-ghost btn-icon mobile-only" aria-label="Menu">☰</button>
+          <div id="live-status-pill" class="status-pill status-connecting">
+            <span class="status-dot"></span>
+            <span id="live-status-text" data-i18n="status.connecting">Подключение…</span>
+          </div>
+          <span class="uptime-chip">
+            <span class="muted" data-i18n="topbar.uptime">Аптайм:</span>
+            <strong id="topbar-uptime">0s</strong>
+          </span>
+        </div>
+        <div class="topbar-actions">
+          <button id="btn-refresh-all" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.refresh">Обновить</button>
+          <button id="btn-quick-backup" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.backup">Бэкап</button>
+          <button id="btn-restart-server" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.restart">Перезапуск</button>
+          <button id="btn-stop-server" type="button" class="btn btn-danger-soft btn-sm" data-i18n="actions.stop">Стоп</button>
+          <div class="divider-v"></div>
+          <button type="button" class="btn btn-ghost btn-sm lang-toggle-btn" id="lang-btn">RU</button>
+          <button type="button" class="btn btn-ghost btn-sm theme-toggle-btn" id="theme-btn">☀ / ☾</button>
+        </div>
+      </header>
+
+      <main class="content-area">
+        <!-- TAB 1: OVERVIEW -->
+        <section id="tab-overview" class="tab-panel active">
+          <div class="page-head">
+            <div>
+              <h2 data-i18n="overview.title">Обзор шлюза</h2>
+              <p class="muted" data-i18n="overview.subtitle">Телеметрия, квоты Google Cloud Code, история нагрузки и события в реальном времени</p>
+            </div>
+          </div>
+
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-label" data-i18n="overview.kpiRequests">Запросы</div>
+              <div id="kpi-requests" class="kpi-value">0</div>
+              <div id="kpi-requests-sub" class="kpi-sub muted">—</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label" data-i18n="overview.kpiErrors">Ошибки / Блокировки</div>
+              <div id="kpi-errors" class="kpi-value">0 / 0</div>
+              <div id="kpi-errors-sub" class="kpi-sub muted">—</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label" data-i18n="overview.kpiCloud">Cloud Auth (Antigravity IDE)</div>
+              <div id="kpi-cloud-status" class="kpi-value kpi-sm">—</div>
+              <div id="kpi-cloud-sub" class="kpi-sub muted">—</div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-label" data-i18n="overview.kpiWeb">Gemini Web мост</div>
+              <div id="kpi-web-status" class="kpi-value kpi-sm">—</div>
+              <div id="kpi-web-sub" class="kpi-sub muted">—</div>
+            </div>
+          </div>
+
+          <!-- Cloud Auth & Actions Strip -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h3 data-i18n="overview.authCardTitle">Авторизация Cloud Code и Guard</h3>
+                <p id="cloud-account-meta" class="muted">—</p>
+              </div>
+              <div class="btn-group">
+                <button id="btn-extract-token" type="button" class="btn btn-secondary btn-sm" data-i18n="overview.extractToken">Извлечь токен из Antigravity IDE</button>
+                <button id="btn-reload-token" type="button" class="btn btn-ghost btn-sm" data-i18n="overview.reloadToken">Перечитать auth.json</button>
+              </div>
+            </div>
+            <div id="guard-summary-bar" class="guard-strip"></div>
+          </div>
+
+          <div class="two-col">
+            <!-- Quota Gauges -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3 data-i18n="overview.quotasTitle">Квоты моделей (5h / Weekly)</h3>
+                  <p class="muted" data-i18n="overview.quotasSub">Сводка retrieveUserQuotaSummary и локального кэша моделей</p>
+                </div>
+                <button id="btn-refresh-limits" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.refresh">Обновить</button>
+              </div>
+              <div id="quota-gauges-root" class="viz-container"></div>
+            </div>
+
+            <!-- Usage History Chart -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3 data-i18n="overview.usageTitle">История использования</h3>
+                  <p class="muted" data-i18n="overview.usageSub">Запросы и токены по дням из usage.json</p>
+                </div>
+                <div class="btn-group">
+                  <div class="seg-control" id="usage-metric-switch">
+                    <button type="button" class="seg-btn active" data-metric="requests" data-i18n="overview.metricRequests">Запросы</button>
+                    <button type="button" class="seg-btn" data-metric="tokens" data-i18n="overview.metricTokens">Токены</button>
+                  </div>
+                  <div class="seg-control" id="usage-days-switch">
+                    <button type="button" class="seg-btn active" data-days="14">14d</button>
+                    <button type="button" class="seg-btn" data-days="30">30d</button>
+                  </div>
+                </div>
+              </div>
+              <div id="usage-chart-root" class="viz-container"></div>
+            </div>
+          </div>
+
+          <!-- Telemetry & Live Logs -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h3 data-i18n="overview.logsTitle">Живой поток событий и задержка</h3>
+                <p class="muted" data-i18n="overview.logsSub">Обновляется мгновенно через SSE /_events</p>
+              </div>
+              <div class="toolbar-inline">
+                <input id="log-search-input" type="search" class="input-sm" data-i18n-placeholder="overview.logFilterPlaceholder" placeholder="Фильтр по модели, маршруту, ошибке…">
+                <select id="log-status-filter" class="input-sm">
+                  <option value="all" data-i18n="overview.logAll">Все статусы</option>
+                  <option value="ok">2xx OK</option>
+                  <option value="err">4xx / 5xx</option>
+                </select>
+              </div>
+            </div>
+            <div id="telemetry-sparkline-root" class="telemetry-strip"></div>
+            <div id="live-logs-list" class="log-table-wrap"></div>
+          </div>
+
+          <div class="two-col">
+            <!-- Installed Tools -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3 data-i18n="overview.installsTitle">Обнаруженные программы (IDE / CLI)</h3>
+                  <p class="muted" data-i18n="overview.installsSub">Можно задать или исправить путь вручную</p>
+                </div>
+                <button id="btn-refresh-installs" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.refresh">Обновить</button>
+              </div>
+              <div id="installs-list" class="stack-sm"></div>
+            </div>
+
+            <!-- Backups -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3 data-i18n="overview.backupsTitle">Снимки и бэкапы (_backups)</h3>
+                  <p class="muted" data-i18n="overview.backupsSub">Состояние конфигурации, ключей, авторизации и git-бандлы</p>
+                </div>
+                <button id="btn-create-backup" type="button" class="btn btn-secondary btn-sm" data-i18n="overview.createBackup">Создать бэкап сейчас</button>
+              </div>
+              <div id="backups-list" class="stack-sm"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 2: MODELS -->
+        <section id="tab-models" class="tab-panel">
+          <div class="page-head">
+            <div>
+              <h2 data-i18n="models.title">Каталог моделей</h2>
+              <p class="muted" data-i18n="models.subtitle">Все доступные модели cloud/* и web/* с контекстом и быстрым переходом в чат</p>
+            </div>
+            <button id="btn-refresh-models" type="button" class="btn btn-secondary btn-sm" data-i18n="actions.refresh">Обновить</button>
+          </div>
+          <div class="card">
+            <div class="filter-bar">
+              <input id="models-search" type="search" data-i18n-placeholder="models.searchPlaceholder" placeholder="Поиск модели по ID или имени…">
+              <div id="models-filter-pills" class="pill-group">
+                <button type="button" class="pill active" data-filter="all" data-i18n="models.filterAll">Все</button>
+                <button type="button" class="pill" data-filter="cloud">Cloud</button>
+                <button type="button" class="pill" data-filter="web">Web</button>
+                <button type="button" class="pill" data-filter="claude">Claude</button>
+                <button type="button" class="pill" data-filter="gemini">Gemini</button>
+                <button type="button" class="pill" data-filter="gpt">GPT</button>
+              </div>
+            </div>
+            <div id="models-grid" class="models-grid"></div>
+          </div>
+        </section>
+
+        <!-- TAB 3: GEMINI WEB -->
+        <section id="tab-gemini-web" class="tab-panel">
+          <div class="page-head">
+            <div>
+              <h2 data-i18n="web.title">Gemini Web мост и аккаунты</h2>
+              <p class="muted" data-i18n="web.subtitle">Управление cookie, импортом через браузер CDP и пулом аккаунтов с ротацией</p>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <!-- Single / Main Cookie Config -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3 data-i18n="web.cookieCardTitle">Основная сессия и Cookie</h3>
+                  <p id="web-cookie-state-desc" class="muted">—</p>
+                </div>
+                <div class="btn-group">
+                  <button id="btn-web-open-browser" type="button" class="btn btn-secondary btn-sm" data-i18n="web.openBrowser">Открыть Gemini в браузере</button>
+                  <button id="btn-web-import-cdp" type="button" class="btn btn-primary btn-sm" data-i18n="web.importCdp">Импорт cookie (CDP)</button>
+                </div>
+              </div>
+
+              <div class="stack-md">
+                <div class="row-between">
+                  <div class="seg-control" id="web-cookie-mode-switch">
+                    <button type="button" class="seg-btn active" data-mode="raw" data-i18n="web.modeRaw">Строка Cookie</button>
+                    <button type="button" class="seg-btn" data-mode="file" data-i18n="web.modeFile">Путь к cookie-файлу</button>
+                  </div>
+                  <div id="web-cookie-badges" class="badge-row"></div>
+                </div>
+
+                <div id="web-raw-cookie-wrap">
+                  <label class="field">
+                    <span data-i18n="web.rawCookieLabel">Cookie header (SAPISID / __Secure-1PSID / __Secure-1PSIDTS)</span>
+                    <textarea id="web-cookie-input" rows="3" data-i18n-placeholder="web.rawCookiePlaceholder" placeholder="Оставьте пустым, чтобы сохранить текущие cookie, или вставьте новую строку из DevTools / CDP"></textarea>
+                  </label>
+                </div>
+
+                <div id="web-file-cookie-wrap" class="hidden">
+                  <label class="field">
+                    <span data-i18n="web.cookieFileLabel">Путь к файлу cookie_file</span>
+                    <input id="web-cookie-file-input" type="text" placeholder="cookies.txt">
+                  </label>
+                </div>
+
+                <div class="form-grid-2">
+                  <label class="field">
+                    <span data-i18n="web.authUserLabel">authUser (индекс профиля /u/N)</span>
+                    <input id="web-authuser-input" type="number" min="0" max="20" placeholder="auto (null)">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.thinkModeLabel">Режим размышлений</span>
+                    <select id="web-thinkmode-select">
+                      <option value="" data-i18n="web.thinkAuto">По модели (auto)</option>
+                      <option value="default" data-i18n="web.thinkDefault">Обычный (default)</option>
+                      <option value="extended" data-i18n="web.thinkExtended">Расширенный (extended)</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.proxyLabel">Прокси только для Gemini Web</span>
+                    <input id="web-proxy-input" type="text" placeholder="http://127.0.0.1:10808">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.historyMaxCharsLabel">Лимит контекста (historyMaxChars)</span>
+                    <input id="web-historymax-input" type="number" min="4000" max="400000" step="1000">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.atTokenLabel">atToken (опционально)</span>
+                    <input id="web-attoken-input" type="password" data-i18n-placeholder="web.atTokenPlaceholder" placeholder="Автоопределение со страницы /app">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.blLabel">Build label (bl)</span>
+                    <input id="web-bl-input" type="text">
+                  </label>
+                </div>
+
+                <div class="checkbox-grid">
+                  <label class="check-row"><input id="web-enabled-chk" type="checkbox"> <span data-i18n="web.enabledLabel">Мост Gemini Web включён</span></label>
+                  <label class="check-row"><input id="web-tempchats-chk" type="checkbox"> <span data-i18n="web.tempChatsLabel">Временные чаты (temporaryChats)</span></label>
+                  <label class="check-row"><input id="web-autorotate-chk" type="checkbox"> <span data-i18n="web.autoRotateLabel">Авторотация аккаунта при HTTP 429</span></label>
+                  <label class="check-row"><input id="web-xsrf-chk" type="checkbox"> <span data-i18n="web.xsrfLabel">Авто-XSRF / rotateCookies (xsrf)</span></label>
+                </div>
+
+                <div class="btn-group">
+                  <button id="btn-web-save" type="button" class="btn btn-primary" data-i18n="web.saveWebSettings">Сохранить настройки Gemini Web</button>
+                  <button id="btn-web-clear-cookie" type="button" class="btn btn-danger-soft" data-i18n="web.clearCookie">Очистить Cookie</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Multi-Account Manager -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3 data-i18n="web.accountsTitle">Менеджер веб-аккаунтов</h3>
+                  <p class="muted" data-i18n="web.accountsSub">Подключение нескольких Google-аккаунтов с разными прокси и фейловером</p>
+                </div>
+              </div>
+              <div id="web-accounts-list" class="stack-sm"></div>
+
+              <hr class="sep">
+              <form id="web-account-form" class="stack-sm">
+                <h4 id="web-acc-form-title" data-i18n="web.addAccountTitle">Добавить / обновить аккаунт</h4>
+                <div class="form-grid-2">
+                  <label class="field">
+                    <span data-i18n="web.accNameLabel">Имя аккаунта</span>
+                    <input id="acc-name-input" type="text" required placeholder="work-1">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.accLabelLabel">Метка (опционально)</span>
+                    <input id="acc-label-input" type="text" placeholder="Personal">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.accProxyLabel">Прокси аккаунта</span>
+                    <input id="acc-proxy-input" type="text" placeholder="socks5://127.0.0.1:10808">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.accAuthUserLabel">authUser</span>
+                    <input id="acc-authuser-input" type="number" min="0" max="20" placeholder="null">
+                  </label>
+                </div>
+                <label class="field">
+                  <span data-i18n="web.accCookieLabel">Cookie аккаунта</span>
+                  <textarea id="acc-cookie-input" rows="2" placeholder="SAPISID=...; __Secure-1PSID=..."></textarea>
+                </label>
+                <div class="form-grid-2">
+                  <label class="field">
+                    <span data-i18n="web.accCookieFileLabel">Или путь к cookie_file</span>
+                    <input id="acc-cookiefile-input" type="text" placeholder="account2_cookie.txt">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="web.accThinkModeLabel">thinkMode</span>
+                    <select id="acc-thinkmode-select">
+                      <option value="">auto</option>
+                      <option value="default">default</option>
+                      <option value="extended">extended</option>
+                    </select>
+                  </label>
+                </div>
+                <label class="check-row"><input id="acc-tempchats-chk" type="checkbox"> <span data-i18n="web.accTempChats">temporaryChats для этого аккаунта</span></label>
+                <div class="btn-group">
+                  <button id="btn-acc-save" type="submit" class="btn btn-primary btn-sm" data-i18n="web.saveAccount">Сохранить аккаунт</button>
+                  <button id="btn-acc-import-cdp" type="button" class="btn btn-secondary btn-sm" data-i18n="web.importToAccount">Импорт CDP в этот аккаунт</button>
+                  <button id="btn-acc-reset" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.cancel">Сброс</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 4: DIAGNOSTIC CHAT -->
+        <section id="tab-chat" class="tab-panel">
+          <div class="page-head">
+            <div>
+              <h2 data-i18n="chat.title">Диагностический чат</h2>
+              <p class="muted" data-i18n="chat.subtitle">Проверка моделей и маршрутов через /api/diagnostics/chat без утечки ключей</p>
+            </div>
+            <div class="toolbar-inline">
+              <button id="btn-chat-clear" type="button" class="btn btn-ghost btn-sm" data-i18n="chat.clear">Очистить ленту</button>
+            </div>
+          </div>
+
+          <div class="card chat-shell">
+            <div class="chat-controls">
+              <label class="field field-grow">
+                <span data-i18n="chat.modelLabel">Модель</span>
+                <select id="chat-model-select"></select>
+              </label>
+              <label class="field">
+                <span data-i18n="chat.bridgeLabel">Транспорт (bridge)</span>
+                <select id="chat-bridge-select">
+                  <option value="auto">auto</option>
+                  <option value="api">api (Cloud Code)</option>
+                  <option value="web">web (Gemini Web)</option>
+                </select>
+              </label>
+              <label class="check-row chat-stream-toggle">
+                <input id="chat-stream-chk" type="checkbox" checked>
+                <span data-i18n="chat.streamLabel">Потоковый вывод (SSE)</span>
+              </label>
+            </div>
+
+            <div id="chat-messages" class="chat-messages"></div>
+
+            <form id="chat-form" class="chat-composer">
+              <textarea id="chat-input" rows="2" data-i18n-placeholder="chat.inputPlaceholder" placeholder="Введите тестовое сообщение (Ctrl+Enter — отправить)…"></textarea>
+              <div class="chat-composer-actions">
+                <button id="btn-chat-retry" type="button" class="btn btn-ghost btn-sm hidden" data-i18n="chat.retry">Повторить последний</button>
+                <button id="btn-chat-stop" type="button" class="btn btn-danger-soft btn-sm hidden" data-i18n="chat.stop">Остановить</button>
+                <button id="btn-chat-send" type="submit" class="btn btn-primary" data-i18n="chat.send">Отправить</button>
+              </div>
+            </form>
+          </div>
+        </section>
+
+        <!-- TAB 5: CONNECTION -->
+        <section id="tab-connection" class="tab-panel">
+          <div class="page-head">
+            <div>
+              <h2 data-i18n="conn.title">Подключение клиентов</h2>
+              <p class="muted" data-i18n="conn.subtitle">Готовые URL, ключи доступа, управление портом/автозапуском и примеры для CLI / IDE</p>
+            </div>
+          </div>
+
+          <div class="two-col">
+            <div class="card">
+              <h3 data-i18n="conn.endpointsTitle">API-эндпоинты (только чтение)</h3>
+              <div class="stack-sm mt-md">
+                <label class="field">
+                  <span>OpenAI-compatible Base URL</span>
+                  <div class="input-row">
+                    <input id="ep-openai" type="text" readonly>
+                    <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="ep-openai" data-i18n="actions.copy">Копировать</button>
+                  </div>
+                </label>
+                <label class="field">
+                  <span>Anthropic Messages API</span>
+                  <div class="input-row">
+                    <input id="ep-anthropic" type="text" readonly>
+                    <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="ep-anthropic" data-i18n="actions.copy">Копировать</button>
+                  </div>
+                </label>
+                <label class="field">
+                  <span>Gemini Native API</span>
+                  <div class="input-row">
+                    <input id="ep-gemini" type="text" readonly>
+                    <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="ep-gemini" data-i18n="actions.copy">Копировать</button>
+                  </div>
+                </label>
+              </div>
+
+              <hr class="sep">
+              <h3 data-i18n="conn.keysTitle">Ключи доступа</h3>
+              <div class="stack-sm mt-md">
+                <label class="field">
+                  <span data-i18n="conn.apiKeyLabel">Клиентский API-ключ (apikey.txt — для моделей /v1)</span>
+                  <div class="input-row">
+                    <input id="key-api-input" type="password" readonly>
+                    <button type="button" class="btn btn-ghost btn-sm toggle-secret-btn" data-secret-target="key-api-input" data-i18n="actions.show">Показать</button>
+                    <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="key-api-input" data-i18n="actions.copy">Копировать</button>
+                  </div>
+                </label>
+                <label class="field">
+                  <span data-i18n="conn.adminKeyLabel">Ключ администратора (admin.key — только для этой панели)</span>
+                  <div class="input-row">
+                    <input id="key-admin-input" type="password" readonly>
+                    <button type="button" class="btn btn-ghost btn-sm toggle-secret-btn" data-secret-target="key-admin-input" data-i18n="actions.show">Показать</button>
+                    <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="key-admin-input" data-i18n="actions.copy">Копировать</button>
+                  </div>
+                </label>
+              </div>
+            </div>
+
+            <div class="card">
+              <h3 data-i18n="conn.listenTitle">Сетевой адрес и автозапуск</h3>
+              <div class="form-grid-2 mt-md">
+                <label class="field">
+                  <span>Host</span>
+                  <input id="conn-host-input" type="text" placeholder="127.0.0.1">
+                </label>
+                <label class="field">
+                  <span>Port</span>
+                  <input id="conn-port-input" type="number" min="1" max="65535" placeholder="8317">
+                </label>
+              </div>
+              <div class="btn-group mt-sm">
+                <button id="btn-save-listen" type="button" class="btn btn-primary btn-sm" data-i18n="conn.savePort">Применить адрес / порт</button>
+              </div>
+              <p class="hint mt-sm" data-i18n="conn.portHint">При смене порта потребуется перезапуск сервера; при запуске через лаунчер панель автоматически перейдёт на новый порт.</p>
+
+              <hr class="sep">
+              <div class="row-between">
+                <div>
+                  <strong data-i18n="conn.autostartTitle">Автозапуск с системой (скрытый режим)</strong>
+                  <p id="autostart-path-desc" class="muted">—</p>
+                </div>
+                <label class="switch">
+                  <input id="autostart-toggle" type="checkbox">
+                  <span class="slider"></span>
+                </label>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h3 data-i18n="conn.snippetsTitle">Примеры интеграции</h3>
+                <p class="muted" data-i18n="conn.snippetsSub">С актуальным URL и ключом (маскируется при желании)</p>
+              </div>
+              <div class="seg-control" id="snippet-tabs">
+                <button type="button" class="seg-btn active" data-snippet="curl">cURL</button>
+                <button type="button" class="seg-btn" data-snippet="claude">Claude Code</button>
+                <button type="button" class="seg-btn" data-snippet="python">Python SDK</button>
+                <button type="button" class="seg-btn" data-snippet="cursor">Cursor / OpenAI</button>
+              </div>
+            </div>
+            <div class="code-box-wrap">
+              <pre id="snippet-code" class="code-box"></pre>
+              <button id="btn-copy-snippet" type="button" class="btn btn-secondary btn-sm" data-i18n="actions.copy">Копировать</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 6: SETTINGS -->
+        <section id="tab-settings" class="tab-panel">
+          <div class="page-head">
+            <div>
+              <h2 data-i18n="settings.title">Настройки сервера</h2>
+              <p class="muted" data-i18n="settings.subtitle">Сеть, прокси, DNS/DoH, Safe Mode лимиты, CORS, мышление и агентная песочница</p>
+            </div>
+            <button id="btn-save-settings" type="button" class="btn btn-primary" data-i18n="settings.saveAll">Сохранить все настройки</button>
+          </div>
+
+          <div id="settings-feedback" class="alert hidden"></div>
+
+          <div class="two-col">
+            <!-- Network & Proxy -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3 data-i18n="settings.networkTitle">Сеть, Прокси и DNS</h3>
+                  <p class="muted" data-i18n="settings.networkSub">Проверка настроек до сохранения и автопоиск локальных прокси</p>
+                </div>
+                <div class="btn-group">
+                  <button id="btn-detect-proxy" type="button" class="btn btn-secondary btn-sm" data-i18n="settings.findProxies">Найти прокси</button>
+                  <button id="btn-test-network" type="button" class="btn btn-ghost btn-sm" data-i18n="settings.testNetwork">Тест сети</button>
+                </div>
+              </div>
+
+              <div id="detected-proxies-wrap" class="pill-group hidden mb-sm"></div>
+              <div id="network-test-result" class="network-test-box hidden mb-sm"></div>
+
+              <div class="stack-sm">
+                <label class="field">
+                  <span data-i18n="settings.proxyLabel">Прокси (network.proxy)</span>
+                  <input id="set-net-proxy" type="text" placeholder="http://127.0.0.1:10808 or socks5://127.0.0.1:1080">
+                </label>
+                <div class="form-grid-2">
+                  <label class="field">
+                    <span data-i18n="settings.dohLabel">DNS over HTTPS (dohUrl)</span>
+                    <input id="set-net-doh" type="text" placeholder="https://1.1.1.1/dns-query">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.timeoutLabel">Сетевой таймаут (мс)</span>
+                    <input id="set-net-timeout" type="number" min="2000" max="120000" step="500">
+                  </label>
+                </div>
+                <label class="field">
+                  <span data-i18n="settings.dnsLabel">DNS серверы (через запятую)</span>
+                  <input id="set-net-dns" type="text" placeholder="1.1.1.1, 8.8.8.8">
+                </label>
+                <label class="check-row">
+                  <input id="set-net-envproxy" type="checkbox">
+                  <span data-i18n="settings.useEnvProxy">Использовать системный / env прокси (useEnvProxy)</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Safe Mode -->
+            <div class="card">
+              <h3 data-i18n="settings.safeModeTitle">Safe Mode — защита от бана и перерасхода</h3>
+              <div class="stack-sm mt-md">
+                <label class="check-row">
+                  <input id="set-safe-enabled" type="checkbox">
+                  <span data-i18n="settings.safeEnabled">Включить локальный ограничитель Safe Mode</span>
+                </label>
+                <div class="form-grid-2">
+                  <label class="field"><span>maxRequestsPerMinute</span><input id="set-safe-rpm" type="number" min="1"></label>
+                  <label class="field"><span>maxRequestsPerHour</span><input id="set-safe-rph" type="number" min="1"></label>
+                  <label class="field"><span>maxRequestsPerDay</span><input id="set-safe-rpd" type="number" min="1"></label>
+                  <label class="field"><span>maxRequestsPerWeek</span><input id="set-safe-rpw" type="number" min="1"></label>
+                  <label class="field"><span>maxTokensPerDay</span><input id="set-safe-tpd" type="number" min="0" step="1000"></label>
+                  <label class="field"><span>maxTokensPerWeek</span><input id="set-safe-tpw" type="number" min="0" step="1000"></label>
+                  <label class="field"><span>minIntervalMs</span><input id="set-safe-interval" type="number" min="0"></label>
+                  <label class="field"><span>jitterMs</span><input id="set-safe-jitter" type="number" min="0"></label>
+                  <label class="field"><span>maxConcurrent</span><input id="set-safe-concurrent" type="number" min="1"></label>
+                  <label class="field"><span>cooldownAfter429Ms</span><input id="set-safe-cd429" type="number" min="0" step="1000"></label>
+                  <label class="field"><span>maxCooldownMs</span><input id="set-safe-maxcd" type="number" min="0" step="1000"></label>
+                </div>
+              </div>
+            </div>
+
+            <!-- Routing, Thinking & CORS -->
+            <div class="card">
+              <h3 data-i18n="settings.generationTitle">Модели, Thinking и CORS</h3>
+              <div class="stack-sm mt-md">
+                <div class="form-grid-2">
+                  <label class="field">
+                    <span data-i18n="settings.defaultModel">Модель по умолчанию (defaultModel)</span>
+                    <input id="set-default-model" type="text" placeholder="claude-sonnet-4-6">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.retries">Повторы (retries, 0-5)</span>
+                    <input id="set-retries" type="number" min="0" max="5">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.headroom">Запас output tokens (outputHeadroomTokens)</span>
+                    <input id="set-headroom" type="number" min="0" max="8192">
+                  </label>
+                  <label class="field">
+                    <span data-i18n="settings.thinkingBudget">thinking.defaultBudget</span>
+                    <input id="set-think-budget" type="number" min="0" max="65536" placeholder="auto (null)">
+                  </label>
+                </div>
+                <div class="checkbox-grid">
+                  <label class="check-row"><input id="set-include-thoughts" type="checkbox"> <span>includeThoughts</span></label>
+                  <label class="check-row"><input id="set-map-effort" type="checkbox"> <span>thinking.mapReasoningEffort</span></label>
+                  <label class="check-row"><input id="set-cors-enabled" type="checkbox"> <span>CORS enabled</span></label>
+                  <label class="check-row"><input id="set-cors-any" type="checkbox"> <span>cors.allowAnyOrigin</span></label>
+                </div>
+                <label class="field">
+                  <span data-i18n="settings.corsOrigins">Разрешённые Origins (по одному на строку)</span>
+                  <textarea id="set-cors-origins" rows="2" placeholder="https://example.com"></textarea>
+                </label>
+              </div>
+            </div>
+
+            <!-- Agent & Security Lockbox -->
+            <div class="card">
+              <h3 data-i18n="settings.agentTitle">Агентная песочница (Agent Tool Loop)</h3>
+              <div class="stack-sm mt-md">
+                <div class="checkbox-grid">
+                  <label class="check-row"><input id="set-agent-enabled" type="checkbox"> <span data-i18n="settings.agentEnabled">Агентные инструменты включены (agent.enabled)</span></label>
+                  <label class="check-row"><input id="set-agent-webagent" type="checkbox"> <span data-i18n="settings.agentWeb">Разрешить web/*-agent (agent.allowWebAgent)</span></label>
+                  <label class="check-row"><input id="set-agent-planner" type="checkbox"> <span data-i18n="settings.agentPlanner">Planner tool (ask_planner)</span></label>
+                </div>
+                <div class="form-grid-2">
+                  <label class="field"><span>workspaceRoot</span><input id="set-agent-root" type="text" placeholder="agent_workspace"></label>
+                  <label class="field"><span>maxIterations</span><input id="set-agent-iters" type="number" min="1" max="24"></label>
+                  <label class="field"><span>maxReadBytes</span><input id="set-agent-read" type="number" min="1024"></label>
+                  <label class="field"><span>maxWriteBytes</span><input id="set-agent-write" type="number" min="1024"></label>
+                  <label class="field"><span>shellTimeoutMs</span><input id="set-agent-shellto" type="number" min="1000"></label>
+                  <label class="field"><span>planner.maxCalls</span><input id="set-agent-pcalls" type="number" min="0" max="10"></label>
+                </div>
+
+                <div class="lockbox">
+                  <div class="lockbox-head">
+                    <strong data-i18n="settings.diskOnlyTitle">Защищённые флаги (только вручную в config.json)</strong>
+                  </div>
+                  <p class="hint" data-i18n="settings.diskOnlyDesc">В целях безопасности ОС параметры удаления файлов, запуска shell-команд и выхода за пределы песочницы нельзя включать по HTTP даже с adminKey.</p>
+                  <div id="agent-diskonly-badges" class="badge-row mt-xs"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Confirm Modal -->
+  <div id="confirm-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <h3 id="confirm-title">—</h3>
+      <p id="confirm-message" class="muted mt-xs">—</p>
+      <div class="btn-group mt-md row-end">
+        <button id="confirm-cancel-btn" type="button" class="btn btn-ghost" data-i18n="actions.cancel">Отмена</button>
+        <button id="confirm-ok-btn" type="button" class="btn btn-danger" data-i18n="actions.confirm">Подтвердить</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <script src="/i18n.js"></script>
+  <script src="/charts.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

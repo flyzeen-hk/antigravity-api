@@ -41,6 +41,12 @@ const { stripBom, readJsonFile, writeFileAtomic, backupFile, restoreLatestBackup
 const configLib = require('./lib/config');
 const { applyThinkingConfig } = require('./lib/thinking');
 const anthropic = require('./lib/anthropic');
+const { autoExtract } = require('./lib/token_extract');
+const { detectProxies } = require('./lib/proxy_detect');
+const installsLib = require('./lib/installs');
+const cdpCookies = require('./lib/cdp_cookies');
+const shortcuts = require('./scripts/shortcuts');
+const updater = require('./scripts/update');
 
 const ROOT = __dirname; // код
 // Данные (config.json, apikey.txt, auth.json, usage.json, backups/) можно
@@ -292,11 +298,17 @@ class Upstream {
     const tokenIssue = res.status === 401
       || /invalid_grant|access_token|token.*expired|expired.*token|unauthenticated|invalid credentials|login required/i.test(body);
     if (!tokenIssue) {
-      // Тело уже прочитано — отдаём его вызывающему повторно без второго запроса.
-      return Object.assign({}, res, {
+      // Тело уже прочитано — отдаём обёртку со скопированным status/ok/headers
+      // (нативный fetch Response держит их на прототипе, Object.assign их терял).
+      return {
+        ok: res.ok,
+        status: res.status,
+        statusText: res.statusText || '',
+        headers: res.headers,
+        body: res.body,
         text: async () => body,
         json: async () => JSON.parse(body),
-      });
+      };
     }
 
     // Один refresh на всех: параллельные запросы не должны дёргать OAuth каждый сам.
@@ -400,15 +412,16 @@ class Upstream {
 
 // ---------- обработчики ----------
 
-function start(config) {
-  config.userAgent = resolveCloudCodeUserAgent(config.userAgent);
-  // Запас на размышления: config.outputHeadroomTokens (0 = выключить) или AG_OUTPUT_HEADROOM.
+function syncOutputHeadroom(cfg) {
   const envHead = process.env.AG_OUTPUT_HEADROOM;
-  const headRaw = envHead != null && envHead !== '' ? Number(envHead) : Number(config.outputHeadroomTokens);
+  const headRaw = envHead != null && envHead !== '' ? Number(envHead) : Number(cfg && cfg.outputHeadroomTokens);
   OUTPUT_HEADROOM = Number.isFinite(headRaw)
     ? Math.max(0, Math.min(8192, Math.round(headRaw))) : OUTPUT_HEADROOM_DEFAULT;
-  // В контейнере том может быть смонтирован root'ом: без записи сервер упадёт
-  // позже и непонятно где. Лучше сказать прямо при старте.
+}
+
+function start(config) {
+  config.userAgent = resolveCloudCodeUserAgent(config.userAgent);
+  syncOutputHeadroom(config);
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.accessSync(DATA_DIR, fs.constants.W_OK);
@@ -417,16 +430,11 @@ function start(config) {
     console.error('    В Docker: chown -R 1000:1000 ./data (или user: "1000:1000" в compose).\n');
     process.exit(1);
   }
-  // dns.setServers affects dns.resolve*, not fetch()/getaddrinfo. The network
-  // layer supplies a real lookup for proxied and custom-DNS transports.
   const network = new NetworkManager(config);
-  // Ищем локальный relay (AGUnlocker) сразу, не дожидаясь первого cloud-запроса.
   if (network.autoDetect) network.autoDetect();
   const authFile = process.env.AG_AUTH_FILE || path.join(DATA_DIR, 'auth.json');
   let tokens;
   if (CLOUD_DISABLED) {
-    // Заглушка: любой вызов cloud-пути даёт 503 с явной причиной, а не падение
-    // на старте из-за отсутствующего auth.json.
     const cloudOff = () => {
       const e = new Error('cloud-модели отключены (AG_NO_CLOUD=1). Работают только web/* модели.');
       e.status = 503;
@@ -436,16 +444,17 @@ function start(config) {
     tokens = {
       projectId: '',
       email: '',
+      hasCredentials: () => false,
+      reloadFromDisk: () => false,
       getAccessToken: async () => { throw cloudOff(); },
-      summary: () => ({ email: '', projectId: '', expiresAt: 0, hasRefreshToken: false }),
+      summary: () => ({ configured: false, email: '', projectId: '', accessTokenValidForSec: 0, hasRefreshToken: false }),
     };
   } else {
-    if (!fs.existsSync(authFile)) {
-      console.log(`\n  ! Не найден ${authFile} — сначала: python scripts\\extract_token.py`);
-      console.log('    Либо запустите без cloud: AG_NO_CLOUD=1 (только web-модели).\n');
-      process.exit(1);
+    tokens = new TokenManager(authFile, { network, allowMissing: true });
+    if (!tokens.hasCredentials()) {
+      console.log(`\n  i ${path.basename(authFile)} не найден — сервер запущен в режиме Web-Only (web/* модели).`);
+      console.log('    Подключите токен Antigravity IDE в веб-панели или командой: npm run extract-token\n');
     }
-    tokens = new TokenManager(authFile, { network });
   }
   const catalog = new ModelCatalog(config.upstreamHost, {
     project: tokens.projectId,
@@ -456,14 +465,20 @@ function start(config) {
   const upstream = new Upstream(config, tokens, catalog, network);
   const guard = new Guard(config.safeMode || {}, process.env.AG_USAGE_FILE || path.join(DATA_DIR, 'usage.json'));
 
-  // Ротация cookie в веб-мосте должна переживать рестарт: пишем её туда же,
-  // откуда она читается — в файл, если задан cookie_file, иначе в config.json.
   function persistRotatedCookie(cookie, accountName = '') {
     try {
       const ws = config.geminiWeb || {};
       if (accountName && Array.isArray(ws.accounts)) {
         const acc = ws.accounts.find((a) => a && a.name === accountName);
-        if (acc) acc.cookie = cookie;
+        if (acc) {
+          if (acc.cookie_file && !acc.cookie) {
+            const file = path.isAbsolute(acc.cookie_file) ? acc.cookie_file : path.join(DATA_DIR, acc.cookie_file);
+            backupFile(file);
+            writeFileAtomic(file, cookie + '\n');
+            return;
+          }
+          acc.cookie = cookie;
+        }
       } else if (ws.cookie_file) {
         const file = path.isAbsolute(ws.cookie_file) ? ws.cookie_file : path.join(DATA_DIR, ws.cookie_file);
         backupFile(file);
@@ -480,8 +495,6 @@ function start(config) {
     } catch {}
   }
 
-  // Переключение аккаунта из-за 429/401 фиксируем в конфиге: иначе рестарт
-  // вернёт исходный аккаунт, который как раз и отказал.
   function persistActiveAccount(name) {
     try {
       config.geminiWeb = { ...(config.geminiWeb || {}), activeAccount: name };
@@ -498,7 +511,7 @@ function start(config) {
     onCookieRotated: persistRotatedCookie,
     onAccountSwitch: persistActiveAccount,
   });
-  webBridge.ensureBlFresh(true).catch(() => {}); // фоновое обновление BL-версии, best-effort
+  webBridge.ensureBlFresh(true).catch(() => {});
   const netSummary = network.summary();
   if (netSummary.active) {
     const dnsLabel = netSummary.dnsMode === 'doh' ? `DoH ${netSummary.dohHost}`
@@ -508,15 +521,32 @@ function start(config) {
   }
   const log = [];
   const stats = { startedAt: new Date().toISOString(), requests: 0, errors: 0, blocked: 0 };
+  const eventClients = new Set();
+
+  const broadcastEvent = (type, payload) => {
+    if (!eventClients.size) return;
+    const msg = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+    for (const client of eventClients) {
+      try {
+        if (!client.writableEnded && !client.destroyed) client.write(msg);
+      } catch {}
+    }
+  };
 
   const pushLog = (e) => {
     stats.requests++;
     if (e.error) stats.errors++;
-    log.push({ ts: new Date().toISOString(), ...e });
+    const safeEntry = {
+      ts: new Date().toISOString(),
+      ...e,
+      ...(typeof e.error === 'string' ? { error: redactSecrets(e.error) } : {}),
+    };
+    log.push(safeEntry);
     if (log.length > 200) log.shift();
     console.log(
-      `  [${e.kind}] ${e.model || ''} ${e.status ?? ''} ${e.ms ?? ''}ms ${e.error ? 'ERR ' + e.error : 'OK'} ${e.quota ? '(' + e.quota + ')' : ''}`.trimEnd()
+      `  [${safeEntry.kind}] ${safeEntry.model || ''} ${safeEntry.status ?? ''} ${safeEntry.ms ?? ''}ms ${safeEntry.error ? 'ERR ' + safeEntry.error : 'OK'} ${safeEntry.quota ? '(' + safeEntry.quota + ')' : ''}`.trimEnd()
     );
+    broadcastEvent('log', { entry: safeEntry, stats: { ...stats, uptime: Math.floor(process.uptime()) } });
   };
 
   const withRetry429 = async (fn) => {
@@ -750,18 +780,79 @@ function start(config) {
     return [bearer, req.headers['x-goog-api-key'], req.headers['x-api-key'], req.headers['x-admin-key'], query];
   }
 
+  // ---- админ-сессии и одноразовые launch-токены ----
+  const adminSessions = new Map(); // sid -> expiresAt
+  const launchNonces = new Map(); // nonce -> expiresAt
+  if (process.env.AG_LAUNCH_NONCE) {
+    launchNonces.set(String(process.env.AG_LAUNCH_NONCE), Date.now() + 180_000);
+  }
+
+  function parseCookies(req) {
+    const out = {};
+    const raw = String(req.headers.cookie || '');
+    for (const part of raw.split(';')) {
+      const eq = part.indexOf('=');
+      if (eq <= 0) continue;
+      const k = part.slice(0, eq).trim();
+      const v = part.slice(eq + 1).trim();
+      if (k) out[k] = v;
+    }
+    return out;
+  }
+
+  function sessionOk(req) {
+    const sid = parseCookies(req).ag_admin_session;
+    if (!sid) return false;
+    const exp = adminSessions.get(sid);
+    if (!exp) return false;
+    if (exp < Date.now()) {
+      adminSessions.delete(sid);
+      return false;
+    }
+    return true;
+  }
+
+  function issueSessionCookie(res) {
+    const now = Date.now();
+    for (const [k, v] of adminSessions) {
+      if (v < now) adminSessions.delete(k);
+    }
+    while (adminSessions.size >= 100) {
+      adminSessions.delete(adminSessions.keys().next().value);
+    }
+    const sid = crypto.randomBytes(24).toString('hex');
+    adminSessions.set(sid, now + 24 * 3600 * 1000);
+    res.setHeader('set-cookie', `ag_admin_session=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`);
+    return sid;
+  }
+
+  function mintLaunchNonce() {
+    const now = Date.now();
+    for (const [k, v] of launchNonces) {
+      if (v < now) launchNonces.delete(k);
+    }
+    const nonce = crypto.randomBytes(24).toString('hex');
+    launchNonces.set(nonce, now + 120_000);
+    return nonce;
+  }
+
+  function consumeLaunchNonce(nonce) {
+    if (!nonce) return false;
+    const exp = launchNonces.get(nonce);
+    launchNonces.delete(nonce);
+    return !!exp && exp >= Date.now();
+  }
+
   // Ключ клиентов моделей: только /v1*.
   function authOk(req) {
-    // Authorization: Bearer <key> — основной способ (OpenAI-совместимость).
-    // x-goog-api-key и ?key= — для Gemini SDK (google-generativeai и т.п.).
     return presentedKeys(req).some((k) => keyEquals(k, config.apiKey));
   }
 
-  // Админский ключ: /_* и HTML-дашборд. В тестах/кастомных запусках adminKey
+  // Админский ключ: /_* и веб-панель. В тестах/кастомных запусках adminKey
   // может отсутствовать — тогда допускаем apiKey (так работают фикстуры).
   function adminOk(req) {
     const expected = config.adminKey || config.apiKey;
-    return presentedKeys(req).some((k) => keyEquals(k, expected));
+    return presentedKeys(req).some((k) => keyEquals(k, expected)) || sessionOk(req);
   }
 
   // Чтение состояния: доступно обоим ключам (не даёт менять конфиг).
@@ -937,7 +1028,16 @@ function start(config) {
   // the generic error responder or logs, even for invalid JSON/authentication.
   async function handleDiagnosticChat(req, res) {
     const t0 = Date.now();
+    let streamingSse = false;
+    const ac = new AbortController();
+    const onClose = () => { if (!res.writableEnded) ac.abort(); };
+    res.once('close', onClose);
     try {
+      const blockedUntil = authBlocked(req);
+      if (blockedUntil) {
+        res.setHeader('retry-after', String(Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000))));
+        throw diagnosticError(429, 'too_many_auth_failures', 'Слишком много неверных попыток авторизации. Подождите немного и повторите.', 'auth');
+      }
       if (!statusOk(req)) {
         noteAuthFailure(req);
         throw diagnosticError(401, 'invalid_api_key', 'Неверный или отсутствующий ключ приложения. Проверьте Authorization: Bearer и актуальный ключ в apikey.txt.', 'auth');
@@ -956,41 +1056,94 @@ function start(config) {
       catch {
         throw diagnosticError(400, 'invalid_json', 'Не удалось разобрать JSON. Проверьте кавычки, запятые и поля model, message, bridge.', 'validation');
       }
-      const out = await executeDiagnosticChat(body, { catalog, tokens, upstream, webBridge, guard });
-      // Do not log request model/message: they are untrusted and may contain secrets.
+      if (body && typeof body === 'object' && body.stream === true) {
+        streamingSse = true;
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        const out = await executeDiagnosticChat(body, {
+          catalog, tokens, upstream, webBridge, guard, cloudDisabled: CLOUD_DISABLED,
+        }, {
+          signal: ac.signal,
+          onDelta: (delta) => {
+            if (!res.writableEnded && !res.destroyed) {
+              res.write(`data: ${JSON.stringify({ type: 'delta', text: delta })}\n\n`);
+            }
+          },
+        });
+        pushLog({ kind: 'diagnostics', status: 200, ms: Date.now() - t0 });
+        if (!res.writableEnded && !res.destroyed) {
+          res.write(`data: ${JSON.stringify({ type: 'done', ...out })}\n\n`);
+          res.end();
+        }
+        return;
+      }
+      const out = await executeDiagnosticChat(body, {
+        catalog, tokens, upstream, webBridge, guard, cloudDisabled: CLOUD_DISABLED,
+      }, { signal: ac.signal });
       pushLog({ kind: 'diagnostics', status: 200, ms: Date.now() - t0 });
       return sendJson(res, 200, out);
     } catch (err) {
+      if (err && err.code === 'client_disconnected') {
+        pushLog({ kind: 'diagnostics', status: 499, ms: Date.now() - t0, error: 'client disconnected' });
+        return;
+      }
       const safe = normalizeDiagnosticError(err);
       pushLog({ kind: 'diagnostics', status: safe.status, ms: Date.now() - t0, error: safe.error.code });
+      if (streamingSse && !res.writableEnded && !res.destroyed) {
+        res.write(`data: ${JSON.stringify({ type: 'error', ok: false, error: safe.error })}\n\n`);
+        res.end();
+        return;
+      }
       return sendJson(res, safe.status, { ok: false, error: safe.error });
+    } finally {
+      res.removeListener('close', onClose);
+      if (clientGone(res) && !ac.signal.aborted) ac.abort();
     }
   }
 
   // ---- Anthropic Messages API: /v1/messages ----
-  // Claude Code, Cline, Continue и Zed ходят только по этому протоколу.
 
   function anthropicError(res, status, type, message) {
     res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ type: 'error', error: { type, message } }));
   }
 
+  async function readAnthropicBody(req, res) {
+    let raw;
+    try {
+      raw = await readBody(req);
+    } catch (err) {
+      const tooLarge = err && err.status === 413;
+      const status = tooLarge ? 413 : 400;
+      anthropicError(res, status, tooLarge ? 'request_too_large' : 'invalid_request_error',
+        tooLarge ? `Тело запроса больше ${MB(MAX_BODY_BYTES)}.` : 'Не удалось прочитать тело запроса.');
+      if (tooLarge) drainRejectedBody(req);
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        anthropicError(res, 400, 'invalid_request_error', 'Тело запроса должно быть JSON-объектом.');
+        return null;
+      }
+      return parsed;
+    } catch {
+      anthropicError(res, 400, 'invalid_request_error', 'Invalid JSON body');
+      return null;
+    }
+  }
+
   async function handleAnthropicCountTokens(req, res) {
-    const read = await readBodyOrRespond(req, res);
-    if (!read.ok) return;
-    const body = parseRequestBody(read.raw);
-    // Точный подсчёт требует вызова апстрима, а Anthropic-клиенты используют
-    // ответ только для оценки контекста — отдаём детерминированную оценку.
+    const body = await readAnthropicBody(req, res);
+    if (!body) return;
     return sendJson(res, 200, { input_tokens: anthropic.estimateTokens(body) });
   }
 
   async function handleAnthropicMessages(req, res) {
     const t0 = Date.now();
-    const read = await readBodyOrRespond(req, res);
-    if (!read.ok) return;
-    const body = parseRequestBody(read.raw);
+    const body = await readAnthropicBody(req, res);
+    if (!body) return;
 
-    const modelName = String(body.model || '').trim();
+    const modelName = String(body.model || '').trim() || String(config.defaultModel || '').trim();
     if (!modelName) return anthropicError(res, 400, 'invalid_request_error', 'model: обязательное поле');
     if (!Number.isFinite(body.max_tokens) || body.max_tokens <= 0) {
       return anthropicError(res, 400, 'invalid_request_error', 'max_tokens: обязательное поле (> 0)');
@@ -1010,15 +1163,15 @@ function start(config) {
         'Anthropic /v1/messages работает только через cloud-модели, а они отключены (AG_NO_CLOUD=1).');
     }
     if (parsed.namespace === providers.WEB) {
-      // У веб-канала нет нативного function calling и thinking-блоков,
-      // поэтому /v1/messages для web/* не притворяется рабочим.
       return anthropicError(res, 400, 'invalid_request_error',
         'web-модели не поддерживают /v1/messages — используйте /v1/chat/completions с теми же моделями');
     }
 
     let requestObj;
     try {
-      ({ requestObj } = anthropic.anthropicToGeminiRequest(body));
+      ({ requestObj } = anthropic.anthropicToGeminiRequest(body, {
+        mapReasoningEffort: !!(config.thinking && config.thinking.mapReasoningEffort),
+      }));
       applyOutputHeadroom(requestObj);
     } catch (e) {
       return anthropicError(res, e.status || 400, 'invalid_request_error', e.message);
@@ -1038,7 +1191,7 @@ function start(config) {
           const text = (await upRes.text().catch(() => '')) || '';
           if (upRes.status === 429) guard.report429(parsed.baseId, parseResetMs(text));
           const quota = extractQuotaInfo(text);
-          pushLog({ kind: 'anthropic', model: parsed.displayId, status: upRes.status, ms: Date.now() - t0, error: text.slice(0, 160), quota, provider: providers.CLOUD });
+          pushLog({ kind: 'anthropic', model: parsed.displayId, status: upRes.status, ms: Date.now() - t0, error: redactSecrets(text).slice(0, 160), quota, provider: providers.CLOUD });
           const message = redactSecrets(text).replace(/\s+/g, ' ').slice(0, 400) || `upstream ${upRes.status}`;
           const type = upRes.status === 429 ? 'rate_limit_error'
             : upRes.status === 401 || upRes.status === 403 ? 'authentication_error'
@@ -1052,7 +1205,7 @@ function start(config) {
             if (!data || data === '[DONE]') continue;
             saw.push(parseUpstreamData(data));
           }
-          let out = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw) }, modelName);
+          let out = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw) }, modelName, { includeThoughts: !!config.includeThoughts });
           if (anthropicAnswerEmpty(out)) {
             const retryObj = retryRequestWithBudget(requestObj);
             if (retryObj) {
@@ -1063,7 +1216,7 @@ function start(config) {
                   if (!data || data === '[DONE]') continue;
                   saw2.push(parseUpstreamData(data));
                 }
-                const out2 = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw2) }, modelName);
+                const out2 = anthropic.geminiToAnthropicResponse({ response: mergeGeminiResponse(saw2) }, modelName, { includeThoughts: !!config.includeThoughts });
                 if (!anthropicAnswerEmpty(out2)) {
                   out = out2;
                   pushLog({ kind: 'anthropic', model: parsed.displayId, status: 200, ms: Date.now() - t0, retry: 'max_tokens', provider: providers.CLOUD });
@@ -1082,7 +1235,6 @@ function start(config) {
           connection: 'keep-alive',
         });
         const conv = new anthropic.AnthropicStream(modelName, { includeThinking: !!config.includeThoughts });
-        // message_start нужен сразу: клиенты показывают «печатает» до первого чанка.
         for (const evt of conv.startMessage()) res.write(anthropic.formatSse(evt));
         let anyText = false;
         try {
@@ -1090,7 +1242,9 @@ function start(config) {
             if (!data || data === '[DONE]') continue;
             const resp = parseUpstreamData(data);
             for (const p of (resp.response ?? resp).candidates?.[0]?.content?.parts || []) {
-              if (!p.thought && typeof p.text === 'string' && p.text) anyText = true;
+              if ((!p.thought && typeof p.text === 'string' && p.text) || (p.functionCall && p.functionCall.name)) {
+                anyText = true;
+              }
             }
             for (const evt of conv.push(resp.response ?? resp)) res.write(anthropic.formatSse(evt));
           }
@@ -1305,6 +1459,7 @@ function start(config) {
     // functionResponse с thought signatures. Никакой текстовой склейки.
     const chatCloud = async (msgs) => {
       const requestObj = applyOutputHeadroom(openAIToGeminiRequest({ messages: msgs, tools: toolsForLoop }));
+      applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
       const ac = new AbortController();
       const onClose = () => { if (!res.writableEnded) ac.abort(); };
       res.once('close', onClose);
@@ -1472,22 +1627,31 @@ function start(config) {
     const read = await readBodyOrRespond(req, res);
     if (!read.ok) return;
     const body = parseRequestBody(read.raw);
-    // "tools": "builtin" — синоним запроса серверных файловых инструментов.
     if (body.tools === 'builtin') {
       body.agent = true;
       body.tools = undefined;
     }
+    if ((!body.model || !String(body.model).trim()) && config.defaultModel) {
+      body.model = config.defaultModel;
+    }
     validateOpenAI(body);
-    let parsed = providers.parseModel(body.model.trim());
+    let rawModel = body.model.trim();
+    if (rawModel === 'web' && config.geminiWeb?.defaultModel) {
+      rawModel = providers.formatModel(providers.WEB, config.geminiWeb.defaultModel.replace(/^web\//i, ''));
+    }
+    let parsed = providers.parseModel(rawModel);
     if (!parsed.ok) {
-      parsed = (await resolveFlatModel(body.model.trim())) || parsed;
+      parsed = (await resolveFlatModel(rawModel)) || parsed;
+    }
+    if (!parsed.ok && config.defaultModel && parsed.code === 'model_namespace_required') {
+      const fb = providers.parseModel(config.defaultModel);
+      if (fb.ok) parsed = fb;
+      else parsed = (await resolveFlatModel(config.defaultModel)) || parsed;
     }
     if (!parsed.ok) return sendNamespaceError(res, parsed);
     if (parsed.namespace === providers.CLOUD && CLOUD_DISABLED) return sendJson(res, 400, cloudDisabledError());
     const stream = !!body.stream;
 
-    // Агентный режим — только явные триггеры: суффикс -agent у модели,
-    // body.agent / body.builtin_tools. Обычный чат инструментов не получает.
     const agentReq = resolveAgentRequest(body, parsed);
     if (agentReq) {
       if (config.agent && config.agent.enabled === false) {
@@ -1499,28 +1663,27 @@ function start(config) {
           },
         });
       }
-      // Веб-агент — opt-in: только при явном agent.allowWebAgent=true.
       if (parsed.namespace === providers.WEB && !(config.agent && config.agent.allowWebAgent === true)) {
         return sendJson(res, 400, webAgentDisabledError());
       }
       return await handleAgentChat(res, { body, parsed, stream, t0 });
     }
 
-    // web/* — чистый чат. У веб-канала нет нативного function calling,
-    // поэтому tools от клиента игнорируются; агент — только web/<alias>-agent.
     if (parsed.namespace === providers.WEB) {
       if (!webBridge.isWebModel(parsed.baseId)) {
         return sendJson(res, 400, webBridgeDisabledError());
       }
-      // Web-модели тоже под Safe Mode: раньше лимиты запросов на них не
-      // действовали вообще (считались только токены).
       return guarded(res, parsed.baseId, 'openai', async () => {
       const ac = new AbortController();
       const onClose = () => { if (!res.writableEnded) ac.abort(); };
       res.once('close', onClose);
       try {
         const out = await webBridge.handleOpenAIChat(
-          { ...body, model: parsed.baseId, tools: undefined }, stream, res, { signal: ac.signal });
+          { ...body, model: parsed.baseId, tools: undefined },
+          stream,
+          res,
+          { signal: ac.signal, onUsage: (u) => guard.reportUsage(u?.totalTokens) }
+        );
         if (out) {
           guard.reportUsage(out.usage?.total_tokens);
           pushLog({ kind: 'openai', model: parsed.displayId, status: 200, ms: Date.now() - t0, stream, provider: providers.WEB });
@@ -1535,7 +1698,7 @@ function start(config) {
         const code = regional ? 'region_not_supported' : status;
         const detail = redactSecrets(String(err && err.message || 'unknown error')).replace(/\s+/g, ' ').slice(0, 220);
         const message = regional ? normalizeDiagnosticError(err, { bridge: 'web' }).error.message
-          : `Gemini Web request failed: ${detail} (проверьте VPN и свежесть куки; повторите попытку)`;
+          : `Gemini Web request failed: ${detail} (проверьте прокси и свежесть куки; повторите попытку)`;
         if (status === 429) guard.report429(parsed.baseId, parseResetMs(detail));
         pushLog({ kind: 'openai', status, ms: Date.now() - t0, error: regional ? code : 'web: ' + detail.slice(0, 140), provider: providers.WEB });
         sendApiError(res, status, { error: { message, type, code } }, stream);
@@ -1549,8 +1712,6 @@ function start(config) {
 
     const model = parsed.baseId;
     const requestObj = applyOutputHeadroom(openAIToGeminiRequest(body));
-    // reasoning_effort/thinking -> generationConfig.thinkingConfig (только если
-    // config.thinking.mapReasoningEffort=true: поддержка зависит от апстрима).
     applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
 
     return guarded(res, model, 'openai', async () => {
@@ -1564,12 +1725,11 @@ function start(config) {
           const text = (await upRes.text().catch(() => '')) || '';
           if (upRes.status === 429) guard.report429(model, parseResetMs(text));
           const quota = extractQuotaInfo(text);
-          pushLog({ kind: 'openai', model: parsed.displayId, status: upRes.status, ms: Date.now() - t0, error: text.slice(0, 160), quota, provider: providers.CLOUD });
+          pushLog({ kind: 'openai', model: parsed.displayId, status: upRes.status, ms: Date.now() - t0, error: redactSecrets(text).slice(0, 160), quota, provider: providers.CLOUD });
           return upstreamErrorToClient(res, { status: upRes.status, text: async () => text });
         }
 
         if (!stream) {
-          // агрегируем SSE-поток в один ответ
           const saw = [];
           for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
             if (!data || data === '[DONE]') continue;
@@ -1608,13 +1768,15 @@ function start(config) {
             if (!data || data === '[DONE]') continue;
             parseUpstreamData(data);
             for (const chunk of conv.pushData(data)) {
-              if (chunk.choices?.[0]?.delta?.content) anyContent = true;
+              const delta = chunk.choices?.[0]?.delta;
+              if (delta && (delta.content || (Array.isArray(delta.tool_calls) && delta.tool_calls.length))) {
+                anyContent = true;
+              }
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
             }
           }
           for (const chunk of conv.finishChunks()) res.write(`data: ${JSON.stringify(chunk)}\n\n`);
           if (!anyContent) {
-            // Бюджет ушёл на размышления: пустой поток клиенту ничего не объяснит.
             res.write(`data: ${JSON.stringify({ error: {
               message: 'Модель израсходовала max_tokens на размышления и не вернула текст. Увеличьте max_tokens (например, до 1024) и повторите.',
               type: 'api_error', code: 'empty_reasoning_budget',
@@ -1622,7 +1784,6 @@ function start(config) {
           }
           res.write('data: [DONE]\n\n');
         } catch (e) {
-          // Обрыв на нашей стороне — это уход клиента, а не сбой апстрима.
           if (clientGone(res) || (e && (e.name === 'AbortError' || e.name === 'TimeoutError' || ac.signal.aborted))) throw abortedError();
           pushLog({ kind: 'openai', model: parsed.displayId, status: 502, ms: Date.now() - t0, error: 'stream: ' + e.message, provider: providers.CLOUD });
           sendApiError(res, 502, { error: { message: `Antigravity upstream stream: ${e.message}`, type: 'api_error', code: 502 } }, true);
@@ -1645,7 +1806,6 @@ function start(config) {
   }
 
   function aggregateGeminiChunks(chunks, model) {
-    // chunks: массив {response:{candidates:[{content:{parts},finishReason}],usageMetadata},traceId}
     const parts = [];
     let finish = null;
     let usage = null;
@@ -1656,16 +1816,17 @@ function start(config) {
       if (c.traceId) traceId = c.traceId;
       const cand = resp.candidates?.[0] ?? {};
       for (const p of cand.content?.parts ?? []) {
-        if (p.thought) continue;
         const last = parts[parts.length - 1];
-        if (typeof p.text === 'string' && last && typeof last.text === 'string') last.text += p.text;
-        else parts.push(p);
+        if (typeof p.text === 'string' && last && typeof last.text === 'string' && !!last.thought === !!p.thought) {
+          last.text += p.text;
+        } else {
+          parts.push({ ...p });
+        }
       }
       if (cand.finishReason) finish = cand.finishReason;
       if (resp.usageMetadata) usage = resp.usageMetadata;
       if (resp.promptFeedback) promptFeedback = resp.promptFeedback;
     }
-    // Заблокированный запрос приходит без кандидатов — сохраняем это для finish_reason.
     const blocked = !!promptFeedback?.blockReason && !parts.length && !finish;
     const resp = {
       response: {
@@ -1737,12 +1898,15 @@ function start(config) {
           const iterator = webBridge.streamResponse(upRes)[Symbol.asyncIterator]();
           const first = await iterator.next();
           res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+          let outChars = 0;
           if (!first.done) {
+            outChars += String(first.value || '').length;
             const firstChunk = { candidates: [{ content: { parts: [{ text: first.value }], role: 'model' }, finishReason: null, index: 0 }] };
             res.write(`data: ${JSON.stringify(firstChunk)}\n\n`);
             for (;;) {
               const next = await iterator.next();
               if (next.done) break;
+              outChars += String(next.value || '').length;
               const chunk = { candidates: [{ content: { parts: [{ text: next.value }], role: 'model' }, finishReason: null, index: 0 }] };
               res.write(`data: ${JSON.stringify(chunk)}\n\n`);
             }
@@ -1756,11 +1920,13 @@ function start(config) {
           };
           res.write(`data: ${JSON.stringify(endChunk)}\n\n`);
           res.end();
+          guard.reportUsage(Math.max(2, Math.round((prompt.length + outChars) / 4)));
           pushLog({ kind: 'gemini', model: displayModel, status: 200, ms: Date.now() - t0, stream: true, provider: providers.WEB });
           return;
         }
 
         const text = await webBridge.generate(prompt, meta.modelId, meta.thinkMode, lang, { signal: ac.signal });
+        const totalTokens = Math.max(2, Math.round((prompt.length + text.length) / 4));
         const out = {
           candidates: [{
             content: { parts: [{ text }], role: 'model' },
@@ -1770,10 +1936,11 @@ function start(config) {
           usageMetadata: {
             promptTokenCount: Math.max(1, Math.round(prompt.length / 4)),
             candidatesTokenCount: Math.max(1, Math.round(text.length / 4)),
-            totalTokenCount: Math.max(2, Math.round((prompt.length + text.length) / 4)),
+            totalTokenCount: totalTokens,
           },
           modelVersion: displayModel,
         };
+        guard.reportUsage(totalTokens);
         pushLog({ kind: 'gemini', model: displayModel, status: 200, ms: Date.now() - t0, provider: providers.WEB });
         return sendJson(res, 200, out);
       } catch (err) {
@@ -1796,6 +1963,10 @@ function start(config) {
       });
     }
 
+    if (!isWeb) {
+      applyThinkingConfig(requestObj, body, { ...config.thinking, includeThoughts: !!config.includeThoughts });
+    }
+
     return guarded(res, model, 'gemini', async () => {
       const ac = new AbortController();
       const onClose = () => { if (!res.writableEnded) ac.abort(); };
@@ -1806,7 +1977,7 @@ function start(config) {
         if (!upRes.ok) {
           const text = (await upRes.text().catch(() => '')) || '';
           if (upRes.status === 429) guard.report429(model, parseResetMs(text));
-          pushLog({ kind: 'gemini', model: displayModel, status: upRes.status, ms: Date.now() - t0, error: text.slice(0, 160), quota: extractQuotaInfo(text), provider: providers.CLOUD });
+          pushLog({ kind: 'gemini', model: displayModel, status: upRes.status, ms: Date.now() - t0, error: redactSecrets(text).slice(0, 160), quota: extractQuotaInfo(text), provider: providers.CLOUD });
           return upstreamErrorToClient(res, { status: upRes.status, text: async () => text });
         }
 
@@ -1846,11 +2017,12 @@ function start(config) {
         for await (const data of sseData(bodyWhileConnected(res, upRes.body))) {
           if (!data || data === '[DONE]') continue;
           const j = parseUpstreamData(data);
-          // разворачиваем обёртку {"response": ...} -> чистый Gemini-формат
           const inner = j.response ?? j;
           if (inner.usageMetadata) lastUsage = inner.usageMetadata;
           for (const p of inner.candidates?.[0]?.content?.parts || []) {
-            if (!p.thought && typeof p.text === 'string' && p.text) anyText = true;
+            if ((!p.thought && typeof p.text === 'string' && p.text) || (p.functionCall && p.functionCall.name)) {
+              anyText = true;
+            }
           }
           res.write(`data: ${JSON.stringify(inner)}\n\n`);
         }
@@ -2011,174 +2183,177 @@ function start(config) {
     return sendJson(res, 200, found);
   }
 
-  // ---- статус-страница ----
+  // ---- статические ассеты веб-панели и вспомогательные ответы ----
 
-  function statusPage() {
-    const esc = (s) => String(s ?? '').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-    const statusBadge = (st) => {
-      const n = Number(st);
-      if (Number.isFinite(n)) {
-        const cls = n < 400 ? 'ok' : (n < 500 ? 'warn' : 'bad');
-        return `<span class="badge ${cls}">${n}</span>`;
-      }
-      return esc(st);
-    };
-    const providerOf = (r) => {
-      if (r.provider) return r.provider;
-      const m = String(r.model || '');
-      if (m.startsWith('web/')) return 'web';
-      if (m.startsWith('cloud/')) return 'cloud';
-      return '—';
-    };
-    const providerBadge = (p) => (p === 'web'
-      ? '<span class="badge warn">web</span>'
-      : p === 'cloud' ? '<span class="badge ok">cloud</span>' : '<span class="badge off">—</span>');
-    const rows = log.slice().reverse().slice(0, 40).map((r) =>
-      `<tr><td class="mono">${esc(r.ts?.slice(11, 19))}</td><td>${providerBadge(providerOf(r))}</td><td>${esc(r.kind)}</td>` +
-      `<td class="mono">${esc(r.model || '')}</td><td>${statusBadge(r.status)}</td>` +
-      `<td class="mono">${esc(r.ms ?? '')}ms</td><td>${esc(r.quota || '')}</td><td class="err">${esc(r.error || '')}</td></tr>`
-    ).join('');
-    let modelCount = 0;
-    try { modelCount = catalog.cache ? catalog.cache.models.size : 0; } catch {}
-    let webModelCount = 0;
-    try { webModelCount = webBridge.getModelsList().length; } catch {}
+  const PUBLIC_FILES = {
+    '/': { file: path.join(ROOT, 'public', 'index.html'), type: 'text/html; charset=utf-8' },
+    '/index.html': { file: path.join(ROOT, 'public', 'index.html'), type: 'text/html; charset=utf-8' },
+    '/styles.css': { file: path.join(ROOT, 'public', 'styles.css'), type: 'text/css; charset=utf-8' },
+    '/app.js': { file: path.join(ROOT, 'public', 'app.js'), type: 'application/javascript; charset=utf-8' },
+    '/i18n.js': { file: path.join(ROOT, 'public', 'i18n.js'), type: 'application/javascript; charset=utf-8' },
+    '/charts.js': { file: path.join(ROOT, 'public', 'charts.js'), type: 'application/javascript; charset=utf-8' },
+    '/favicon.ico': { file: path.join(ROOT, 'assets', 'antigravity_api.ico'), type: 'image/x-icon' },
+  };
 
-    // Cloud Code (Antigravity): OAuth, квоты в процентах, нативные tools.
-    const cloudKvs =
-      `<div class="kv"><span class="k">Transport</span><span><span class="badge ok">OAuth · Cloud Code v1internal</span></span></div>` +
-      `<div class="kv"><span class="k">Models</span><span><b>${modelCount}</b> · namespace <code>cloud/&lt;id&gt;</code></span></div>` +
-      `<div class="kv"><span class="k">Tool calling</span><span><span class="badge ok">native (functionDeclarations + thought signatures)</span></span></div>` +
-      `<div class="kv"><span class="k">Quota</span><span>per-account percentages · see <code>/_limits</code></span></div>` +
-      `<div class="kv"><span class="k">Token refreshes</span><span>${upstream.refreshCount}</span></div>`;
-
-    let webKvs = '';
+  function servePublicAsset(res, pathname) {
+    const asset = PUBLIC_FILES[pathname];
+    if (!asset) return false;
     try {
-      const ws = webBridge.summary ? webBridge.summary() : null;
-      if (ws) {
-        const enCls = ws.enabled ? 'ok' : 'off';
-        const ckCls = ws.cookieSet ? 'ok' : 'warn';
-        const allowWebAgent = !!(config.agent && config.agent.allowWebAgent === true);
-        webKvs =
-          `<div class="kv"><span class="k">Status</span><span><span class="badge ${enCls}">${ws.enabled ? 'Enabled' : 'Disabled'}</span></span></div>` +
-          `<div class="kv"><span class="k">Cookie</span><span><span class="badge ${ckCls}">${ws.cookieSet ? 'set' : 'none (anonymous)'}</span></span></div>` +
-          (ws.accounts && ws.accounts.length
-            ? `<div class="kv"><span class="k">Accounts</span><span>${ws.accounts.map((a) => `<code>${esc(a.name)}</code>${a.active ? ' <span class="badge ok">active</span>' : ''}${a.cooldownUntil ? ' <span class="badge warn">cooldown</span>' : ''}${a.requests ? ' · ' + esc(a.requests) + ' req' : ''}`).join(' ')}</span></div>`
-            : '') +
-          `<div class="kv"><span class="k">BL version</span><span><code>${esc(ws.bl)}</code></span></div>` +
-          (ws.proxy ? `<div class="kv"><span class="k">Proxy</span><span><code>${esc(ws.proxy)}</code></span></div>` : '') +
-          (ws.authUser !== null && ws.authUser !== undefined ? `<div class="kv"><span class="k">Google /u/</span><span><code>${esc(ws.authUser)}</code></span></div>` : '') +
-          (ws.temporaryChats ? `<div class="kv"><span class="k">Mode</span><span>temporary chats</span></div>` : '') +
-          `<div class="kv"><span class="k">Models</span><span><b>${webModelCount}</b> · namespace <code>web/&lt;alias&gt;</code></span></div>` +
-          `<div class="kv"><span class="k">Model resolution</span><span><span class="badge warn">heuristic · exact aliases only</span></span></div>` +
-          `<div class="kv"><span class="k">Tool calling</span><span><span class="badge warn">none · text-protocol emulation</span></span></div>` +
-          `<div class="kv"><span class="k">Agent mode</span><span><span class="badge ${allowWebAgent ? 'warn' : 'off'}">${allowWebAgent ? 'web/&lt;alias&gt;-agent · VERY unreliable' : 'disabled (opt-in via allowWebAgent)'}</span></span></div>` +
-          `<div class="kv"><span class="k">Web models</span><span>${ws.models.map((m) => '<code>web/' + esc(m) + '</code>').join(' ') || '—'}</span></div>`;
-      }
-    } catch {}
+      const data = fs.readFileSync(asset.file);
+      res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-cache' });
+      res.end(data);
+    } catch {
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('Control Panel UI files not found.');
+    }
+    return true;
+  }
 
-    const ns = network.summary();
-    const netKvs =
-      `<div class="kv"><span class="k">Status</span><span><span class="badge ${ns.active ? 'ok' : 'off'}">${ns.active ? 'Proxy / custom DNS' : 'Direct (system DNS)'}</span></span></div>` +
-      `<div class="kv"><span class="k">Proxy</span><span>${ns.proxy ? '<code>' + esc(ns.proxy) + '</code>' : '—'}</span></div>` +
-      (ns.webProxy ? `<div class="kv"><span class="k">Web bridge proxy</span><span><code>${esc(ns.webProxy)}</code></span></div>` : '') +
-      (ns.envProxy ? `<div class="kv"><span class="k">Env proxy</span><span><code>${esc(ns.envProxy)}</code></span></div>` : '') +
-      `<div class="kv"><span class="k">DNS</span><span>${ns.dnsMode === 'doh' ? 'DoH · <code>' + esc(ns.dohHost) + '</code>' : ns.dnsMode === 'custom' ? 'custom · <code>' + esc((ns.dnsServers || []).join(', ')) + '</code>' : 'system'}</span></div>`;
+  function sanitizeConfigForClient() {
+    const norm = configLib.normalize(config).config;
+    const rawCookie = String(norm.geminiWeb?.cookie || '');
+    const accounts = (norm.geminiWeb?.accounts || []).map((a) => ({
+      name: a.name,
+      label: a.label || '',
+      proxy: a.proxy || '',
+      authUser: a.authUser,
+      thinkMode: a.thinkMode || null,
+      temporaryChats: a.temporaryChats === true,
+      cookie_file: a.cookie_file || '',
+      hasCookie: !!a.cookie,
+      hasCookieFile: !!a.cookie_file,
+    }));
+    return {
+      ...norm,
+      apiKey: undefined,
+      adminKey: undefined,
+      hasApiKey: !!config.apiKey,
+      hasAdminKey: !!config.adminKey,
+      geminiWeb: {
+        ...norm.geminiWeb,
+        cookie: undefined,
+        atToken: undefined,
+        cookieSet: !!(rawCookie || norm.geminiWeb?.cookie_file),
+        cookieLength: rawCookie.length,
+        cookieHasSapisid: /SAPISID=/.test(rawCookie),
+        cookieHas1Psid: /__Secure-1PSID=/.test(rawCookie),
+        hasAtToken: !!norm.geminiWeb?.atToken,
+        accounts,
+      },
+    };
+  }
 
-    const g = guard.summary();
-    const guardKvs =      `<div class="kv"><span class="k">Status</span><span><span class="badge ${guard.cfg.enabled ? 'warn' : 'off'}">${guard.cfg.enabled ? 'Enabled' : 'Disabled (direct upstream mode)'}</span></span></div>` +
-      `<div class="kv"><span class="k">Requests today</span><span><b>${g.requestsToday}</b>${guard.cfg.enabled ? ' / ' + g.limits.perDay : ''}</span></div>` +
-      `<div class="kv"><span class="k">Tokens today</span><span><b>${g.tokensToday}</b>${guard.cfg.enabled ? ' / ' + g.limits.tokensPerDay : ''}</span></div>` +
-      `<div class="kv"><span class="k">Cooldown</span><span><code>${esc(JSON.stringify(g.cooldowns))}</code></span></div>`;
-
-    // Агентные файловые инструменты (lib/agent.js) + гибридный planner.
-    const agentEnabled = !(config.agent && config.agent.enabled === false);
-    const agentWs = agent.resolveWorkspace(config.agent, ROOT);
-    const plannerCfg = { ...planner.DEFAULT_SETTINGS, ...((config.agent && config.agent.planner) || {}) };
-    const allowWebAgent = !!(config.agent && config.agent.allowWebAgent === true);
-    const recentAgent = log.filter((r) => r.agentActions != null).slice(-5).reverse();
-    const agentKvs =
-      `<div class="kv"><span class="k">Status</span><span><span class="badge ${agentEnabled ? 'ok' : 'off'}">${agentEnabled ? 'Enabled' : 'Disabled'}</span></span></div>` +
-      `<div class="kv"><span class="k">Workspace</span><span><code>${esc(agentWs)}</code></span></div>` +
-      `<div class="kv"><span class="k">Tools</span><span>${agent.TOOL_NAMES.map((t) => '<code>' + esc(t) + '</code>').join(' ')}</span></div>` +
-      `<div class="kv"><span class="k">Max iterations</span><span>${(config.agent && config.agent.maxIterations) || agent.DEFAULTS.maxIterations}</span></div>` +
-      `<div class="kv"><span class="k">Web agent</span><span><span class="badge ${allowWebAgent ? 'warn' : 'off'}">${allowWebAgent ? 'enabled · VERY unreliable' : 'disabled (opt-in)'}</span></span></div>` +
-      `<div class="kv"><span class="k">Planner</span><span><span class="badge ${plannerCfg.enabled ? 'ok' : 'off'}">${plannerCfg.enabled ? 'enabled' : 'disabled'}</span> <code>${esc(plannerCfg.model)}</code> · maxCalls ${esc(plannerCfg.maxCalls)} · timeout ${esc(plannerCfg.timeoutMs)}ms</span></div>` +
-      `<div class="kv"><span class="k">delete_path</span><span><span class="badge ${config.agent && config.agent.allowDelete ? 'warn' : 'off'}">${config.agent && config.agent.allowDelete ? 'allowed' : 'disabled'}</span></span></div>` +
-      `<div class="kv"><span class="k">run_command</span><span><span class="badge ${config.agent && config.agent.allowShell ? 'warn' : 'off'}">${config.agent && config.agent.allowShell ? 'allowed' : 'disabled'}</span></span></div>` +
-      `<div class="kv"><span class="k">Absolute paths</span><span><span class="badge ${config.agent && config.agent.allowAbsolutePaths ? 'warn' : 'off'}">${config.agent && config.agent.allowAbsolutePaths ? 'allowed (system dirs blocked)' : 'disabled (sandbox only)'}</span></span></div>` +
-      (recentAgent.length
-        ? `<div class="kv"><span class="k">Last agent runs</span><span>${recentAgent.map((r) => `<code>${esc(r.model || '')}</code> ${esc(r.agentActions)} actions`).join(' · ')}</span></div>`
-        : '');
-
-    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Antigravity API Dashboard</title><meta http-equiv="refresh" content="5">
-<style>
-:root{--bg:#0b0c10;--panel:#141622;--sub:#1b1e2e;--border:#23273c;--txt:#f8fafc;--mut:#94a3b8;--dim:#64748b;--cy:#38bdf8;--ok:#10b981;--warn:#f59e0b;--bad:#ef4444}
-*{box-sizing:border-box}
-body{font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:28px}
-.wrap{max-width:1080px;margin:0 auto}
-.header{display:flex;align-items:center;gap:12px}
-.dot{width:11px;height:11px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
-h1{font-size:22px;margin:0}h1 .api{color:var(--cy)}
-.sub{color:var(--dim);font-size:13px;margin:6px 0 18px}
-.pills{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
-.pill{background:var(--sub);border:1px solid var(--border);border-radius:20px;padding:5px 13px;font-size:12px;color:var(--mut)}
-.pill b{color:var(--txt)}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;margin-bottom:18px;overflow:hidden}
-.card h2{font-size:12px;letter-spacing:.07em;text-transform:uppercase;color:var(--mut);margin:0;padding:14px 20px;border-bottom:1px solid var(--border)}
-.card .body{padding:8px 20px 14px}
-.kv{display:grid;grid-template-columns:190px 1fr;gap:8px;font-size:13px;padding:7px 0;border-bottom:1px dashed #1e2233}
-.kv:last-child{border-bottom:none}
-.kv .k{color:var(--mut)}
-.badge{display:inline-block;padding:2px 11px;border-radius:12px;font-size:12px;font-weight:600}
-.badge.ok{background:#064e3b;color:#6ee7b7}.badge.off{background:#23273c;color:var(--mut)}
-.badge.warn{background:#451a03;color:#fbbf24}.badge.bad{background:#450a0a;color:#fca5a5}
-table{border-collapse:collapse;width:100%;font-size:13px}
-td,th{padding:8px 10px;text-align:left;border-bottom:1px solid #1e2233;vertical-align:top}
-th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.05em}
-tr:last-child td{border-bottom:none}
-.mono{font-family:Consolas,monospace;font-size:12px}
-.err{color:var(--bad);font-size:12px;max-width:280px;overflow:hidden;text-overflow:ellipsis}
-code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-size:12px;margin-right:4px}
-.empty{color:var(--dim);font-size:13px;padding:10px 0}
-.footer{color:var(--dim);font-size:12px;margin-top:4px}
-</style></head><body><div class="wrap">
-<div class="header"><span class="dot"></span><h1>ANTIGRAVITY <span class="api">API</span> <span style="font-size:12px;opacity:.55;font-weight:400">v${esc(APP_VERSION)}</span></h1></div>
-<p class="sub">Локальный OpenAI-совместимый шлюз · модели неймспейснуты: <code>cloud/&lt;id&gt;</code> и <code>web/&lt;alias&gt;</code> · автообновление каждые 5 с</p>
-<div class="pills">
-<span class="pill">Started <b>${esc(stats.startedAt)}</b></span>
-<span class="pill">Requests <b>${stats.requests}</b></span>
-<span class="pill">Errors <b>${stats.errors}</b></span>
-<span class="pill">Guard blocks <b>${stats.blocked}</b></span>
-<span class="pill">Cloud models <b>${modelCount}</b></span>
-<span class="pill">Web models <b>${webModelCount}</b></span>
-<span class="pill">Token refreshes <b>${upstream.refreshCount}</b></span>
-</div>
-<div class="card"><h2>☁️ Cloud Code (Antigravity)</h2><div class="body">${cloudKvs}</div></div>
-<div class="card"><h2>🌐 Gemini Web (Browser Bridge) · VERY unreliable for agents</h2><div class="body">${webKvs}</div></div>
-<div class="card"><h2>🤖 Agent &amp; Planner</h2><div class="body">${agentKvs}</div></div>
-<div class="card"><h2>🛰 Network Transport</h2><div class="body">${netKvs}</div></div>
-<div class="card"><h2>🛡 Guard Status (Optional)</h2><div class="body">${guardKvs}</div></div>
-<div class="card"><h2>Recent Requests (last 40)</h2><div class="body">${
-  rows ? `<table><tr><th>Time</th><th>Provider</th><th>Kind</th><th>Model</th><th>Status</th><th>Latency</th><th>Quota</th><th>Error</th></tr>${rows}</table>`
-       : `<div class="empty">No requests yet.</div>`
-}</div></div>
-<p class="footer">Base URL: <code>http://127.0.0.1:${config.port}/v1</code> · Key file: <code>apikey.txt</code></p>
-</div></body></html>`;
+  function buildStatusSnapshot() {
+    const listen = envListen(config);
+    return {
+      version: APP_VERSION,
+      startedAt: stats.startedAt,
+      uptime: Math.floor(process.uptime()),
+      port: listen.port,
+      host: listen.host,
+      platform: process.platform,
+      nodeVersion: process.version,
+      supervised: process.env.AG_SUPERVISED === '1',
+      cloudDisabled: CLOUD_DISABLED,
+      cloudAuthReady: !CLOUD_DISABLED && (typeof tokens.hasCredentials === 'function' ? tokens.hasCredentials() : true),
+      requests: stats.requests,
+      errors: stats.errors,
+      blocked: stats.blocked,
+      tokenRefreshes: upstream.refreshCount,
+      tokens: tokens.summary(),
+      network: network.summary(),
+      geminiWeb: webBridge.summary ? webBridge.summary() : null,
+      agent: {
+        enabled: !(config.agent && config.agent.enabled === false),
+        workspace: agent.resolveWorkspace({ ...(config.agent || {}), dataDir: DATA_DIR }, ROOT),
+        tools: agent.TOOL_NAMES,
+        allowDelete: !!(config.agent && config.agent.allowDelete),
+        allowShell: !!(config.agent && config.agent.allowShell),
+        allowWebAgent: !!(config.agent && config.agent.allowWebAgent === true),
+        maxIterations: (config.agent && config.agent.maxIterations) || agent.DEFAULTS.maxIterations,
+        planner: { ...planner.DEFAULT_SETTINGS, ...((config.agent && config.agent.planner) || {}) },
+      },
+    };
   }
 
   // ---- маршрутизация ----
 
-  // Браузерные клиенты (Open WebUI, LibreChat, свои страницы) шлют preflight:
-  // без него запрос не уходит вообще. Ключ всё равно обязателен на /v1.
+  function isLoopbackOrigin(origin) {
+    return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(String(origin || '').trim());
+  }
+
   function applyCors(req, res) {
     const origin = req.headers.origin;
     if (!origin) return;
-    res.setHeader('access-control-allow-origin', origin);
-    res.setHeader('vary', 'origin');
-    res.setHeader('access-control-allow-credentials', 'true');
+    const corsCfg = (config && config.cors) || DEFAULT_CONFIG.cors;
+    if (corsCfg.enabled === false) return;
+    const normalized = String(origin).trim().replace(/\/+$/, '');
+    const allowedList = Array.isArray(corsCfg.origins) ? corsCfg.origins : [];
+    const explicitlyAllowed = isLoopbackOrigin(normalized) || allowedList.includes(normalized);
+
+    if (explicitlyAllowed) {
+      res.setHeader('access-control-allow-origin', origin);
+      res.setHeader('vary', 'origin');
+      res.setHeader('access-control-allow-credentials', 'true');
+    } else if (corsCfg.allowAnyOrigin === true) {
+      res.setHeader('access-control-allow-origin', '*');
+      res.setHeader('vary', 'origin');
+    } else {
+      return;
+    }
     res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
     res.setHeader('access-control-allow-headers', (req.headers['access-control-request-headers'] || 'authorization,content-type,x-api-key,x-goog-api-key,x-admin-key,anthropic-version,anthropic-beta').slice(0, 1024));
     res.setHeader('access-control-max-age', '600');
+  }
+
+  async function readJsonObj(req, res) {
+    const read = await readBodyOrRespond(req, res);
+    if (!read.ok) return null;
+    try {
+      return parseRequestBody(read.raw);
+    } catch {
+      sendJson(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
+      return null;
+    }
+  }
+
+  function scheduleProcessAction(action) {
+    setTimeout(() => {
+      for (const client of eventClients) {
+        try { client.end(); } catch {}
+      }
+      eventClients.clear();
+      try { guard.flush(); } catch {}
+      try { webBridge.closeAllSockets?.(); } catch {}
+      try { network.destroyAll?.(); } catch {}
+      const exitCode = action === 'restart' && process.env.AG_SUPERVISED === '1' ? 75 : 0;
+      const done = () => {
+        if (action === 'restart' && process.env.AG_SUPERVISED !== '1') {
+          try {
+            const { spawn } = require('child_process');
+            spawn(process.execPath, [path.join(ROOT, 'server.js')], {
+              cwd: ROOT,
+              detached: true,
+              stdio: 'ignore',
+              windowsHide: true,
+            }).unref();
+          } catch {}
+        }
+        process.exit(exitCode);
+      };
+      const hard = setTimeout(() => {
+        try { server.closeAllConnections?.(); } catch {}
+        done();
+      }, 2000);
+      if (hard.unref) hard.unref();
+      try {
+        server.close(() => { clearTimeout(hard); done(); });
+        server.closeIdleConnections?.();
+      } catch {
+        clearTimeout(hard);
+        done();
+      }
+    }, 80).unref?.();
   }
 
   async function handler(req, res) {
@@ -2195,8 +2370,53 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
         throw requestError('Invalid request URL');
       }
       p = u.pathname;
-      if (p === '/_health') return sendJson(res, 200, { ok: true, uptime: process.uptime() });
+      if (p === '/_health') return sendJson(res, 200, { ok: true, uptime: process.uptime(), version: APP_VERSION });
       if (p === '/api/diagnostics/chat') return await handleDiagnosticChat(req, res);
+
+      if (p === '/_auth/session') {
+        if (req.method === 'GET') {
+          return sendJson(res, 200, { authenticated: adminOk(req), supervised: process.env.AG_SUPERVISED === '1' });
+        }
+        if (req.method === 'POST') {
+          const blockedUntil = authBlocked(req);
+          if (blockedUntil) return unauthorized(res, blockedUntil);
+          const body = await readJsonObj(req, res);
+          if (!body) return;
+          const expected = config.adminKey || config.apiKey;
+          const candidate = String(body.adminKey || body.key || '').trim();
+          if (!keyEquals(candidate, expected)) {
+            noteAuthFailure(req);
+            return unauthorized(res);
+          }
+          issueSessionCookie(res);
+          return sendJson(res, 200, { ok: true });
+        }
+      }
+      if (p === '/_auth/logout' && req.method === 'POST') {
+        const sid = parseCookies(req).ag_admin_session;
+        if (sid) adminSessions.delete(sid);
+        res.setHeader('set-cookie', 'ag_admin_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (req.method === 'GET' && p === '/') {
+        const launch = u.searchParams.get('launch');
+        if (launch) {
+          if (consumeLaunchNonce(launch)) {
+            issueSessionCookie(res);
+          }
+          res.writeHead(302, { location: '/' });
+          return res.end();
+        }
+        if (authOk(req) && !adminOk(req)) {
+          return forbidden(res, 'admin_key_required', 'Веб-панель доступна только с админским ключом (admin.key). Клиентский API-ключ не даёт доступа к панели.');
+        }
+        return servePublicAsset(res, '/');
+      }
+
+      if (req.method === 'GET' && p !== '/' && PUBLIC_FILES[p]) {
+        return servePublicAsset(res, p);
+      }
 
       const blockedUntil = authBlocked(req);
       if (blockedUntil) return unauthorized(res, blockedUntil);
@@ -2205,44 +2425,17 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
         return unauthorized(res);
       }
 
-      if (p === '/' || p === '/_status') {
-        // Дашборд — административная поверхность: клиентский API-ключ
-        // (он лежит у Cursor/Cline/любого скрипта) в панель не пускаем.
-        if (p === '/' && !adminOk(req)) {
-          return forbidden(res, 'admin_key_required', 'HTML-дашборд доступен только с админским ключом (admin.key). Клиентский API-ключ не даёт доступа к панели.');
-        }
-        const s = {
-          version: APP_VERSION,
-          startedAt: stats.startedAt,
-          requests: stats.requests,
-          errors: stats.errors,
-          tokens: tokens.summary(),
-          network: network.summary(),
-          agent: {
-            enabled: !(config.agent && config.agent.enabled === false),
-            workspace: agent.resolveWorkspace(config.agent, ROOT),
-            tools: agent.TOOL_NAMES,
-            allowDelete: !!(config.agent && config.agent.allowDelete),
-            allowShell: !!(config.agent && config.agent.allowShell),
-            allowWebAgent: !!(config.agent && config.agent.allowWebAgent === true),
-            maxIterations: (config.agent && config.agent.maxIterations) || agent.DEFAULTS.maxIterations,
-            planner: { ...planner.DEFAULT_SETTINGS, ...((config.agent && config.agent.planner) || {}) },
-          },
-        };
-        if (p === '/_status') return sendJson(res, 200, s);
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-        return res.end(statusPage());
+      if (p === '/_status') {
+        return sendJson(res, 200, buildStatusSnapshot());
       }
 
       if (p === '/_limits' || p === '/_quota') {
-        if (CLOUD_DISABLED) {
-          // Без OAuth-токена квоты Cloud Code недоступны: отдаём локальные
-          // счётчики и состояние веб-моста, чтобы панель не висела.
+        if (CLOUD_DISABLED || (typeof tokens.hasCredentials === 'function' && !tokens.hasCredentials())) {
           const reply = {
             local: guard.summary(),
-            account: { error: 'cloud_disabled' },
+            account: { error: CLOUD_DISABLED ? 'cloud_disabled' : 'auth_missing' },
             models: [],
-            modelsError: 'cloud-модели отключены (AG_NO_CLOUD=1)',
+            modelsError: CLOUD_DISABLED ? 'cloud-модели отключены (AG_NO_CLOUD=1)' : 'Токен Antigravity IDE (auth.json) не найден',
             quotaFamilies: {},
             serverQuotas: null,
             config: { safeMode: guard.cfg },
@@ -2251,8 +2444,6 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
           };
           return sendJson(res, 200, p === '/_quota' ? { serverQuotas: null } : reply);
         }
-        // Независимые запросы — параллельно: иначе холодный вызов ждёт Google
-        // последовательно (15с+15с), а GUI сдаётся раньше. Кэш: квоты 30с, аккаунт 300с.
         const quotaP = upstream.getQuotaSummary();
         if (p === '/_quota') return sendJson(res, 200, await quotaP);
 
@@ -2262,9 +2453,9 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
           upstream.getAccountInfo(),
           (async () => {
             try {
-              await catalog.list(() => tokens.getAccessToken()); // прогрев кэша моделей
+              await catalog.list(() => tokens.getAccessToken());
             } catch (e) {
-              modelsError = e.message; // показываем в GUI, а не глотаем
+              modelsError = e.message;
             }
           })(),
         ]);
@@ -2290,12 +2481,87 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
         });
       }
 
-      // ---- веб-аккаунты: управление без правки config.json руками ----
-      // Cookie никогда не возвращается наружу: только признак наличия.
-      if (p === '/_web/accounts') {
-        if (!adminOk(req)) {
-          return forbidden(res, 'admin_key_required', 'Управление веб-аккаунтами доступно только с админским ключом (admin.key).');
+      // ---- Админские маршруты (только admin.key / сессия панели) ----
+      const requireAdmin = () => {
+        if (adminOk(req)) return true;
+        forbidden(res, 'admin_key_required', 'Доступ разрешён только с админским ключом (admin.key) или через сессию веб-панели.');
+        return false;
+      };
+
+      if (p === '/_auth/launch' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        return sendJson(res, 200, { ok: true, nonce: mintLaunchNonce() });
+      }
+
+      if (p === '/_keys' && req.method === 'GET') {
+        if (!requireAdmin()) return;
+        return sendJson(res, 200, { apiKey: config.apiKey || '', adminKey: config.adminKey || '' });
+      }
+
+      if (p === '/_usage' && req.method === 'GET') {
+        if (!requireAdmin()) return;
+        return sendJson(res, 200, {
+          summary: guard.summary(),
+          history: guard.history(30),
+          stats: { ...stats, uptime: Math.floor(process.uptime()) },
+        });
+      }
+
+      if (p === '/_logs' && req.method === 'GET') {
+        if (!requireAdmin()) return;
+        return sendJson(res, 200, { logs: log.slice().reverse(), stats: { ...stats, uptime: Math.floor(process.uptime()) } });
+      }
+
+      if (p === '/_events' && req.method === 'GET') {
+        if (!requireAdmin()) return;
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-cache',
+          connection: 'keep-alive',
+        });
+        eventClients.add(res);
+        res.write(`event: init\ndata: ${JSON.stringify({ status: buildStatusSnapshot(), logs: log.slice().reverse().slice(0, 60) })}\n\n`);
+        const hb = setInterval(() => {
+          if (res.writableEnded || res.destroyed) return;
+          res.write(`event: heartbeat\ndata: ${JSON.stringify({ uptime: Math.floor(process.uptime()), requests: stats.requests, errors: stats.errors, blocked: stats.blocked })}\n\n`);
+        }, 15000);
+        if (hb.unref) hb.unref();
+        req.on('close', () => {
+          clearInterval(hb);
+          eventClients.delete(res);
+        });
+        return;
+      }
+
+      if ((p === '/_auth/extract' || p === '/_auth/reload') && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        if (CLOUD_DISABLED) {
+          return sendJson(res, 400, { error: { message: 'Cloud режим отключён (AG_NO_CLOUD=1).', code: 'cloud_disabled' } });
         }
+        try {
+          let extracted = null;
+          if (p === '/_auth/extract') {
+            extracted = autoExtract({ force: true, outPath: authFile });
+          }
+          tokens.reloadFromDisk();
+          catalog.project = tokens.projectId || '';
+          catalog.invalidate();
+          upstream._accInfo = null;
+          upstream._quotaSummary = null;
+          return sendJson(res, 200, {
+            ok: true,
+            dbSource: extracted?.data?.db_source || '',
+            tokens: tokens.summary(),
+          });
+        } catch (e) {
+          return sendJson(res, e.status || 500, {
+            error: { message: e.message || 'Auth extract failed', code: e.code || 'auth_extract_failed' },
+          });
+        }
+      }
+
+      if (p === '/_web/accounts') {
+        if (!requireAdmin()) return;
         if (req.method === 'GET') {
           const ws = webBridge.summary ? webBridge.summary() : {};
           return sendJson(res, 200, {
@@ -2307,6 +2573,7 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
               authUser: a.authUser,
               thinkMode: a.thinkMode || null,
               temporaryChats: a.temporaryChats === true,
+              cookie_file: a.cookie_file || '',
               hasCookie: !!a.cookie,
               hasCookieFile: !!a.cookie_file,
               stats: (ws.accounts || []).find((x) => x.name === a.name) || null,
@@ -2317,56 +2584,112 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
           res.setHeader('allow', 'GET, POST');
           return sendJson(res, 405, { error: { message: 'Используйте GET или POST', type: 'invalid_request_error' } });
         }
-        const readAcct = await readBodyOrRespond(req, res);
-        if (!readAcct.ok) return;
-        let acctBody;
-        try { acctBody = parseRequestBody(readAcct.raw); } catch {
-          return sendJson(res, 400, { error: { message: 'Invalid JSON body', type: 'invalid_request_error' } });
-        }
+        const acctBody = await readJsonObj(req, res);
+        if (!acctBody) return;
         return await handleWebAccountAction(res, acctBody);
       }
 
-      if (req.method === 'POST' && p === '/_config') {
-        if (!adminOk(req)) {
-          return forbidden(res, 'admin_key_required', 'Изменение настроек доступно только с админским ключом (admin.key). Клиентский API-ключ даёт доступ только к /v1*.');
-        }
-        const readCfg = await readBodyOrRespond(req, res);
-        if (!readCfg.ok) return;
-        let parsed;
+      if (p === '/_web/browser/open' && req.method === 'POST') {
+        if (!requireAdmin()) return;
         try {
-          parsed = parseRequestBody(readCfg.raw);
-        } catch {
-          return sendJson(res, 400, { error: { message: 'Invalid JSON body' } });
+          const info = cdpCookies.openGeminiLoginWindow();
+          return sendJson(res, 200, info);
+        } catch (e) {
+          return sendJson(res, 500, { error: { message: e.message, code: e.code || 'browser_open_failed' } });
         }
+      }
 
-        // Белый список полей: опасные флаги агента (allowDelete/allowShell/
-        // allowAbsolutePaths/auditFile) и секреты не принимаются из HTTP никогда.
+      if (p === '/_web/browser/import-cookies' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const body = await readJsonObj(req, res);
+        if (!body) return;
+        try {
+          const resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true });
+          let saved = false;
+          if (resCdp.cookie && body.saveTo === 'single') {
+            const patch = configLib.patchConfig(config, {
+              geminiWeb: {
+                cookie: resCdp.cookie,
+                cookie_file: '',
+                ...(resCdp.atToken ? { atToken: resCdp.atToken } : {}),
+              },
+            });
+            Object.assign(config, patch.config);
+            webBridge.updateConfig(config.geminiWeb);
+            saveConfigFile();
+            saved = true;
+          } else if (resCdp.cookie && body.saveTo === 'account' && body.accountName) {
+            const name = String(body.accountName).trim();
+            const exists = (config.geminiWeb.accounts || []).some((a) => a.name.toLowerCase() === name.toLowerCase());
+            // Save into account via handleWebAccountAction logic directly
+            const list = (config.geminiWeb.accounts || []).map((a) => ({ ...a }));
+            if (exists) {
+              const item = list.find((a) => a.name.toLowerCase() === name.toLowerCase());
+              item.cookie = resCdp.cookie;
+              item.cookie_file = '';
+            } else {
+              list.push({ name, cookie: resCdp.cookie, cookie_file: '', authUser: null, proxy: '', label: '', thinkMode: null, temporaryChats: false });
+            }
+            const patch = configLib.patchConfig(config, { geminiWeb: { accounts: list, activeAccount: name } });
+            Object.assign(config, patch.config);
+            webBridge.updateConfig(config.geminiWeb);
+            saveConfigFile();
+            saved = true;
+          }
+          return sendJson(res, 200, {
+            ok: resCdp.ok,
+            count: resCdp.count,
+            hasSapisid: resCdp.hasSapisid,
+            has1Psid: resCdp.has1Psid,
+            domains: resCdp.domains,
+            hasAtToken: !!resCdp.atToken,
+            saved,
+            ...(body.returnCookie ? { cookie: resCdp.cookie } : {}),
+          });
+        } catch (e) {
+          return sendJson(res, 500, { error: { message: e.message, code: e.code || 'cdp_import_failed' } });
+        }
+      }
+
+      if (p === '/_config') {
+        if (!requireAdmin()) return;
+        if (req.method === 'GET') {
+          return sendJson(res, 200, sanitizeConfigForClient());
+        }
+        if (req.method !== 'POST') {
+          res.setHeader('allow', 'GET, POST');
+          return sendJson(res, 405, { error: { message: 'Используйте GET или POST', type: 'invalid_request_error' } });
+        }
+        const parsed = await readJsonObj(req, res);
+        if (!parsed) return;
+
+        const prevPort = config.port;
+        const prevHost = config.host;
         const patch = configLib.patchConfig(config, parsed);
         Object.assign(config, patch.config);
+        syncOutputHeadroom(config);
 
-        // Применяем к живым объектам. Исполнитель агента создаётся на каждый
-        // запрос, поэтому его настройки подхватываются сами.
         guard.updateConfig(config.safeMode);
         webBridge.updateConfig(config.geminiWeb);
         network.updateConfig(config);
 
         if (patch.applied.length) {
-          // В файл пишем нормализованный конфиг целиком: миграции и дефолты не
-          // теряются, неизвестные ключи сохраняются (deepMerge в lib/config).
-          // apiKey/adminKey живут в этом же объекте, поэтому не пропадают.
-          // Путь — DATA_DIR: в Docker /app только для чтения.
           const saveErr = saveConfigFile();
           if (saveErr) {
             return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${saveErr.message}`, type: 'internal_error' } });
           }
         }
 
+        const restartRequired = patch.ignored.filter((k) => /allowDelete|allowShell|allowAbsolutePaths|auditFile/.test(k));
+        if (config.port !== prevPort) restartRequired.push('port');
+        if (config.host !== prevHost) restartRequired.push('host');
+
         const reply = {
           ok: true,
           applied: patch.applied,
           ignored: patch.ignored,
           warnings: patch.warnings,
-          restartRequired: patch.ignored.filter((k) => /allowDelete|allowShell|allowAbsolutePaths|auditFile/.test(k)),
+          restartRequired,
           safeMode: guard.cfg,
           network: network.summary(),
         };
@@ -2374,22 +2697,97 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
         return sendJson(res, 200, reply);
       }
 
-      if (req.method === 'GET' && p === '/_network/test') {
-        const timeout = Math.max(2000, Math.min(15000, Number(u.searchParams.get('timeout')) || 5000));
-        return sendJson(res, 200, await network.test(timeout));
+      if (p === '/_network/detect-proxy' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const proxies = await detectProxies();
+        return sendJson(res, 200, { ok: true, proxies });
       }
 
-      if (req.method === 'GET' && p === '/v1/models') return await listModelsOpenAI(res);
-      if (req.method === 'GET' && /^\/(v1beta|v1)\/models\/?$/.test(p)) return await listModelsGemini(res);
+      if (p === '/_network/test') {
+        if (req.method === 'GET') {
+          const timeout = Math.max(2000, Math.min(15000, Number(u.searchParams.get('timeout')) || 5000));
+          return sendJson(res, 200, await network.test(timeout));
+        }
+        if (req.method === 'POST') {
+          if (!requireAdmin()) return;
+          const body = await readJsonObj(req, res);
+          if (!body) return;
+          const timeout = Math.max(2000, Math.min(15000, Number(body.timeout) || 5000));
+          const draftCfg = {
+            ...config,
+            ...(isPlainObject(body.network) ? { network: { ...config.network, ...body.network } } : {}),
+            ...(isPlainObject(body.geminiWeb) ? { geminiWeb: { ...config.geminiWeb, ...body.geminiWeb } } : {}),
+          };
+          const tmpNet = new NetworkManager(draftCfg);
+          try {
+            return sendJson(res, 200, await tmpNet.test(timeout));
+          } finally {
+            tmpNet.destroyAll();
+          }
+        }
+      }
+
+      if (p === '/_installs') {
+        if (!requireAdmin()) return;
+        if (req.method === 'GET') {
+          return sendJson(res, 200, installsLib.detectInstallations(DATA_DIR));
+        }
+        if (req.method === 'POST') {
+          const body = await readJsonObj(req, res);
+          if (!body) return;
+          return sendJson(res, 200, installsLib.setInstallPath(DATA_DIR, body.key, body.path));
+        }
+      }
+
+      if (p === '/_startup') {
+        if (!requireAdmin()) return;
+        if (req.method === 'GET') {
+          return sendJson(res, 200, shortcuts.getAutostartInfo({ rootDir: ROOT }));
+        }
+        if (req.method === 'POST') {
+          const body = await readJsonObj(req, res);
+          if (!body) return;
+          return sendJson(res, 200, shortcuts.setAutostart(!!body.enabled, { rootDir: ROOT }));
+        }
+      }
+
+      if (p === '/_backups' && req.method === 'GET') {
+        if (!requireAdmin()) return;
+        return sendJson(res, 200, { backups: updater.listBackups({ rootDir: ROOT }) });
+      }
+
+      if (p === '/_backup' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const result = updater.createBackup({ rootDir: ROOT, dataDir: DATA_DIR, reason: 'panel' });
+        return sendJson(res, 200, { ok: true, backup: result.manifest });
+      }
+
+      if (p === '/_server/restart' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        sendJson(res, 200, { ok: true, action: 'restart', port: config.port, supervised: process.env.AG_SUPERVISED === '1' });
+        scheduleProcessAction('restart');
+        return;
+      }
+
+      if (p === '/_server/shutdown' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        sendJson(res, 200, { ok: true, action: 'shutdown' });
+        scheduleProcessAction('shutdown');
+        return;
+      }
+
+      if (req.method === 'GET' && /^\/v1\/models\/?$/.test(p)) return await listModelsOpenAI(res);
+      if (req.method === 'GET' && /^\/v1beta\/models\/?$/.test(p)) return await listModelsGemini(res);
 
       const getOne = p.match(/^\/(v1beta|v1)\/models\/(.+)$/);
       if (req.method === 'GET' && getOne) return await getModel(res, getOne[1], getOne[2]);
 
-      // Имя модели неймспейснуто: cloud/<id> | web/<alias>. Разделитель может
-      // прийти как %2F (клиенты кодируют слэш) — decodeURIComponent ниже.
       const gm = p.match(/^\/(v1beta|v1)\/models\/(.+?)(?::(generateContent|streamGenerateContent|countTokens))?$/);
       if (req.method === 'POST' && gm) {
-        const model = decodeURIComponent(gm[2]);
+        let model;
+        try { model = decodeURIComponent(gm[2]); } catch {
+          return sendJson(res, 400, { error: { message: 'Invalid model name encoding', type: 'invalid_request_error', code: 'invalid_model_name' } });
+        }
         const method = gm[3] ?? 'generateContent';
         return await handleGeminiGenerate(req, res, model, method);
       }
@@ -2406,7 +2804,6 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
       }
       stats.errors++;
       const status = e.status >= 400 && e.status <= 599 ? e.status : 500;
-      // Client-side 4xx are routine (bad model, empty messages); keep stacks for server faults only.
       if (status >= 500) console.error('  [request error]', req.method, p, e);
       else console.error('  [request error]', req.method, p, e.message || e);
       sendApiError(res, status, { error: {
@@ -2417,12 +2814,12 @@ code{color:var(--cy);background:#0f1220;padding:1px 7px;border-radius:5px;font-s
     }
   }
 
+  const listen = envListen(config);
   const server = http.createServer(handler);
   server.on('error', (e) => {
-    console.error(`  ! Порт ${config.port}: ${e.message}`);
-    if (e.code === 'EADDRINUSE') console.error('    Уже занят. Поменяй "port" в config.json.');
+    console.error(`  ! Порт ${listen.port}: ${e.message}`);
+    if (e.code === 'EADDRINUSE') console.error('    Уже занят. Поменяй "port" в config.json или веб-панели.');
   });
-  const listen = envListen(config);
   server.listen(listen.port, listen.host);
 
   return { server, tokens, catalog, upstream, config, network, guard, webBridge };
@@ -2448,24 +2845,26 @@ function main() {
   }
 
   if (cmd === 'models') {
-    const authFile = path.join(DATA_DIR, 'auth.json');
+    const authFile = process.env.AG_AUTH_FILE || path.join(DATA_DIR, 'auth.json');
     const network = new NetworkManager(config);
-    const tokens = new TokenManager(authFile, { network });
-    const catalog = new ModelCatalog(config.upstreamHost, {
-      project: tokens.projectId,
-      userAgent: config.userAgent,
-      fallbackHost: config.upstreamFallbackHost,
-      network,
-    });
-    catalog
-      .list(() => tokens.getAccessToken())
-      .then((models) => {
-        for (const [id, m] of models) console.log(`  ${id.padEnd(32)} ${m.displayName}`);
-      })
-      .catch((e) => {
-        console.error(e.message);
-        process.exit(1);
+    const run = async () => {
+      if (network.autoDetect) await network.autoDetect();
+      const tokens = new TokenManager(authFile, { network, allowMissing: false });
+      const catalog = new ModelCatalog(config.upstreamHost, {
+        project: tokens.projectId,
+        userAgent: config.userAgent,
+        fallbackHost: config.upstreamFallbackHost,
+        network,
       });
+      const models = await catalog.list(() => tokens.getAccessToken());
+      for (const [id, m] of models) console.log(`  ${id.padEnd(32)} ${m.displayName}`);
+      network.destroyAll();
+    };
+    run().catch((e) => {
+      network.destroyAll();
+      console.error(e.message);
+      process.exit(1);
+    });
     return;
   }
 

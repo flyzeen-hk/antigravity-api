@@ -1,14 +1,20 @@
 {
   "name": "antigravity-api",
-  "version": "1.2.4",
-  "description": "Turn your Google Antigravity account into a full OpenAI/Gemini-compatible API key (local gateway to daily-cloudcode-pa.googleapis.com)",
+  "version": "2.0.0",
+  "description": "Local OpenAI/Anthropic/Gemini API gateway with offline Web Control Panel, live quota visualizations, consent-based Node bootstrap, and server-side agent file tools.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "key": "node server.js key",
-    "models": "node server.js models",
+    "ui": "node scripts/launcher.js",
+    "key": "node server.js --print-key",
+    "models": "node server.js --models",
+    "extract-token": "node lib/token_extract.js",
+    "backup": "node scripts/update.js --backup-only",
+    "update": "node scripts/update.js",
+    "build:portable": "node scripts/build_portable.js --zip",
+    "check:privacy": "node scripts/verify_privacy.js",
     "test": "node test/all.js",
-    "test:unit": "node test/test_models.js && node test/agent_tools_test.js && node test/test_translate.js && node test/test_web_bridge.js"
+    "test:unit": "node test/test_models.js && node test/agent_tools_test.js && node test/test_translate.js && node test/test_web_bridge.js && node test/test_config.js && node test/test_security_and_fixes.js && node test/test_token_extract.js && node test/test_proxy_detect.js"
   },
   "engines": {
     "node": ">=18"

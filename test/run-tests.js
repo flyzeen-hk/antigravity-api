@@ -792,58 +792,6 @@ async function main() {
     assert.match(String(statusJson.version || ''), /^\d+\.\d+\.\d+$/, '/_status должен отдавать версию');
   });
 
-  await ok('web-bridge unit: тесты lib/web_bridge.js (child process)', () =>
-    new Promise((resolve, reject) => {
-      const cp = require('child_process');
-      cp.execFile(process.execPath, [path.join(__dirname, 'test_web_bridge.js')], { timeout: 60000 }, (e, stdout, stderr) => {
-        if (e) return reject(new Error(stderr || stdout || e.message));
-        resolve();
-      });
-    })
-  );
-
-  await ok('diagnostic chat HTTP integration: isolated local server and offline transports', () =>
-    new Promise((resolve, reject) => {
-      const cp = require('child_process');
-      cp.execFile(process.execPath, [path.join(__dirname, 'test_diagnostics.js')], { timeout: 120000 }, (e, stdout, stderr) => {
-        if (e) return reject(new Error(stderr || stdout || e.message));
-        resolve();
-      });
-    })
-  );
-
-  await ok('cookie-extract unit: тесты scripts/extract_gemini_cookie.py (child process)', () =>
-    new Promise((resolve, reject) => {
-      const cp = require('child_process');
-      const py = process.platform === 'win32' ? 'python' : 'python3';
-      cp.execFile(py, [path.join(__dirname, 'test_cookie_extract.py')], { timeout: 60000 }, (e, stdout, stderr) => {
-        if (e) return reject(new Error(stderr || stdout || e.message));
-        resolve();
-      });
-    })
-  );
-
-  await ok('network unit: прокси, DoH, CONNECT, SOCKS5 (child process)', () =>
-    new Promise((resolve, reject) => {
-      const cp = require('child_process');
-      cp.execFile(process.execPath, [path.join(__dirname, 'test_net.js')], { timeout: 120000 }, (e, stdout, stderr) => {
-        if (e) return reject(new Error(stderr || stdout || e.message));
-        resolve();
-      });
-    })
-  );
-
-  await ok('cookie CDP unit: mock /json/version + WebSocket (child process)', () =>
-    new Promise((resolve, reject) => {
-      const cp = require('child_process');
-      const py = process.platform === 'win32' ? 'python' : 'python3';
-      cp.execFile(py, [path.join(__dirname, 'test_cookie_cdp.py')], { timeout: 60000 }, (e, stdout, stderr) => {
-        if (e) return reject(new Error(stderr || stdout || e.message));
-        resolve();
-      });
-    })
-  );
-
   await ok('model lists advertise cloud/ and web/ namespaced IDs', async () => {
     const r = await A('/v1/models');
     assert.strictEqual(r.status, 200, r.text);

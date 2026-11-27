@@ -10,10 +10,18 @@ cookie.txt
 ui_language.txt
 install_paths.json
 
-# Rolling backups of the files above (contain the same secrets)
+# Rolling and pre-update/consolidation backups (contain the same secrets)
 backups/
+_backups/
+*.bak
+*.tmp
+*.corrupt
 # Interrupted atomic writes (.config.json.<pid>.tmp etc.)
 .*.tmp
+
+# Local portable runtime & distribution builds
+runtime/
+dist/
 
 # Local agent sandbox, audit trail and tool state
 agent_workspace/
@@ -28,7 +36,7 @@ antigravity-api.log
 # Dependencies
 node_modules/
 
-# Python cache & virtual environments
+# Python cache & virtual environments (legacy cleanup)
 __pycache__/
 *.py[cod]
 *$py.class

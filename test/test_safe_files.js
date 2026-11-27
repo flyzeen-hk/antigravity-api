@@ -81,22 +81,19 @@ const KEY_B = 'agk_' + 'b'.repeat(48);
   });
 
   if (process.platform === 'win32') {
-    await test('writeFileAtomic: файл открыт другим процессом (Python) — данные всё равно записаны', async () => {
+    await test('writeFileAtomic: файл открыт другим процессом (Node) — данные всё равно записаны', async () => {
       const dir = tmpDir();
       const file = path.join(dir, 'config.json');
       fs.writeFileSync(file, '{"old":true}');
-      const holder = spawn('python', ['-c',
-        'import sys,time\nf=open(sys.argv[1],"rb")\nprint("ready",flush=True)\ntime.sleep(2.5)\n', file]);
+      const holder = spawn(process.execPath, ['-e',
+        'const fs=require("fs");const fd=fs.openSync(process.argv[1],"r");console.log("ready");setTimeout(()=>{try{fs.closeSync(fd);}catch{}},2500);', file]);
       const ready = await new Promise((resolve) => {
         let out = '';
         holder.stdout.on('data', (d) => { out += d; if (out.includes('ready')) resolve(true); });
         holder.on('error', () => resolve(false));
         holder.on('exit', () => resolve(false));
       });
-      if (!ready) {
-        console.log('       (python недоступен — проверка пропущена)');
-        return;
-      }
+      assert.strictEqual(ready, true, 'Node lock-holder process failed to start');
       try {
         writeFileAtomic(file, '{"new":true}');
         assert.deepStrictEqual(readJsonFile(file), { new: true });
@@ -313,7 +310,7 @@ const KEY_B = 'agk_' + 'b'.repeat(48);
   });
 
   // Node 24 на Windows: fs.rmSync молча ничего не делает, если в пути есть
-  // не-ASCII символы (C:\Users\максим\...). removeTree должен работать и так.
+  // не-ASCII символы (C:\Users\<user>\...). removeTree должен работать и так.
   const cyrDir = () => {
     const dir = path.join(tmpDir(), 'кириллица', 'вложенная-папка');
     fs.mkdirSync(dir, { recursive: true });

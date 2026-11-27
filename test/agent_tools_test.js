@@ -266,7 +266,7 @@ const ex = createExecutor({ workspaceRoot: tmp, auditFile: path.join(projectDir,
   ok(/must be RELATIVE/.test(sysSandbox), 'промпт без флага требует относительные пути');
 
   // Рекурсивное удаление: раньше fs.rmSync в Node 24 на пути с кириллицей
-  // (C:\Users\максим\...) молча ничего не удалял, а инструмент отвечал ok:true.
+  // (C:\Users\<user>\...) молча ничего не удалял, а инструмент отвечал ok:true.
   const delRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-agent-del-'));
   const delAudit = path.join(os.tmpdir(), `ag-agent-del-audit-${process.pid}.jsonl`);
   const exDel = createExecutor({ workspaceRoot: delRoot, allowDelete: true, auditFile: delAudit }, delRoot);

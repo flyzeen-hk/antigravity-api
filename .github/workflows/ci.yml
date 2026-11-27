@@ -2,50 +2,25 @@ name: CI
 
 on:
   push:
-    branches: [main, feat/v1.2]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 jobs:
-  node:
+  test:
     name: node ${{ matrix.node }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # 18 — минимальная поддерживаемая версия из package.json engines.
-        node: [18, 20, 22]
-        os: [ubuntu-latest]
-        include:
-          - node: 22
-            os: windows-latest
-          - node: 22
-            os: macos-latest
+        node: [20, 22]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      # Зависимостей нет: npm install нужен только для package-lock/engines.
       - run: node --version
-      - run: node test/all.js
+      - run: npm run check:privacy
+      - run: npm test
         timeout-minutes: 10
-
-  python:
-    name: panel tests (python ${{ matrix.python }})
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.10", "3.12"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      # Панель — Tkinter; в ubuntu-образе нужен python3-tk и виртуальный экран.
-      - run: sudo apt-get update && sudo apt-get install -y python3-tk xvfb
-      - run: python -m compileall -q app.py window_guard.py scripts test
-      - run: xvfb-run -a python test/test_app_config.py
-      - run: python test/test_cookie_extract.py
-      - run: python test/test_cookie_cdp.py

@@ -1,28 +1,22 @@
-# Antigravity API — локальный шлюз в контейнере.
+# Antigravity API — local gateway & offline Web Control Panel container.
 #
-# cloud/* модели требуют auth.json (OAuth-токены) — монтируйте его с хоста,
-# внутри контейнера OAuth-браузер пройти нельзя.
-# Только веб-модели: запустите с AG_NO_CLOUD=1 — auth.json не нужен, cloud/*
-# отключаются, в /v1/models остаются web/*.
+# cloud/* models require auth.json (OAuth tokens) — mount ./data from host.
+# Web-only mode: set AG_NO_CLOUD=1 (auth.json not required, only web/* models).
 FROM node:22-alpine
 
-# curl нужен для healthcheck, tini — чтобы SIGTERM доходил до node.
 RUN apk add --no-cache curl tini
 
 WORKDIR /app
 
-# Зависимостей нет — копируем только код (см. .dockerignore: секреты
-# auth.json/apikey.txt/cookie.txt/config.json в образ не попадают).
-COPY package.json ./
-COPY server.js ./
+COPY package.json server.js README.md ./
 COPY lib ./lib
-COPY README.md ./
+COPY public ./public
+COPY assets ./assets
+COPY scripts ./scripts
 
-# Непривилегированный пользователь: контейнер не должен работать от root.
 RUN mkdir -p /data && chown -R node:node /app /data
 USER node
 
-# Каталог для изменяемых файлов (config.json, usage.json, backups/).
 ENV AG_DATA_DIR=/data \
     AG_HOST=0.0.0.0 \
     AG_PORT=8317 \
