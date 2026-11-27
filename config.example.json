@@ -30,6 +30,7 @@
   "retries": 2,
   "theme": "dark",
   "language": "ru",
+  "autoStartServer": false,
   "geminiWeb": {
     "enabled": true,
     "cookie": "",

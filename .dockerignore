@@ -17,6 +17,9 @@ apikey.txt
 admin.key
 cookie.txt
 cookies.txt
+cookie*.txt
+*.cookie
+.ag-theme
 config.json
 usage.json
 install_paths.json

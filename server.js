@@ -105,20 +105,26 @@ function readKeyFile(file) {
 //   adminKey — то, что защищает /_* и HTML-дашборд. Клиентам НЕ выдаётся:
 //              иначе один ключ позволяет переписать proxy/config (а через proxy
 //              увести OAuth-токен Google для cloud-пути).
+function writePrivateFileAtomic(file, content) {
+  backupFile(file);
+  writeFileAtomic(file, content);
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(file, 0o600); } catch {}
+  }
+}
+
 function ensureAdminKey(root, config) {
   const file = path.join(root, ADMIN_KEY_FILE);
   const kept = readKeyFile(file);
   if (!config.adminKey) config.adminKey = kept.length >= 16 ? kept : newAdminKey();
   if (kept !== config.adminKey) {
-    backupFile(file);
-    writeFileAtomic(file, config.adminKey + '\n');
+    writePrivateFileAtomic(file, config.adminKey + '\n');
   }
   return config;
 }
 
 function persistConfig(file, config) {
-  backupFile(file);
-  writeFileAtomic(file, JSON.stringify(config, null, 2));
+  writePrivateFileAtomic(file, JSON.stringify(config, null, 2));
 }
 
 // Порт/адрес из окружения действуют только на текущий запуск и НЕ попадают в
@@ -143,10 +149,9 @@ function loadConfig(root = ROOT) {
     const kept = readKeyFile(keyFile);
     const { config } = configLib.normalize({ apiKey: kept.length >= 16 ? kept : newApiKey() });
     ensureAdminKey(root, config);
-    writeFileAtomic(file, JSON.stringify(config, null, 2));
+    writePrivateFileAtomic(file, JSON.stringify(config, null, 2));
     if (kept !== config.apiKey) {
-      backupFile(keyFile);
-      writeFileAtomic(keyFile, config.apiKey + '\n');
+      writePrivateFileAtomic(keyFile, config.apiKey + '\n');
     }
     return { config, created: true, warnings: [] };
   }
@@ -183,8 +188,7 @@ function loadConfig(root = ROOT) {
   if (dirty) persistConfig(file, config);
 
   if (readKeyFile(keyFile) !== config.apiKey) {
-    backupFile(keyFile);
-    writeFileAtomic(keyFile, config.apiKey + '\n');
+    writePrivateFileAtomic(keyFile, config.apiKey + '\n');
   }
   return { config, created: false, warnings };
 }
@@ -823,9 +827,23 @@ function start(config) {
     return out;
   }
 
+  function isSameOriginAsHost(req) {
+    const origin = req.headers.origin;
+    if (!origin) return true; // non-browser CLI/test or same-origin GET
+    if (origin === 'null') return false;
+    try {
+      const u = new URL(String(origin).trim());
+      return u.host.toLowerCase() === String(req.headers.host || '').trim().toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+
   function sessionOk(req) {
     const sid = parseCookies(req).ag_admin_session;
     if (!sid) return false;
+    // Block cross-origin / cross-port CSRF against session cookies
+    if (!isSameOriginAsHost(req)) return false;
     const exp = adminSessions.get(sid);
     if (!exp) return false;
     if (exp < Date.now()) {
@@ -2323,6 +2341,16 @@ function start(config) {
     return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(String(origin || '').trim());
   }
 
+  function isLoopbackHostHeader(hostHdr) {
+    if (!hostHdr) return true;
+    return /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(String(hostHdr).trim());
+  }
+
+  function isBoundToLoopback() {
+    const h = String(envListen(config).host || '127.0.0.1').trim().toLowerCase();
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+  }
+
   function applyCors(req, res) {
     const origin = req.headers.origin;
     if (!origin) return;
@@ -2330,12 +2358,19 @@ function start(config) {
     if (corsCfg.enabled === false) return;
     const normalized = String(origin).trim().replace(/\/+$/, '');
     const allowedList = Array.isArray(corsCfg.origins) ? corsCfg.origins : [];
-    const explicitlyAllowed = isLoopbackOrigin(normalized) || allowedList.includes(normalized);
+    const inAllowList = allowedList.includes(normalized);
+    const sameHost = isSameOriginAsHost(req);
+    const loopbackAllowed = isLoopbackOrigin(normalized);
 
-    if (explicitlyAllowed) {
+    if (sameHost || inAllowList) {
       res.setHeader('access-control-allow-origin', origin);
       res.setHeader('vary', 'origin');
       res.setHeader('access-control-allow-credentials', 'true');
+    } else if (loopbackAllowed) {
+      // Allow Bearer-token API clients on other localhost ports (Open WebUI, LibreChat),
+      // WITHOUT exposing admin session cookies across ports.
+      res.setHeader('access-control-allow-origin', origin);
+      res.setHeader('vary', 'origin');
     } else if (corsCfg.allowAnyOrigin === true) {
       res.setHeader('access-control-allow-origin', '*');
       res.setHeader('vary', 'origin');
@@ -2343,7 +2378,7 @@ function start(config) {
       return;
     }
     res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
-    res.setHeader('access-control-allow-headers', (req.headers['access-control-request-headers'] || 'authorization,content-type,x-api-key,x-goog-api-key,x-admin-key,anthropic-version,anthropic-beta').slice(0, 1024));
+    res.setHeader('access-control-allow-headers', (req.headers['access-control-request-headers'] || 'authorization,content-type,x-api-key,x-goog-api-key,x-admin-key,x-ag-ui,anthropic-version,anthropic-beta').slice(0, 1024));
     res.setHeader('access-control-max-age', '600');
   }
 
@@ -2399,6 +2434,9 @@ function start(config) {
 
   async function handler(req, res) {
     let p = req.url;
+    if (isBoundToLoopback() && !isLoopbackHostHeader(req.headers.host)) {
+      return forbidden(res, 'invalid_host', 'Loopback gateway rejects non-local Host headers (DNS rebinding protection).');
+    }
     applyCors(req, res);
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -3126,12 +3164,38 @@ function main() {
   const { config, created } = loaded;
   config.userAgent = resolveCloudCodeUserAgent(config.userAgent);
 
-  if (cmd === 'key') {
+  if (cmd === '--version' || cmd === '-v') {
+    console.log(APP_VERSION);
+    return;
+  }
+
+  if (cmd === '--help' || cmd === '-h' || cmd === 'help') {
+    console.log([
+      `Antigravity API v${APP_VERSION}`,
+      'Usage: node server.js [command]',
+      '',
+      'Commands:',
+      '  start             Start HTTP API gateway and Control Panel (default)',
+      '  key               Print client API key (apikey.txt)',
+      '  admin-key         Print administrator key (admin.key)',
+      '  models            List live Cloud Code models for configured account',
+      '  --version, -v     Print version',
+      '  --help, -h        Show this help',
+    ].join('\n'));
+    return;
+  }
+
+  if (cmd === 'key' || cmd === '--print-key') {
     console.log(config.apiKey);
     return;
   }
 
-  if (cmd === 'models') {
+  if (cmd === 'admin-key' || cmd === '--print-admin-key') {
+    console.log(config.adminKey);
+    return;
+  }
+
+  if (cmd === 'models' || cmd === '--models') {
     const authFile = process.env.AG_AUTH_FILE || path.join(DATA_DIR, 'auth.json');
     const network = new NetworkManager(config);
     const run = async () => {

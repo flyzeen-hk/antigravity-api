@@ -129,14 +129,15 @@ AG_NO_CLOUD=1 docker compose up -d    # only web models, no Antigravity session
 3. Overview shows **live SSE request telemetry**, **5h & Weekly Cloud Code quota gauges with countdowns**, **Usage charts**, detected programs, and backups.
 4. Use the **Connection** tab to copy Base URLs, API key, and client snippets.
 
-Two files appear next to the program on first run and are **never committed**:
+Three files appear next to the program on first run and are **never committed**:
 
 | File | Contents |
 |---|---|
 | `config.json` | settings, including the web-bridge cookie if you paste one |
-| `apikey.txt` | the generated local API key |
+| `apikey.txt` | the generated client API key (for `/v1/*` and `/v1beta/*`) |
+| `admin.key` | the generated administrator key (for the Web Control Panel and `/_config`) |
 
-If the key is lost, read it from `apikey.txt` or run `node server.js key`.
+If a key is lost, read it from `apikey.txt` / `admin.key` or run `npm run key` / `npm run admin-key`.
 
 ---
 
@@ -203,13 +204,6 @@ origin, so browser clients (Open WebUI, LibreChat, your own page) can call the g
 | POST | `/v1beta/models/{m}:streamGenerateContent` | Add `?alt=sse` for SSE framing |
 | POST | `/v1beta/models/{m}:countTokens` | For `web/` models this is a local estimate, not a Google call |
 | GET | `/v1beta/models/{m}` | Model metadata |
-
-### Anthropic-compatible
-
-| Method | Path | Notes |
-|---|---|---|
-| POST | `/v1/messages` | Claude-style body (`messages`, `system`, `max_tokens`); streaming and tools supported |
-| POST | `/v1/messages/count_tokens` | Token estimate for the same body shape |
 
 ### Local
 
@@ -355,14 +349,10 @@ All six route to the same `modelId` with two thinking depths, so the difference 
 
 ### Enabling
 
-**Settings & Limits → Gemini 4 Unlock**, then:
+Open the **Gemini Web** tab in the Control Panel:
 
-1. Sign in at `gemini.google.com`.
-2. Open DevTools → Network, pick any request to `gemini.google.com`.
-3. Copy the entire **Cookie** request header — it must contain `SAPISID`.
-4. Paste it into the field and save. Changes apply to the running server immediately.
-
-A `cookie.txt` next to the program works too. There are no automatic extraction buttons by design.
+1. **1-click via dedicated browser (CDP):** optionally enter a proxy (`http://` or `socks5://`) if `gemini.google.com` requires one in your region, click **Open Gemini Browser**, sign in to Google, and click **Import Cookies (CDP)**.
+2. **Or manual paste / `cookie.txt`:** open DevTools → Network on `gemini.google.com`, copy the `Cookie` request header (must contain `SAPISID`), and paste it into the field or save it to `cookie.txt` next to the program. Changes apply immediately.
 
 Without a cookie the bridge still starts and the models are listed, but requests are made anonymously and Google usually downgrades or refuses them. `GET /_config` reports `cookieSet: false` in that state.
 
@@ -505,6 +495,8 @@ node test/test_safe_files.js        # atomic writes and backups
 node test/test_net.js               # proxy, DNS, timeouts
 node test/test_providers.js         # namespace parsing
 node test/test_planner.js           # planner limits and timeout
+node test/test_oauth.js             # Google OAuth PKCE & default browser launch
+node test/test_supervisor.js        # UI supervisor lifecycle, theme icons & security
 ```
 
 ---
@@ -595,14 +587,15 @@ AG_NO_CLOUD=1 docker compose up -d    # только веб-модели, без
 2. Войдите по ключу из `admin.key` (при запуске через лаунчер вход выполняется автоматически по одноразовому nonce).
 3. На вкладке **Обзор** доступны живой поток запросов по SSE, датчики квот 5h/Weekly с таймером сброса, графики истории и менеджер бэкапов; во вкладке **Подключение** — URL, ключи и готовые сниппеты.
 
-При первом запуске рядом с программой появляются два файла, которые **никогда не коммитятся**:
+При первом запуске рядом с программой появляются три файла, которые **никогда не коммитятся**:
 
 | Файл | Что внутри |
 |---|---|
 | `config.json` | настройки, включая куки веб-моста, если вы её вставили |
-| `apikey.txt` | сгенерированный локальный API-ключ |
+| `apikey.txt` | сгенерированный клиентский API-ключ (для `/v1/*` и `/v1beta/*`) |
+| `admin.key` | сгенерированный ключ администратора (для веб-панели и `/_config`) |
 
-Ключ можно посмотреть в `apikey.txt` или командой `node server.js key`.
+Ключи можно посмотреть в `apikey.txt` / `admin.key` или командами `npm run key` и `npm run admin-key`.
 
 ## Пространства имён моделей
 
@@ -645,7 +638,7 @@ AG_NO_CLOUD=1 docker compose up -d    # только веб-модели, без
 **Поведение ошибок, которое стоит знать:**
 
 - **Валидация локальная.** Нет `model` или пустой `messages` — `400` без обращения к Google.
-- **Тело больше 64 МБ → `413 body_too_large`**, соединение закрывается, а не вычитывается до конца.
+- **Тело больше 16 МБ (`AG_MAX_BODY_BYTES`) → `413 body_too_large`**, проверка идёт по `content-length` до чтения тела, а потоковые тела аккуратно сбрасываются.
 - **Отключение клиента отменяет запрос к Google** и пишется в журнал как `499`, а не как ошибка сервера.
 - **Промпт, заблокированный Google**, возвращается нормально с `finish_reason: content_filter` и `promptFeedback`, а не 500.
 - **Региональные блокировки** приходят как `region_not_supported` / `LOCATION_REJECTED 1060`. Это про выходной IP, а не про аккаунт или куки.
@@ -726,7 +719,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 
 Все шесть идут в один и тот же `modelId` с двумя глубинами мышления, поэтому разница между «Argon» и «Pro» — это название, а не отдельная модель.
 
-**Включение:** **Settings & Limits → Gemini 4 Unlock**, затем войти на `gemini.google.com`, открыть DevTools → Network, выбрать любой запрос к `gemini.google.com`, скопировать заголовок **Cookie** целиком (в нём должен быть `SAPISID`), вставить в поле и сохранить. Настройки применяются к работающему серверу сразу. Подойдёт и файл `cookie.txt` рядом с программой. Автоматических кнопок извлечения нет — так задумано.
+**Включение:** откройте вкладку **Gemini Web** в панели управления: можно задать прокси (`http://` или `socks5://`), нажать **Открыть Gemini в браузере**, войти в аккаунт Google и нажать **Импорт cookie (CDP)** — либо скопировать заголовок **Cookie** (с `SAPISID`) из DevTools / положить в `cookie.txt` рядом с программой. Настройки применяются сразу.
 
 Без куки мост всё равно запускается и модели видны в списке, но запросы идут анонимно, и Google обычно их понижает или отклоняет. `GET /_config` в этом случае показывает `cookieSet: false`.
 
@@ -836,4 +829,6 @@ node test/test_safe_files.js        # атомарная запись и бэк�
 node test/test_net.js               # прокси, DNS, таймауты
 node test/test_providers.js         # разбор пространств имён
 node test/test_planner.js           # лимиты и таймаут планировщика
+node test/test_oauth.js             # Google OAuth PKCE и открытие системного браузера
+node test/test_supervisor.js        # UI-супервизор, жизненный цикл, темы и защита сессии
 ```

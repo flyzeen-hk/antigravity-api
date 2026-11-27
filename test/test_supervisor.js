@@ -65,15 +65,12 @@ async function main() {
   process.env.AG_DATA_DIR = tmpDir;
   process.env.AG_NO_CLOUD = '1';
 
-  fs.writeFileSync(path.join(tmpDir, 'admin.key'), 'sup_admin_secret_123');
-  fs.writeFileSync(path.join(tmpDir, 'apikey.txt'), 'sup_api_secret_123');
+  // Simulate fresh clone without pre-existing apikey.txt / admin.key
   fs.writeFileSync(path.join(tmpDir, 'config.json'), JSON.stringify({
     configVersion: 2,
     port: gatewayPort,
     host: '127.0.0.1',
     autoStartServer: false,
-    apiKey: 'sup_api_secret_123',
-    adminKey: 'sup_admin_secret_123',
   }, null, 2));
 
   const { startSupervisor } = require('../scripts/ui_supervisor');
@@ -93,6 +90,23 @@ async function main() {
 
     const unauth = await request(`${base}/_supervisor/status`);
     ok(unauth.status === 401, 'unauthenticated /_supervisor/status returns 401');
+
+    // Fresh-clone key auto-bootstrap checks
+    const genApiKey = fs.readFileSync(path.join(tmpDir, 'apikey.txt'), 'utf8').trim();
+    const genAdminKey = fs.readFileSync(path.join(tmpDir, 'admin.key'), 'utf8').trim();
+    ok(/^agk_[0-9a-f]{48}$/.test(genApiKey) && /^agadm_[0-9a-f]{48}$/.test(genAdminKey), 'fresh supervisor boot generates apikey.txt and admin.key');
+
+    const manualLogin = await request(`${base}/_auth/session`, {
+      method: 'POST',
+      body: { adminKey: genAdminKey },
+    });
+    ok(manualLogin.status === 200 && manualLogin.json?.ok === true, 'POST /_auth/session succeeds with generated admin.key before gateway start');
+
+    // DNS rebinding Host check on supervisor
+    const rebindSup = await request(`${base}/_supervisor/health`, {
+      headers: { host: 'evil-rebind.example' },
+    });
+    ok(rebindSup.status === 403, 'supervisor blocks non-loopback Host header (DNS rebinding defense)');
 
     const nonceRes = await request(`${base}/_supervisor/nonce`, {
       method: 'POST',
@@ -117,6 +131,11 @@ async function main() {
     }
     const statusOff = await request(`${base}/_status`, { headers });
     ok(statusOff.json?.supervised === true && statusOff.json?.serverRunning === false, '/_status reports supervised=true serverRunning=false offline');
+
+    const crossPortSup = await request(`${base}/_keys`, {
+      headers: { cookie: sessionCookie, origin: 'http://127.0.0.1:3000' },
+    });
+    ok(crossPortSup.status === 401, 'supervisor rejects session cookie from different localhost port (CSRF defense)');
 
     const darkSvg = await request(`${base}/icon-dark.svg`);
     const lightSvg = await request(`${base}/icon-light.svg`);
@@ -151,6 +170,36 @@ async function main() {
 
     const gwHealth = await request(`http://127.0.0.1:${gatewayPort}/_health`);
     ok(gwHealth.status === 200 && gwHealth.json?.ok === true, 'started gateway responds directly on configured port');
+
+    const rebindGw = await request(`http://127.0.0.1:${gatewayPort}/_health`, {
+      headers: { host: 'evil-rebind.example' },
+    });
+    ok(rebindGw.status === 403, 'gateway blocks non-loopback Host header when bound to loopback');
+
+    const corsBearer = await request(`http://127.0.0.1:${gatewayPort}/v1/models`, {
+      headers: { origin: 'http://127.0.0.1:3000', authorization: `Bearer ${genApiKey}` },
+    });
+    ok(
+      corsBearer.status === 200
+      && corsBearer.headers['access-control-allow-origin'] === 'http://127.0.0.1:3000'
+      && !corsBearer.headers['access-control-allow-credentials'],
+      'cross-port Bearer CORS works without exposing Allow-Credentials'
+    );
+
+    const { execFileSync } = require('child_process');
+    const cliKey = execFileSync(process.execPath, [path.join(__dirname, '..', 'server.js'), 'key'], {
+      env: { ...process.env, AG_DATA_DIR: tmpDir },
+      encoding: 'utf8',
+    }).trim();
+    const cliKeyFlag = execFileSync(process.execPath, [path.join(__dirname, '..', 'server.js'), '--print-key'], {
+      env: { ...process.env, AG_DATA_DIR: tmpDir },
+      encoding: 'utf8',
+    }).trim();
+    const cliAdmin = execFileSync(process.execPath, [path.join(__dirname, '..', 'server.js'), 'admin-key'], {
+      env: { ...process.env, AG_DATA_DIR: tmpDir },
+      encoding: 'utf8',
+    }).trim();
+    ok(cliKey === genApiKey && cliKeyFlag === genApiKey && cliAdmin === genAdminKey, 'server.js CLI key / --print-key / admin-key return initialized keys');
 
     const statusRun = await request(`${base}/_status`, { headers });
     ok(statusRun.status === 200 && statusRun.json?.port === gatewayPort && statusRun.json?.serverRunning !== false, 'proxied /_status responds from live gateway');

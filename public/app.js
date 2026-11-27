@@ -91,7 +91,7 @@
     const opts = {
       method,
       credentials: 'same-origin',
-      headers: { ...extraHeaders },
+      headers: { 'x-ag-ui': '1', ...extraHeaders },
     };
     if (body !== undefined) {
       opts.headers['content-type'] = 'application/json';
@@ -302,7 +302,7 @@
         const lockedN = (snap.planLocked && snap.planLocked.length) || 0;
         const liveCloud = (snap.active && snap.active.length) || 0;
         showToast(
-          `Каталог обновлён: ${liveCloud} cloud, новых +${addedN}, убрано ${remN}, по тарифу ${lockedN}`,
+          t('toast.catalogUpdated', { cloud: liveCloud, added: addedN, removed: remN, locked: lockedN }),
           addedN > 0 ? 'ok' : 'info'
         );
       }
@@ -388,7 +388,7 @@
       state.limits = await api('GET', `/_limits${force ? '?force=1' : ''}`);
       renderLimitsAndAuth();
       renderModelAndChatBanners();
-      if (force) showToast('Квоты обновлены с сервера Google', 'ok');
+      if (force) showToast(t('toast.quotasRefreshed'), 'ok');
     } catch (e) {
       if (force) showToast(e.message, 'err');
     }
@@ -541,17 +541,25 @@
       state.dirtyTabs.add(tab);
     }
     if (state.status) {
-      $('sidebar-version').textContent = `v${state.status.version || '2.0.0'}`;
+      $('sidebar-version').textContent = `v${state.status.version || '2.1.0'}`;
       $('sidebar-listen').textContent = `${state.status.host || '127.0.0.1'}:${state.status.port || 8317}`;
       $('sidebar-node').textContent = state.status.nodeVersion || '—';
     }
     renderTab(state.activeTab);
   }
 
+  function cleanTokenEmail(rawEmail) {
+    return rawEmail && rawEmail !== '(не указан)' ? rawEmail : '';
+  }
+
+  function cleanProjectId(rawProj) {
+    return rawProj && rawProj !== '(авто)' ? rawProj : '';
+  }
+
   function renderOverviewKpis() {
     const s = state.status;
     if (!s) return;
-    $('sidebar-version').textContent = `v${s.version || '2.0.0'}`;
+    $('sidebar-version').textContent = `v${s.version || '2.1.0'}`;
     $('sidebar-listen').textContent = `${s.host || '127.0.0.1'}:${s.port || 8317}`;
     $('sidebar-node').textContent = s.nodeVersion || '—';
     $('topbar-uptime').textContent = state.serverState === 'running' ? formatUptime(s.uptime || 0) : '—';
@@ -570,9 +578,7 @@
       $('kpi-cloud-sub').textContent = 'AG_NO_CLOUD=1';
     } else if (s.cloudAuthReady && s.tokens && s.tokens.configured) {
       $('kpi-cloud-status').innerHTML = `<span class="badge badge-ok">${esc(t('overview.cloudActive'))}</span>`;
-      $('kpi-cloud-sub').textContent = s.tokens.email || s.tokens.projectId || t('overview.tokenExpires', {
-        sec: s.tokens.accessTokenValidForSec || 0, ref: s.tokenRefreshes || 0,
-      });
+      $('kpi-cloud-sub').textContent = cleanTokenEmail(s.tokens.email) || cleanProjectId(s.tokens.projectId) || 'auth.json OK';
     } else {
       $('kpi-cloud-status').innerHTML = `<span class="badge badge-neutral">${esc(t('overview.cloudMissing'))}</span>`;
       $('kpi-cloud-sub').textContent = 'Web-Only';
@@ -592,20 +598,21 @@
 
     const acc = l && l.account;
     const metaEl = $('cloud-account-meta');
+    const tokEmail = state.status && state.status.tokens ? cleanTokenEmail(state.status.tokens.email) : '';
     if (state.serverState !== 'running') {
       metaEl.textContent = state.status && state.status.tokens && state.status.tokens.configured
-        ? `auth.json OK · ${state.status.tokens.email || t('status.stopped')}`
+        ? `auth.json OK · ${tokEmail || t('status.stopped')}`
         : t('status.stopped');
     } else if (acc && !acc.error) {
       const parts = [
-        acc.email || (state.status && state.status.tokens && state.status.tokens.email !== '(не указан)' ? state.status.tokens.email : ''),
+        acc.email || tokEmail,
         acc.tierId ? `${acc.tier || 'Tier'} (${acc.tierId})` : acc.tier,
         acc.region,
         acc.project ? `project: ${acc.project}` : '',
       ].filter(Boolean);
       metaEl.textContent = parts.join(' · ') || '—';
     } else if (state.status && state.status.tokens && state.status.tokens.configured) {
-      metaEl.textContent = `${state.status.tokens.email || 'OAuth'} · ${t('overview.tokenExpires', {
+      metaEl.textContent = `${tokEmail || 'OAuth'} · ${t('overview.tokenExpires', {
         sec: state.status.tokens.accessTokenValidForSec || 0, ref: state.status.tokenRefreshes || 0,
       })}`;
     } else {
@@ -931,7 +938,7 @@
       const vals = Object.values(res.results || {});
       const okN = vals.filter((x) => x && x.status === 'working').length;
       const failN = vals.length - okN;
-      showToast(`Проверено моделей: ${vals.length} (работают: ${okN}, проблемы/удалены: ${failN})`, failN ? 'warn' : 'ok');
+      showToast(t('toast.modelsChecked', { total: vals.length, ok: okN, fail: failN }), failN ? 'warn' : 'ok');
     } catch (e) {
       showToast(e.message, 'err');
     } finally {
@@ -1044,7 +1051,7 @@
       btn.addEventListener('click', async () => {
         try {
           await api('POST', '/_models/custom', { action: 'remove', model: btn.dataset.id });
-          showToast('Пользовательская модель удалена', 'ok');
+          showToast(t('toast.customModelRemoved'), 'ok');
           await refreshModels();
         } catch (e) {
           showToast(e.message, 'err');
@@ -1681,13 +1688,13 @@
     $('btn-save-custom-model').addEventListener('click', async () => {
       const model = $('custom-model-id').value.trim();
       const displayName = $('custom-model-name').value.trim();
-      if (!model) { showToast('Укажите ID модели', 'warn'); return; }
+      if (!model) { showToast(t('toast.enterModelId'), 'warn'); return; }
       try {
         await api('POST', '/_models/custom', { action: 'add', model, displayName });
         $('custom-model-id').value = '';
         $('custom-model-name').value = '';
         $('add-custom-model-bar').classList.add('hidden');
-        showToast(`Добавлена модель cloud/${model.replace(/^cloud\//i, '')}`, 'ok');
+        showToast(t('toast.customModelAdded', { id: `cloud/${model.replace(/^cloud\//i, '')}` }), 'ok');
         await refreshModels();
       } catch (e) {
         showToast(e.message, 'err');
@@ -1711,11 +1718,11 @@
     const startGoogleOAuthAction = async () => {
       try {
         const res = await api('POST', '/_auth/oauth/start', { openBrowser: true });
-        if (!res || !res.ok || !res.authUrl) throw new Error('Не удалось запустить Google OAuth');
+        if (!res || !res.ok || !res.authUrl) throw new Error(t('toast.oauthFailed'));
         pendingOAuthUrl = res.authUrl;
         if (oauthLink) oauthLink.href = pendingOAuthUrl;
         if (oauthBox) oauthBox.classList.remove('hidden');
-        showToast('Открыт браузер для входа в Google. Выберите аккаунт с подпиской.', 'info');
+        showToast(t('toast.oauthOpened'), 'info');
         if (state.oauthPollTimer) clearInterval(state.oauthPollTimer);
         state.oauthPollTimer = setInterval(async () => {
           try {
@@ -1724,14 +1731,14 @@
               clearInterval(state.oauthPollTimer);
               state.oauthPollTimer = null;
               if (oauthBox) oauthBox.classList.add('hidden');
-              showToast(`Аккаунт подключён: ${st.email || 'Google OAuth'}`, 'ok');
+              showToast(t('toast.oauthConnected', { email: st.email || 'Google OAuth' }), 'ok');
               await loadAllData();
               await Promise.all([refreshLimits({ force: true }), refreshModels({ force: true })]);
             } else if (st.status === 'error' || st.status === 'timeout') {
               clearInterval(state.oauthPollTimer);
               state.oauthPollTimer = null;
               if (oauthBox) oauthBox.classList.add('hidden');
-              showToast(st.error || 'Вход отменён', 'err');
+              showToast(st.error || t('toast.oauthCancelled'), 'err');
             }
           } catch {}
         }, 1500);
@@ -1806,7 +1813,7 @@
         const res = await api('POST', '/_network/detect-proxy', {});
         const proxies = res.proxies || [];
         if (!proxies.length) {
-          wrap.innerHTML = '<span class="muted">Локальный прокси/VPN не найден. Укажите URL прокси вручную (http:// или socks5://) или включите системный VPN.</span>';
+          wrap.innerHTML = `<span class="muted">${esc(t('toast.noLocalProxy'))}</span>`;
           wrap.classList.remove('hidden');
           return;
         }
@@ -1818,7 +1825,7 @@
         for (const btn of wrap.querySelectorAll('.pill[data-proxy]')) {
           btn.addEventListener('click', () => {
             $('web-proxy-input').value = btn.dataset.proxy;
-            showToast('Прокси подставлен в поле Gemini Web', 'info');
+            showToast(t('toast.proxyFilled'), 'info');
           });
         }
       } catch (e) {
@@ -1829,23 +1836,23 @@
     $('btn-web-test-proxy').addEventListener('click', async () => {
       const box = $('web-test-result');
       box.classList.remove('hidden');
-      box.textContent = 'Проверка доступа к gemini.google.com и accounts.google.com…';
+      box.textContent = t('toast.testingGeminiWeb');
       try {
         const proxy = $('web-proxy-input').value.trim();
         const res = await api('POST', '/_web/test', { proxy });
         const parts = [];
         if (res.proxyCheck) {
-          parts.push(`<span class="badge ${res.proxyCheck.ok ? 'badge-ok' : 'badge-err'}">Proxy: ${res.proxyCheck.ok ? `OK (${res.proxyCheck.ms}ms)` : esc(res.proxyCheck.error || 'ERR')}</span>`);
+          parts.push(`<span class="badge ${res.proxyCheck.ok ? 'badge-ok' : 'badge-err'}">Proxy: ${res.proxyCheck.ok ? `OK (${Number(res.proxyCheck.ms) || 0}ms)` : esc(res.proxyCheck.error || 'ERR')}</span>`);
         }
         if (res.gemini) {
-          parts.push(`<span class="badge ${res.gemini.ok ? 'badge-ok' : 'badge-err'}">Gemini Web: ${res.gemini.ok ? `OK (${res.gemini.ms}ms, ${res.gemini.via})` : esc(res.gemini.error || 'ERR')}</span>`);
+          parts.push(`<span class="badge ${res.gemini.ok ? 'badge-ok' : 'badge-err'}">Gemini Web: ${res.gemini.ok ? `OK (${Number(res.gemini.ms) || 0}ms, ${esc(res.gemini.via || 'direct')})` : esc(res.gemini.error || 'ERR')}</span>`);
         }
         if (res.accounts) {
-          parts.push(`<span class="badge ${res.accounts.ok ? 'badge-ok' : 'badge-err'}">Google Login: ${res.accounts.ok ? `OK (${res.accounts.ms}ms, ${res.accounts.via})` : esc(res.accounts.error || 'ERR')}</span>`);
+          parts.push(`<span class="badge ${res.accounts.ok ? 'badge-ok' : 'badge-err'}">Google Login: ${res.accounts.ok ? `OK (${Number(res.accounts.ms) || 0}ms, ${esc(res.accounts.via || 'direct')})` : esc(res.accounts.error || 'ERR')}</span>`);
         }
         box.innerHTML = `<div class="badge-row">${parts.join(' ')}</div>`;
       } catch (e) {
-        box.textContent = `Ошибка теста: ${e.message}`;
+        box.textContent = t('toast.testError', { msg: e.message });
       }
     });
 
@@ -1853,8 +1860,11 @@
       try {
         const proxy = $('web-proxy-input').value.trim();
         const res = await api('POST', '/_web/browser/open', { proxy });
-        const proxyNote = res.proxy ? ` через ${res.proxy}` : '';
-        showToast(`Открыт браузер (${res.executable ? res.executable.split(/[\\/]/).pop() : 'CDP'})${proxyNote}`, 'ok');
+        const proxyNote = res.proxy ? t('toast.viaProxy', { proxy: res.proxy }) : '';
+        showToast(t('toast.browserOpened', {
+          exe: res.executable ? res.executable.split(/[\\/]/).pop() : 'CDP',
+          via: proxyNote,
+        }), 'ok');
       } catch (e) {
         showToast(e.message, 'err');
       }
@@ -2098,7 +2108,7 @@
         const res = await api('POST', '/_network/test', { timeout: 6000, network: draftNet });
         const routesHtml = (res.routes || []).map((info) => {
           const ok = info && info.ok;
-          return `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${esc(info.label || info.name)}: ${ok ? `OK (${info.ms}ms, ${info.via})` : esc(info && info.error ? info.error : 'ERR')}</span>`;
+          return `<span class="badge ${ok ? 'badge-ok' : 'badge-err'}">${esc(info.label || info.name)}: ${ok ? `OK (${Number(info.ms) || 0}ms, ${esc(info.via || 'direct')})` : esc(info && info.error ? info.error : 'ERR')}</span>`;
         }).join(' ');
         const proxyWarn = res.proxy && !res.proxy.ok ? `<span class="badge badge-err">Proxy: ${esc(res.proxy.error)}</span>` : '';
         box.innerHTML = `<div class="badge-row"><span>DNS: <code>${esc(res.dnsMode || 'system')}</code></span>${proxyWarn}${routesHtml}</div>`;

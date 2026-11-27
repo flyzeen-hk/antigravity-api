@@ -12,6 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const BASE_DIR = path.resolve(__dirname, '..');
 
@@ -22,8 +23,11 @@ const REQUIRED_GITIGNORE = [
   'config.json',
   'usage.json',
   'cookie.txt',
+  'cookies.txt',
   'agent_audit.jsonl',
   'install_paths.json',
+  'known_models.json',
+  '.ui-supervisor.json',
   'backups/',
   '_backups/',
   'runtime/',
@@ -37,9 +41,13 @@ const PRIVATE_FILES = new Set([
   'config.json',
   'usage.json',
   'cookie.txt',
+  'cookies.txt',
   'agent_audit.jsonl',
   'install_paths.json',
+  'known_models.json',
   'ui_language.txt',
+  '.ui-supervisor.json',
+  '.launcher.pid',
 ]);
 
 const SKIP_DIRS = new Set([
@@ -173,10 +181,41 @@ function scanSourceFiles(baseDir = BASE_DIR) {
   return { scanned, issues };
 }
 
+function checkTrackedAndLineEndings(baseDir = BASE_DIR) {
+  const issues = [];
+  if (fs.existsSync(path.join(baseDir, '.git'))) {
+    try {
+      const tracked = execFileSync('git', ['ls-files'], { cwd: baseDir, encoding: 'utf8', timeout: 5000 })
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const rel of tracked) {
+        const base = path.basename(rel);
+        if (PRIVATE_FILES.has(base) || /^cookie.*\.txt$/i.test(base) || /\.(env|bak|corrupt)$/i.test(base)) {
+          issues.push(`CRITICAL: Private/state file '${rel}' is tracked in Git index!`);
+        }
+      }
+    } catch {}
+  }
+
+  for (const rel of ['run.sh', 'install.sh', 'update.sh', 'scripts/bootstrap_node.sh', 'Dockerfile']) {
+    const p = path.join(baseDir, rel);
+    if (fs.existsSync(p)) {
+      const raw = fs.readFileSync(p);
+      if (raw.includes(0x0d)) {
+        issues.push(`File '${rel}' contains Windows CRLF (\\r\\n) line endings, which breaks Linux/macOS/Docker.`);
+      }
+    }
+  }
+  return issues;
+}
+
 function runAudit(baseDir = BASE_DIR) {
   const giIssues = checkGitignore(baseDir);
   const exIssues = checkExampleConfig(baseDir);
-  const { scanned, issues: srcIssues } = scanSourceFiles(baseDir);
+  const { scanned, issues: sIssues } = scanSourceFiles(baseDir);
+  const extraIssues = checkTrackedAndLineEndings(baseDir);
+  const srcIssues = [...sIssues, ...extraIssues];
   return {
     ok: giIssues.length === 0 && exIssues.length === 0 && srcIssues.length === 0,
     scanned,

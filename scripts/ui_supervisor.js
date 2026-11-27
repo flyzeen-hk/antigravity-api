@@ -44,24 +44,69 @@ const APP_VERSION = (() => {
   try { return String(require('../package.json').version || '2.0.0'); } catch { return '2.0.0'; }
 })();
 
+function writePrivateFile(filePath, content) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  try { if (fs.existsSync(filePath)) backupFile(filePath); } catch {}
+  writeFileAtomic(filePath, content);
+  if (process.platform !== 'win32') {
+    try { fs.chmodSync(filePath, 0o600); } catch {}
+  }
+}
+
+function readKeyFromFile(filePath) {
+  try {
+    const k = fs.readFileSync(filePath, 'utf8').replace(/^\uFEFF/, '').trim();
+    return /^\S+$/.test(k) ? k : '';
+  } catch {
+    return '';
+  }
+}
+
+function ensureDataInitialized() {
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const cfgPath = path.join(DATA_DIR, 'config.json');
+  const apiKeyPath = path.join(DATA_DIR, 'apikey.txt');
+  const adminKeyPath = path.join(DATA_DIR, 'admin.key');
+
+  let raw = {};
+  const hadCfg = fs.existsSync(cfgPath);
+  if (hadCfg) {
+    try { raw = readJsonFile(cfgPath); } catch { raw = {}; }
+  }
+  const { config: norm } = configLib.normalize(raw);
+  let dirtyCfg = !hadCfg;
+
+  const diskApi = readKeyFromFile(apiKeyPath);
+  if (!norm.apiKey) {
+    norm.apiKey = diskApi.length >= 16 ? diskApi : `agk_${crypto.randomBytes(24).toString('hex')}`;
+    dirtyCfg = true;
+  }
+  const diskAdmin = readKeyFromFile(adminKeyPath);
+  if (!norm.adminKey) {
+    norm.adminKey = diskAdmin.length >= 16 ? diskAdmin : `agadm_${crypto.randomBytes(24).toString('hex')}`;
+    dirtyCfg = true;
+  }
+
+  if (dirtyCfg) writePrivateFile(cfgPath, JSON.stringify(norm, null, 2));
+  if (diskApi !== norm.apiKey) writePrivateFile(apiKeyPath, `${norm.apiKey}\n`);
+  if (diskAdmin !== norm.adminKey) writePrivateFile(adminKeyPath, `${norm.adminKey}\n`);
+  return norm;
+}
+
 function readNormalizedConfig() {
   let raw = {};
   try { raw = readJsonFile(path.join(DATA_DIR, 'config.json')); } catch {}
   const norm = configLib.normalize(raw).config;
-  if (!norm.apiKey) {
-    try { norm.apiKey = fs.readFileSync(path.join(DATA_DIR, 'apikey.txt'), 'utf8').trim(); } catch {}
-  }
-  if (!norm.adminKey) {
-    try { norm.adminKey = fs.readFileSync(path.join(DATA_DIR, 'admin.key'), 'utf8').trim(); } catch {}
+  if (!norm.apiKey) norm.apiKey = readKeyFromFile(path.join(DATA_DIR, 'apikey.txt'));
+  if (!norm.adminKey) norm.adminKey = readKeyFromFile(path.join(DATA_DIR, 'admin.key'));
+  if (!norm.apiKey || !norm.adminKey) {
+    return ensureDataInitialized();
   }
   return norm;
 }
 
 function saveConfigDirect(cfg) {
-  const cfgPath = path.join(DATA_DIR, 'config.json');
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  try { if (fs.existsSync(cfgPath)) backupFile(cfgPath); } catch {}
-  writeFileAtomic(cfgPath, JSON.stringify(cfg, null, 2));
+  writePrivateFile(path.join(DATA_DIR, 'config.json'), JSON.stringify(cfg, null, 2));
 }
 
 function sanitizeConfig(cfg) {
@@ -173,20 +218,101 @@ function rotateLogIfLarge() {
   } catch {}
 }
 
+function timingSafeKeyEquals(a, b) {
+  const sa = String(a || '');
+  const sb = String(b || '');
+  if (!sa || !sb) return false;
+  const ha = crypto.createHash('sha256').update(sa).digest();
+  const hb = crypto.createHash('sha256').update(sb).digest();
+  return sa.length === sb.length && crypto.timingSafeEqual(ha, hb);
+}
+
+function isLoopbackHostHeader(hostHdr) {
+  if (!hostHdr) return true;
+  return /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(String(hostHdr).trim());
+}
+
+function isSameOriginAsHost(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  if (origin === 'null') return false;
+  try {
+    const u = new URL(String(origin).trim());
+    return u.host.toLowerCase() === String(req.headers.host || '').trim().toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
 async function startSupervisor({ autoStart = null } = {}) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-  const sessions = new Set();
+  const bootCfg = ensureDataInitialized();
+  const sessions = new Map(); // sid -> expiresAtMs
+  const authFails = new Map(); // ip -> { count, firstAt, blockedUntil }
+  const AUTH_FAIL = { maxFailures: 20, windowMs: 60_000, blockMs: 300_000 };
   const launchNonces = new Map();
   const sseClients = new Set();
   const supSecret = crypto.randomBytes(24).toString('hex');
+
+  function issueSession(res) {
+    const now = Date.now();
+    for (const [k, exp] of sessions) {
+      if (exp < now) sessions.delete(k);
+    }
+    while (sessions.size >= 100) {
+      sessions.delete(sessions.keys().next().value);
+    }
+    const sid = crypto.randomBytes(24).toString('hex');
+    sessions.set(sid, now + 86_400_000);
+    res.setHeader('set-cookie', `ag_sup_session=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`);
+    return sid;
+  }
+
+  function hasValidSession(req) {
+    const sid = parseCookies(req).ag_sup_session;
+    if (!sid || !isSameOriginAsHost(req)) return false;
+    const exp = sessions.get(sid);
+    if (!exp) return false;
+    if (exp < Date.now()) {
+      sessions.delete(sid);
+      return false;
+    }
+    return true;
+  }
+
+  function clientIp(req) {
+    return String(req.socket?.remoteAddress || 'local').replace(/^::ffff:/, '');
+  }
+
+  function checkAuthRateLimit(req) {
+    const st = authFails.get(clientIp(req));
+    if (!st) return 0;
+    const now = Date.now();
+    if (st.blockedUntil > now) return st.blockedUntil;
+    if (now - st.firstAt > AUTH_FAIL.windowMs) authFails.delete(clientIp(req));
+    return 0;
+  }
+
+  function recordAuthFail(req) {
+    const ip = clientIp(req);
+    const now = Date.now();
+    let st = authFails.get(ip);
+    if (!st || now - st.firstAt > AUTH_FAIL.windowMs) st = { count: 0, firstAt: now, blockedUntil: 0 };
+    st.count += 1;
+    if (st.count >= AUTH_FAIL.maxFailures) {
+      st.blockedUntil = now + AUTH_FAIL.blockMs;
+      st.count = 0;
+      st.firstAt = now;
+    }
+    authFails.set(ip, st);
+  }
 
   let serverState = 'stopped'; // 'stopped' | 'starting' | 'running' | 'stopping'
   let childProc = null;
   let lastError = '';
   let idleExitTimer = null;
   let activeStreamReq = null;
-  let activePort = portOf(readNormalizedConfig());
-  let activeHost = connectHostOf(readNormalizedConfig());
+  let activePort = portOf(bootCfg);
+  let activeHost = connectHostOf(bootCfg);
   let startPromise = null;
   let stopPromise = null;
 
@@ -805,6 +931,9 @@ async function startSupervisor({ autoStart = null } = {}) {
 
   const httpServer = http.createServer(async (req, res) => {
     try {
+      if (!isLoopbackHostHeader(req.headers.host)) {
+        return sendJson(res, 403, { error: { code: 'invalid_host', message: 'Supervisor rejects non-local Host headers.' } });
+      }
       const u = new URL(req.url, 'http://127.0.0.1');
       const p = u.pathname;
 
@@ -815,9 +944,7 @@ async function startSupervisor({ autoStart = null } = {}) {
       if (p === '/' && req.method === 'GET') {
         const launch = u.searchParams.get('launch');
         if (launch && consumeNonce(launch)) {
-          const sid = crypto.randomBytes(24).toString('hex');
-          sessions.add(sid);
-          res.setHeader('set-cookie', `ag_sup_session=${sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`);
+          issueSession(res);
           res.writeHead(302, { location: '/' });
           return res.end();
         }
@@ -834,37 +961,57 @@ async function startSupervisor({ autoStart = null } = {}) {
       }
 
       const sid = parseCookies(req).ag_sup_session;
-      const isAuthed = !!(sid && sessions.has(sid));
+      const isAuthed = hasValidSession(req);
 
       if (p === '/_auth/session') {
         if (req.method === 'GET') {
           return sendJson(res, 200, { authenticated: isAuthed, supervised: true });
         }
         if (req.method === 'POST') {
+          if (!isSameOriginAsHost(req)) {
+            return sendJson(res, 403, { error: { code: 'csrf_origin_mismatch', message: 'Cross-origin login blocked.' } });
+          }
+          const blockedUntil = checkAuthRateLimit(req);
+          if (blockedUntil) {
+            const retrySec = Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000));
+            res.setHeader('retry-after', String(retrySec));
+            return sendJson(res, 429, {
+              retryAfterSec: retrySec,
+              error: { code: 'too_many_auth_failures', message: 'Too many failed attempts. Retry later.', type: 'rate_limit_error' },
+            });
+          }
           const body = await readJsonBody(req);
           const cfg = readNormalizedConfig();
           const expected = cfg.adminKey || cfg.apiKey || '';
           const candidate = String(body.adminKey || body.key || '').trim();
-          if (!expected || candidate !== expected) {
+          if (!timingSafeKeyEquals(candidate, expected)) {
+            recordAuthFail(req);
             return sendJson(res, 401, { error: { message: 'Invalid administrator key', type: 'invalid_request_error' } });
           }
-          const newSid = crypto.randomBytes(24).toString('hex');
-          sessions.add(newSid);
-          res.setHeader('set-cookie', `ag_sup_session=${newSid}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400`);
+          issueSession(res);
           return sendJson(res, 200, { ok: true });
         }
       }
 
       if (p === '/_auth/logout' && req.method === 'POST') {
+        if (!isSameOriginAsHost(req)) {
+          return sendJson(res, 403, { error: { code: 'csrf_origin_mismatch', message: 'Cross-origin logout blocked.' } });
+        }
         if (sid) sessions.delete(sid);
         res.setHeader('set-cookie', 'ag_sup_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
         return sendJson(res, 200, { ok: true });
       }
 
       if (p === '/_supervisor/nonce' && req.method === 'POST') {
+        const blockedUntil = checkAuthRateLimit(req);
+        if (blockedUntil) {
+          res.setHeader('retry-after', String(Math.max(1, Math.ceil((blockedUntil - Date.now()) / 1000))));
+          return sendJson(res, 429, { error: { code: 'too_many_auth_failures', message: 'Too many failed attempts.' } });
+        }
         const hdr = String(req.headers['x-supervisor-token'] || '');
-        const validSecret = hdr.length === supSecret.length && crypto.timingSafeEqual(Buffer.from(hdr), Buffer.from(supSecret));
+        const validSecret = timingSafeKeyEquals(hdr, supSecret);
         if (!isAuthed && !validSecret) {
+          recordAuthFail(req);
           return sendJson(res, 401, { error: { message: 'Unauthorized', type: 'authentication_error' } });
         }
         return sendJson(res, 200, { ok: true, nonce: mintNonce() });

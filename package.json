@@ -1,20 +1,22 @@
 {
   "name": "antigravity-api",
-  "version": "2.0.0",
-  "description": "Local OpenAI/Anthropic/Gemini API gateway with offline Web Control Panel, live quota visualizations, consent-based Node bootstrap, and server-side agent file tools.",
+  "version": "2.1.0",
+  "description": "Local OpenAI/Anthropic/Gemini API gateway with offline Web Control Panel, live quota visualizations, Google OAuth, CDP cookie import, and server-side agent file tools.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "ui": "node scripts/launcher.js",
-    "key": "node server.js --print-key",
-    "models": "node server.js --models",
+    "key": "node server.js key",
+    "admin-key": "node server.js admin-key",
+    "models": "node server.js models",
     "extract-token": "node lib/token_extract.js",
+    "shortcuts": "node scripts/shortcuts.js",
     "backup": "node scripts/update.js --backup-only",
     "update": "node scripts/update.js",
     "build:portable": "node scripts/build_portable.js --zip",
     "check:privacy": "node scripts/verify_privacy.js",
     "test": "node test/all.js",
-    "test:unit": "node test/test_models.js && node test/agent_tools_test.js && node test/test_translate.js && node test/test_web_bridge.js && node test/test_config.js && node test/test_security_and_fixes.js && node test/test_token_extract.js && node test/test_proxy_detect.js"
+    "test:unit": "node test/test_models.js && node test/agent_tools_test.js && node test/test_translate.js && node test/test_web_bridge.js && node test/test_config.js && node test/test_security_and_fixes.js && node test/test_token_extract.js && node test/test_proxy_detect.js && node test/test_oauth.js && node test/test_supervisor.js"
   },
   "engines": {
     "node": ">=18"

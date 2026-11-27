@@ -5,6 +5,10 @@ admin.key
 config.json
 usage.json
 cookie.txt
+cookies.txt
+cookie*.txt
+*.cookie
+.ag-theme
 .env
 *.env
 ui_language.txt

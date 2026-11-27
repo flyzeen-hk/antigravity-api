@@ -24,9 +24,18 @@ const INCLUDE_FILES = [
   'run.sh',
   'update.bat',
   'update.sh',
-  'push_to_github.bat',
 ];
 const INCLUDE_DIRS = ['lib', 'public', 'scripts', 'assets'];
+
+function copyFileNormalized(src, dst) {
+  if (/\.sh$/i.test(src)) {
+    const lf = fs.readFileSync(src, 'utf8').replace(/\r\n/g, '\n');
+    fs.writeFileSync(dst, lf, 'utf8');
+    try { fs.chmodSync(dst, 0o755); } catch {}
+    return;
+  }
+  fs.copyFileSync(src, dst);
+}
 
 function copyDir(src, dst) {
   fs.mkdirSync(dst, { recursive: true });
@@ -38,7 +47,7 @@ function copyDir(src, dst) {
     if (st.isSymbolicLink()) continue;
     if (st.isDirectory()) count += copyDir(sp, dp);
     else {
-      fs.copyFileSync(sp, dp);
+      copyFileNormalized(sp, dp);
       count++;
     }
   }
@@ -54,7 +63,7 @@ function buildPortable({ rootDir = ROOT_DIR, createZip = false } = {}) {
   for (const f of INCLUDE_FILES) {
     const src = path.join(rootDir, f);
     if (fs.existsSync(src)) {
-      fs.copyFileSync(src, path.join(outDir, f));
+      copyFileNormalized(src, path.join(outDir, f));
       filesCopied++;
     }
   }
