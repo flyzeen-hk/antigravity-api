@@ -43,14 +43,19 @@
     const clamped = pct === null || pct === undefined ? 0 : Math.max(0, Math.min(100, Number(pct)));
     const dash = (clamped / 100) * c;
     const color = gaugeColor(pct);
-    const label = pct === null || pct === undefined ? '—' : `${Math.round(clamped)}%`;
+    let label = '—';
+    if (pct !== null && pct !== undefined) {
+      if (clamped > 99 && clamped < 100) label = `${clamped.toFixed(1)}%`;
+      else if (clamped > 0 && clamped < 10 && Math.abs(clamped - Math.round(clamped)) >= 0.05) label = `${clamped.toFixed(1)}%`;
+      else label = `${Math.floor(clamped + 1e-6)}%`;
+    }
     return `
       <svg width="86" height="86" viewBox="0 0 86 86" aria-hidden="true">
         <circle cx="43" cy="43" r="${r}" fill="none" stroke="var(--border)" stroke-width="7"></circle>
         <circle class="gauge-arc" cx="43" cy="43" r="${r}" fill="none" stroke="${color}" stroke-width="7"
           stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${c.toFixed(1)}"
           transform="rotate(-90 43 43)"></circle>
-        <text x="43" y="47" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="700" font-family="var(--font-sans)">${esc(label)}</text>
+        <text x="43" y="47" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="700" font-family="var(--font-sans)">${esc(label)}</text>
       </svg>`;
   }
 
@@ -83,8 +88,9 @@
         const title = `${g.displayName || g.name}${winLabel}`;
         const resetAttr = b.resetTime ? `data-reset-iso="${esc(b.resetTime)}"` : '';
         const resetStr = b.resetTime ? t('overview.resetIn', { time: formatCountdown(b.resetTime) }) : '—';
+        const tip = [g.description, b.description].filter(Boolean).join(' — ');
         cards.push(`
-          <div class="gauge-card">
+          <div class="gauge-card" title="${esc(tip)}">
             ${buildArcSvg(pct)}
             <div class="gauge-title">${esc(title)}</div>
             <div class="gauge-sub" ${resetAttr}>${esc(resetStr)}</div>
@@ -92,18 +98,21 @@
       }
     }
 
-    const fams = limitsData.quotaFamilies || {};
-    for (const [famKey, label] of [['gemini', 'Gemini Catalog'], ['claude', 'Claude Catalog'], ['gpt', 'GPT Catalog']]) {
-      const f = fams[famKey];
-      if (!f || (!f.modelCount && f.percent === null)) continue;
-      const resetAttr = f.resetTime ? `data-reset-iso="${esc(f.resetTime)}"` : '';
-      const resetStr = f.resetTime ? t('overview.resetIn', { time: formatCountdown(f.resetTime) }) : `${f.modelCount} models`;
-      cards.push(`
-        <div class="gauge-card">
-          ${buildArcSvg(f.percent)}
-          <div class="gauge-title">${esc(label)}</div>
-          <div class="gauge-sub" ${resetAttr}>${esc(resetStr)}</div>
-        </div>`);
+    // Fallback to catalog quotaFamilies ONLY when official retrieveUserQuotaSummary returned no groups.
+    if (!cards.length) {
+      const fams = limitsData.quotaFamilies || {};
+      for (const [famKey, label] of [['gemini', 'Gemini Models'], ['claude', 'Claude Models'], ['gpt', 'GPT Models']]) {
+        const f = fams[famKey];
+        if (!f || (!f.modelCount && f.percent === null)) continue;
+        const resetAttr = f.resetTime ? `data-reset-iso="${esc(f.resetTime)}"` : '';
+        const resetStr = f.resetTime ? t('overview.resetIn', { time: formatCountdown(f.resetTime) }) : `${f.modelCount} models`;
+        cards.push(`
+          <div class="gauge-card">
+            ${buildArcSvg(f.percent)}
+            <div class="gauge-title">${esc(label)}</div>
+            <div class="gauge-sub" ${resetAttr}>${esc(resetStr)}</div>
+          </div>`);
+      }
     }
 
     if (!cards.length) {
@@ -112,7 +121,25 @@
       return;
     }
 
-    container.innerHTML = `<div class="quota-grid">${cards.join('')}</div>`;
+    const acc = limitsData.account || {};
+    const fetchedAt = limitsData.serverQuotas && limitsData.serverQuotas.fetchedAt
+      ? new Date(limitsData.serverQuotas.fetchedAt).toLocaleTimeString()
+      : '';
+    const metaParts = [
+      acc.email ? acc.email : null,
+      acc.tierId ? `${acc.tier || 'Tier'} (${acc.tierId})` : (acc.tier || null),
+      acc.region ? acc.region : null,
+      fetchedAt ? `${t('overview.updatedAt')}: ${fetchedAt}` : null,
+    ].filter(Boolean);
+
+    const footer = metaParts.length
+      ? `<p class="hint mt-sm">${esc(metaParts.join(' · '))}</p>`
+      : '';
+    const tierNote = (acc.tierId === 'standard-tier' && acc.paidTier)
+      ? `<p class="hint mt-xs">${esc(t('overview.freeTierHint', { paid: acc.paidTier }))}</p>`
+      : '';
+
+    container.innerHTML = `<div class="quota-grid">${cards.join('')}</div>${footer}${tierNote}`;
   }
 
   function tickResetCountdowns(root, t) {

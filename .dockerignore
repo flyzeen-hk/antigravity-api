@@ -20,6 +20,7 @@ cookies.txt
 config.json
 usage.json
 install_paths.json
+known_models.json
 ui_language.txt
 data
 # Agent runtime artifacts

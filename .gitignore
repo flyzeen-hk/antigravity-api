@@ -9,6 +9,7 @@ cookie.txt
 *.env
 ui_language.txt
 install_paths.json
+known_models.json
 
 # Rolling and pre-update/consolidation backups (contain the same secrets)
 backups/

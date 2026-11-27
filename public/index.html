@@ -235,6 +235,7 @@
                 <p id="cloud-account-meta" class="muted">—</p>
               </div>
               <div class="btn-group">
+                <button id="btn-google-oauth" type="button" class="btn btn-primary btn-sm" data-i18n="overview.googleOAuth">Войти через Google (OAuth)</button>
                 <button id="btn-extract-token" type="button" class="btn btn-secondary btn-sm" data-i18n="overview.extractToken">Извлечь токен из Antigravity</button>
                 <button id="btn-reload-token" type="button" class="btn btn-ghost btn-sm" data-i18n="overview.reloadToken">Перечитать auth.json</button>
               </div>
@@ -329,11 +330,26 @@
           <div class="page-head">
             <div>
               <h2 data-i18n="models.title">Каталог моделей</h2>
-              <p class="muted" data-i18n="models.subtitle">Все доступные модели cloud/* и web/* с контекстом и быстрым переходом в чат</p>
+              <p class="muted" data-i18n="models.subtitle">Поиск новых моделей, сохранённая история, проверка работоспособности и запуск в чате</p>
             </div>
-            <button id="btn-refresh-models" type="button" class="btn btn-secondary btn-sm" data-i18n="actions.refresh">Обновить</button>
+            <div class="btn-group">
+              <button id="btn-refresh-models" type="button" class="btn btn-primary btn-sm" data-i18n="models.scanNew">Найти новые модели</button>
+              <button id="btn-check-all-models" type="button" class="btn btn-secondary btn-sm" data-i18n="models.checkAll">Проверить все модели</button>
+              <button id="btn-toggle-add-model" type="button" class="btn btn-ghost btn-sm" data-i18n="models.addCustom">+ Добавить модель</button>
+            </div>
           </div>
           <div id="models-health-banner" class="alert hidden"></div>
+          <div id="add-custom-model-bar" class="card hidden">
+            <div class="row-between mb-sm">
+              <strong data-i18n="models.addCustomTitle">Добавить произвольный ID модели (cloud/*)</strong>
+              <span class="hint" data-i18n="models.addCustomHint">Позволяет проверить и использовать новую модель Google сразу, не удаляя старые.</span>
+            </div>
+            <div class="input-row">
+              <input id="custom-model-id" type="text" placeholder="например: gemini-4-neon-high или claude-sonnet-5-5">
+              <input id="custom-model-name" type="text" placeholder="Название (необязательно)">
+              <button id="btn-save-custom-model" type="button" class="btn btn-primary btn-sm" data-i18n="actions.save">Сохранить</button>
+            </div>
+          </div>
           <div class="card">
             <div class="filter-bar">
               <input id="models-search" type="search" data-i18n-placeholder="models.searchPlaceholder" placeholder="Поиск модели по ID или имени…">
@@ -341,6 +357,9 @@
                 <button type="button" class="pill active" data-filter="all" data-i18n="models.filterAll">Все</button>
                 <button type="button" class="pill" data-filter="cloud">Cloud</button>
                 <button type="button" class="pill" data-filter="web">Web</button>
+                <button type="button" class="pill" data-filter="new-locked" data-i18n="models.filterNewLocked">Новые / Тариф</button>
+                <button type="button" class="pill" data-filter="working" data-i18n="models.filterWorking">Рабочие</button>
+                <button type="button" class="pill" data-filter="broken" data-i18n="models.filterBroken">Ошибки / Удалены</button>
                 <button type="button" class="pill" data-filter="claude">Claude</button>
                 <button type="button" class="pill" data-filter="gemini">Gemini</button>
                 <button type="button" class="pill" data-filter="gpt">GPT</button>

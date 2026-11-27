@@ -25,7 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { TokenManager } = require('./lib/auth');
+const { TokenManager, startInteractiveOAuth, getOAuthStatus } = require('./lib/auth');
 const { ModelCatalog } = require('./lib/models');
 const { openAIToGeminiRequest, geminiToOpenAIResponse, GeminiStreamToOpenAI, sanitizeGeminiTools } = require('./lib/translate');
 const { Guard, parseResetMs } = require('./lib/guard');
@@ -328,11 +328,14 @@ class Upstream {
     return this.generateContent(model, requestObj, { signal });
   }
 
-  // Информация об аккаунте (tier/проект/регион) — кэш 5 минут, best-effort.
-  async getAccountInfo() {
-    if (this._accInfo && Date.now() - this._accInfoAt < 300000) return this._accInfo;
+  // Информация об аккаунте (tier/проект/регион/email) — кэш 5 минут, best-effort.
+  async getAccountInfo({ force = false } = {}) {
+    if (!force && this._accInfo && Date.now() - this._accInfoAt < 300000) return this._accInfo;
     try {
       const token = await this.tokens.getAccessToken();
+      const emailP = typeof this.tokens.ensureEmail === 'function'
+        ? this.tokens.ensureEmail().catch(() => this.tokens.email || '')
+        : Promise.resolve(this.tokens.email || '');
       const meta = {
         metadata: {
           ideType: 'ANTIGRAVITY',
@@ -341,21 +344,26 @@ class Upstream {
         },
         cloudaicompanionProject: this.tokens.projectId || '',
       };
-      const [tierRes, userRes] = await Promise.all([
+      const [tierRes, userRes, email] = await Promise.all([
         this.upFetch('/v1internal:loadCodeAssist', {
           method: 'POST', headers: this.headers(token), body: JSON.stringify(meta), signal: AbortSignal.timeout(15000),
         }),
         this.upFetch('/v1internal:fetchUserInfo', {
           method: 'POST', headers: this.headers(token), body: '{}', signal: AbortSignal.timeout(15000),
         }),
+        emailP,
       ]);
       const tier = tierRes.ok ? await tierRes.json().catch(() => null) : null;
       const user = userRes.ok ? await userRes.json().catch(() => null) : null;
       this._accInfo = {
         tier: tier?.currentTier?.name ?? null,
         tierId: tier?.currentTier?.id ?? null,
+        paidTier: tier?.paidTier?.name ?? null,
+        paidTierId: tier?.paidTier?.id ?? null,
         project: tier?.cloudaicompanionProject ?? null,
         region: user?.regionCode ?? null,
+        email: email || this.tokens.email || null,
+        authSource: this.tokens.authSource || null,
         fetchedAt: new Date().toISOString(),
       };
       this._accInfoAt = Date.now();
@@ -366,14 +374,15 @@ class Upstream {
   }
 
   // Реальная сводка официальных квот Google Cloud Code (retrieveUserQuotaSummary) — кэш 30 сек
-  async getQuotaSummary() {
-    if (this._quotaSummary && Date.now() - this._quotaSummaryAt < 30000) return this._quotaSummary;
+  async getQuotaSummary({ force = false } = {}) {
+    if (!force && this._quotaSummary && Date.now() - this._quotaSummaryAt < 30000) return this._quotaSummary;
     try {
       const token = await this.tokens.getAccessToken();
+      const bodyStr = this.tokens.projectId ? JSON.stringify({ project: this.tokens.projectId }) : '{}';
       const res = await this.upFetch('/v1internal:retrieveUserQuotaSummary', {
         method: 'POST',
         headers: this.headers(token),
-        body: '{}',
+        body: bodyStr,
         signal: AbortSignal.timeout(15000),
       });
       if (!res.ok) {
@@ -390,7 +399,7 @@ class Upstream {
           displayName: b.displayName || '',
           window: b.window || '',
           remainingFraction: typeof b.remainingFraction === 'number' ? b.remainingFraction : null,
-          remainingPercent: typeof b.remainingFraction === 'number' ? Math.round(b.remainingFraction * 1000) / 10 : null,
+          remainingPercent: typeof b.remainingFraction === 'number' ? Math.floor(b.remainingFraction * 1000) / 10 : null,
           resetTime: b.resetTime || null,
           description: b.description || '',
           disabled: !!b.disabled,
@@ -461,6 +470,7 @@ function start(config) {
     userAgent: config.userAgent,
     fallbackHost: config.upstreamFallbackHost,
     network,
+    registryFile: path.join(DATA_DIR, 'known_models.json'),
   });
   const upstream = new Upstream(config, tokens, catalog, network);
   const guard = new Guard(config.safeMode || {}, process.env.AG_USAGE_FILE || path.join(DATA_DIR, 'usage.json'));
@@ -2090,28 +2100,49 @@ function start(config) {
     };
   }
 
-  async function buildOpenAIModels() {
+  async function buildOpenAIModels({ force = false } = {}) {
     let data = [];
+    const seenIds = new Set();
     if (!CLOUD_DISABLED) try {
       await waitNetworkReady();
-      const models = await catalog.list(() => tokens.getAccessToken());
+      const models = await catalog.list(() => tokens.getAccessToken(), { force });
       lastCatalogError = '';
-      data = [...models.entries()].map(([id, m]) => ({
-        id: providers.formatModel(providers.CLOUD, id),
-        provider: providers.CLOUD,
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'antigravity',
-        display_name: m.displayName,
-        displayName: m.displayName,
-        context_length: m.maxTokens ?? undefined,
-        max_completion_tokens: m.maxOutputTokens ?? undefined,
-        capabilities: providers.describeModel(providers.CLOUD),
-      }));
+      data = [...models.entries()].map(([id, m]) => {
+        seenIds.add(id);
+        return {
+          id: providers.formatModel(providers.CLOUD, id),
+          provider: providers.CLOUD,
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'antigravity',
+          display_name: m.displayName,
+          displayName: m.displayName,
+          context_length: m.maxTokens ?? undefined,
+          max_completion_tokens: m.maxOutputTokens ?? undefined,
+          capabilities: providers.describeModel(providers.CLOUD),
+        };
+      });
     } catch (e) {
       lastCatalogError = redactSecrets(e.message || String(e));
-      // каталог аккаунта недоступен — всё равно отдаём web-модели
+      // каталог аккаунта недоступен — всё равно отдаём web-модели и пользовательские модели
       console.error('  [models] upstream каталог недоступен:', e.message);
+    }
+    if (!CLOUD_DISABLED && typeof catalog.getCustomModels === 'function') {
+      for (const rec of catalog.getCustomModels()) {
+        if (seenIds.has(rec.id)) continue;
+        seenIds.add(rec.id);
+        data.push({
+          id: providers.formatModel(providers.CLOUD, rec.id),
+          provider: providers.CLOUD,
+          object: 'model',
+          created: Math.floor(Date.now() / 1000),
+          owned_by: 'antigravity-custom',
+          display_name: rec.displayName || rec.id,
+          displayName: rec.displayName || rec.id,
+          custom: true,
+          capabilities: providers.describeModel(providers.CLOUD),
+        });
+      }
     }
     if (webBridge.enabled) {
       for (const m of webBridge.getModelsList()) {
@@ -2446,12 +2477,13 @@ function start(config) {
 
       if (p === '/_limits' || p === '/_quota') {
         await waitNetworkReady();
+        const force = u.searchParams.get('force') === '1';
         if (CLOUD_DISABLED || (typeof tokens.hasCredentials === 'function' && !tokens.hasCredentials())) {
           const reply = {
             local: guard.summary(),
             account: { error: CLOUD_DISABLED ? 'cloud_disabled' : 'auth_missing' },
             models: [],
-            modelsError: CLOUD_DISABLED ? 'cloud-модели отключены (AG_NO_CLOUD=1)' : 'Токен Antigravity IDE (auth.json) не найден',
+            modelsError: CLOUD_DISABLED ? 'cloud-модели отключены (AG_NO_CLOUD=1)' : 'OAuth-токен Antigravity (auth.json) не найден',
             quotaFamilies: {},
             serverQuotas: null,
             config: { safeMode: guard.cfg },
@@ -2460,16 +2492,16 @@ function start(config) {
           };
           return sendJson(res, 200, p === '/_quota' ? { serverQuotas: null } : reply);
         }
-        const quotaP = upstream.getQuotaSummary();
+        const quotaP = upstream.getQuotaSummary({ force });
         if (p === '/_quota') return sendJson(res, 200, await quotaP);
 
         let modelsError = null;
         const [serverQuotas, account] = await Promise.all([
           quotaP,
-          upstream.getAccountInfo(),
+          upstream.getAccountInfo({ force }),
           (async () => {
             try {
-              await catalog.list(() => tokens.getAccessToken());
+              await catalog.list(() => tokens.getAccessToken(), { force });
               lastCatalogError = '';
             } catch (e) {
               modelsError = e.message;
@@ -2763,6 +2795,185 @@ function start(config) {
         const body = await readJsonObj(req, res);
         if (!body) return;
         return sendJson(res, 200, installsLib.openInstallFolder(DATA_DIR, body.key));
+      }
+
+      if (p === '/_auth/oauth/start' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const body = await readJsonObj(req, res);
+        if (!body) return;
+        const started = await startInteractiveOAuth({
+          authFile,
+          network,
+          openBrowser: body.openBrowser !== false,
+          onSuccess: async () => {
+            tokens.reloadFromDisk();
+            upstream._accInfo = null;
+            upstream._quotaSummary = null;
+            catalog.cache = null;
+            catalog.project = tokens.projectId || '';
+          },
+        });
+        return sendJson(res, 200, started);
+      }
+
+      if (p === '/_auth/oauth/status' && req.method === 'GET') {
+        if (!requireAdmin()) return;
+        return sendJson(res, 200, getOAuthStatus());
+      }
+
+      if (p === '/_models/catalog' && req.method === 'GET') {
+        if (!requireAdmin()) return;
+        const force = u.searchParams.get('force') === '1';
+        let fetchErr = '';
+        if (!CLOUD_DISABLED && typeof tokens.hasCredentials === 'function' && tokens.hasCredentials()) {
+          try {
+            await waitNetworkReady();
+            await catalog.list(() => tokens.getAccessToken(), { force });
+            lastCatalogError = '';
+          } catch (e) {
+            fetchErr = redactSecrets(e.message || String(e));
+            lastCatalogError = fetchErr;
+          }
+        }
+        const snap = catalog.getCatalogSnapshot();
+        const webModels = webBridge.enabled
+          ? webBridge.getModelsList().map((m) => {
+              const fullId = providers.formatModel(providers.WEB, m.id);
+              return {
+                id: fullId,
+                rawId: m.id,
+                provider: providers.WEB,
+                displayName: m.display_name || m.displayName || m.id,
+                inLiveCatalog: true,
+                capabilities: providers.describeModel(providers.WEB, { bridgeEnabled: true }),
+                health: catalog.getHealth(fullId),
+              };
+            })
+          : [];
+        return sendJson(res, 200, {
+          ...snap,
+          web: webModels,
+          catalogError: fetchErr || lastCatalogError || null,
+          cloudDisabled: CLOUD_DISABLED,
+        });
+      }
+
+      if (p === '/_models/custom' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const body = await readJsonObj(req, res);
+        if (!body) return;
+        const action = String(body.action || 'add').toLowerCase();
+        const modelId = String(body.model || '').trim();
+        if (action === 'remove') {
+          const removed = catalog.removeCustomModel(modelId);
+          return sendJson(res, 200, { ok: true, removed, snapshot: catalog.getCatalogSnapshot() });
+        }
+        const added = catalog.addCustomModel(modelId, body.displayName || '');
+        return sendJson(res, 200, { ok: true, model: added, snapshot: catalog.getCatalogSnapshot() });
+      }
+
+      if (p === '/_models/check' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const body = await readJsonObj(req, res);
+        if (!body) return;
+        await waitNetworkReady();
+
+        const probeOne = async (fullId) => {
+          const started = Date.now();
+          const isWeb = /^web\//i.test(fullId);
+          const rawId = fullId.replace(/^(?:cloud|web)\//i, '');
+          if (isWeb) {
+            if (!webBridge.enabled) {
+              return catalog.recordHealth(fullId, { status: 'error', httpStatus: 503, ms: 0, error: 'Gemini Web мост выключен' });
+            }
+            const sum = webBridge.summary ? webBridge.summary() : {};
+            if (!sum.hasCookie && !sum.cookieConfigured && !(sum.accountsCount > 0)) {
+              return catalog.recordHealth(fullId, { status: 'forbidden', httpStatus: 401, ms: 0, error: 'Не заданы cookie для Gemini Web' });
+            }
+            if (!body.model) {
+              return catalog.recordHealth(fullId, { status: 'working', httpStatus: 200, ms: Date.now() - started, error: '' });
+            }
+            try {
+              const r = await webBridge.generateContent(rawId, { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] });
+              const okReply = !!(r && (r.text || (r.candidates && r.candidates.length)));
+              return catalog.recordHealth(fullId, {
+                status: okReply ? 'working' : 'error',
+                httpStatus: okReply ? 200 : 502,
+                ms: Date.now() - started,
+                error: okReply ? '' : 'Пустой ответ Gemini Web',
+              });
+            } catch (e) {
+              return catalog.recordHealth(fullId, {
+                status: e.status === 429 ? 'rate_limited' : 'error',
+                httpStatus: e.status || 502,
+                ms: Date.now() - started,
+                error: redactSecrets(e.message || String(e)),
+              });
+            }
+          }
+
+          if (CLOUD_DISABLED) {
+            return catalog.recordHealth(fullId, { status: 'error', httpStatus: 503, ms: 0, error: 'AG_NO_CLOUD=1' });
+          }
+          try {
+            const upRes = await upstream.generateContent(
+              rawId,
+              {
+                contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
+                generationConfig: { maxOutputTokens: 1 },
+              },
+              { signal: AbortSignal.timeout(12000) }
+            );
+            const ms = Date.now() - started;
+            const txt = await upRes.text().catch(() => '');
+            if (upRes.ok) {
+              return catalog.recordHealth(fullId, { status: 'working', httpStatus: upRes.status, ms, error: '' });
+            }
+            let st = 'error';
+            let msg = `HTTP ${upRes.status}`;
+            if (upRes.status === 404) { st = 'not_found'; msg = 'Удалена / не найдена (404)'; }
+            else if (upRes.status === 403) { st = 'forbidden'; msg = 'Нет доступа по тарифу (403)'; }
+            else if (upRes.status === 429) { st = 'rate_limited'; msg = 'Лимит исчерпан (429)'; }
+            else if (upRes.status === 400 && /location|region|country/i.test(txt)) { st = 'region_blocked'; msg = 'Гео-ограничение (400)'; }
+            else if (txt) { msg = redactSecrets(`HTTP ${upRes.status}: ${txt.slice(0, 120)}`); }
+            return catalog.recordHealth(fullId, { status: st, httpStatus: upRes.status, ms, error: msg });
+          } catch (e) {
+            return catalog.recordHealth(fullId, {
+              status: 'error',
+              httpStatus: e.status || null,
+              ms: Date.now() - started,
+              error: redactSecrets(e.message || String(e)),
+            });
+          }
+        };
+
+        let targets = [];
+        if (body.model) {
+          targets = [String(body.model).trim()];
+        } else {
+          const scope = String(body.scope || 'all').toLowerCase();
+          if (scope !== 'web' && !CLOUD_DISABLED) {
+            try { await catalog.list(() => tokens.getAccessToken()); } catch {}
+            const snap = catalog.getCatalogSnapshot();
+            for (const m of [...snap.active, ...snap.custom, ...snap.removed]) targets.push(m.id);
+          }
+          if (scope !== 'cloud' && webBridge.enabled) {
+            for (const m of webBridge.getModelsList()) targets.push(providers.formatModel(providers.WEB, m.id));
+          }
+          targets = [...new Set(targets)];
+        }
+
+        const results = {};
+        const concurrency = 3;
+        let idx = 0;
+        const worker = async () => {
+          while (idx < targets.length) {
+            const id = targets[idx++];
+            results[id] = await probeOne(id);
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(concurrency, targets.length || 1) }, worker));
+        return sendJson(res, 200, { ok: true, checked: Object.keys(results).length, results });
       }
 
       if (p === '/_startup') {

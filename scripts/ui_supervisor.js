@@ -24,7 +24,8 @@ const { readJsonFile, writeFileAtomic, backupFile } = require('../lib/safe_files
 const configLib = require('../lib/config');
 const { Guard } = require('../lib/guard');
 const { NetworkManager } = require('../lib/net');
-const { TokenManager } = require('../lib/auth');
+const { TokenManager, startInteractiveOAuth, getOAuthStatus } = require('../lib/auth');
+const { ModelCatalog } = require('../lib/models');
 const { GeminiWebBridge } = require('../lib/web_bridge');
 const { autoExtract } = require('../lib/token_extract');
 const { detectProxies } = require('../lib/proxy_detect');
@@ -696,6 +697,62 @@ async function startSupervisor({ autoStart = null } = {}) {
       } finally {
         net.destroyAll();
       }
+    }
+
+    if (pathname === '/_auth/oauth/start' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const net = new NetworkManager(cfg);
+      const authFile = process.env.AG_AUTH_FILE || path.join(DATA_DIR, 'auth.json');
+      const started = await startInteractiveOAuth({
+        authFile,
+        network: net,
+        openBrowser: body.openBrowser !== false,
+        onSuccess: () => { net.destroyAll(); },
+      });
+      return sendJson(res, 200, started);
+    }
+
+    if (pathname === '/_auth/oauth/status' && req.method === 'GET') {
+      return sendJson(res, 200, getOAuthStatus());
+    }
+
+    if (pathname === '/_models/catalog' && req.method === 'GET') {
+      const cat = new ModelCatalog(cfg.upstreamHost || 'https://daily-cloudcode-pa.googleapis.com', {
+        registryFile: path.join(DATA_DIR, 'known_models.json'),
+      });
+      const wb = new GeminiWebBridge({ ...(cfg.geminiWeb || {}) });
+      const web = wb.enabled ? wb.getModelsList().map((m) => ({
+        id: `web/${m.id}`,
+        rawId: m.id,
+        provider: 'web',
+        displayName: m.display_name || m.displayName || m.id,
+        inLiveCatalog: true,
+        health: cat.getHealth(`web/${m.id}`),
+      })) : [];
+      const snap = cat.getCatalogSnapshot();
+      return sendJson(res, 200, { ...snap, web, serverStopped: true, catalogError: null });
+    }
+
+    if (pathname === '/_models/custom' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const cat = new ModelCatalog(cfg.upstreamHost || 'https://daily-cloudcode-pa.googleapis.com', {
+        registryFile: path.join(DATA_DIR, 'known_models.json'),
+      });
+      const action = String(body.action || 'add').toLowerCase();
+      const modelId = String(body.model || '').trim();
+      if (action === 'remove') {
+        const removed = cat.removeCustomModel(modelId);
+        return sendJson(res, 200, { ok: true, removed, snapshot: cat.getCatalogSnapshot() });
+      }
+      const added = cat.addCustomModel(modelId, body.displayName || '');
+      return sendJson(res, 200, { ok: true, model: added, snapshot: cat.getCatalogSnapshot() });
+    }
+
+    if (pathname === '/_models/check' && req.method === 'POST') {
+      return sendJson(res, 503, {
+        ok: false,
+        error: { code: 'server_stopped', message: 'API-сервер остановлен. Нажмите «Запустить сервер», чтобы проверить работоспособность моделей.' },
+      });
     }
 
     if (pathname === '/api/diagnostics/chat') {

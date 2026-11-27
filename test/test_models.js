@@ -1,8 +1,12 @@
 'use strict';
 
-// ModelCatalog: кэш, stale-while-revalidate и фильтрация служебных моделей.
+// ModelCatalog: кэш, stale-while-revalidate, фильтрация служебных моделей,
+// история новых/удалённых моделей, planLocked (-disabled), custom-модели и health-check.
 
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const { ModelCatalog } = require('../lib/models');
 
 let passed = 0;
@@ -28,10 +32,14 @@ const FIRST = {
   'gemini-3-flash': { displayName: 'Gemini 3 Flash', quotaInfo: { remainingFraction: 0.5, resetTime: '2026-01-01T00:00:00Z' } },
   'tab_flash_lite_preview': { displayName: 'internal' },
   'chat_20706': { displayName: 'internal' },
-  'claude-disabled': { displayName: 'placeholder' },
+  'claude-disabled': { displayName: 'placeholder', disabled: true, tagTitle: 'Paid Pro', tagDescription: 'Pro only' },
   'claude-sonnet-4-6': { displayName: 'Claude Sonnet 4.6', maxTokens: 200000 },
 };
-const SECOND = { ...FIRST, 'gemini-3-pro': { displayName: 'Gemini 3 Pro' } };
+const SECOND = {
+  'gemini-3-flash': FIRST['gemini-3-flash'],
+  'gemini-4-neon-disabled': { displayName: 'Gemini 4 Neon', disabled: true, tagTitle: 'Paid Pro', tagDescription: 'Pro only' },
+  'gemini-3-pro': { displayName: 'Gemini 3 Pro' },
+};
 
 (async () => {
   console.log('== 1. Первый запрос тянет каталог, повторный — из кэша');
@@ -41,7 +49,8 @@ const SECOND = { ...FIRST, 'gemini-3-pro': { displayName: 'Gemini 3 Pro' } };
   ok(net.calls === 1, 'один запрос к апстриму');
   ok(m1.has('gemini-3-flash'), 'публичная модель есть');
   ok(!m1.has('tab_flash_lite_preview') && !m1.has('chat_20706'), 'служебные tab_*/chat_* скрыты');
-  ok(!m1.has('claude-disabled'), '-disabled заглушки скрыты');
+  ok(!m1.has('claude-disabled'), '-disabled заглушки скрыты из активного Map');
+  ok(cat.disabledModels.has('claude-disabled'), '-disabled модели сохранены в disabledModels (planLocked)');
   ok(m1.get('gemini-3-flash').quota.percent === 50, 'квота пересчитана в проценты');
   await cat.list(async () => 'token');
   ok(net.calls === 1, 'в пределах ttl апстрим не дёргается');
@@ -70,6 +79,31 @@ const SECOND = { ...FIRST, 'gemini-3-pro': { displayName: 'Gemini 3 Pro' } };
   const kept = await cat4.list(async () => 'token');
   ok(kept.has('x'), 'при падении фонового обновления отдаётся старый каталог');
   await new Promise((r) => setTimeout(r, 20));
+
+  console.log('== 4. Реестр known_models.json: новые, убранные, custom и health');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-models-test-'));
+  const regFile = path.join(tmpDir, 'known_models.json');
+  try {
+    const net4 = fakeNetwork([FIRST, SECOND]);
+    const cat5 = new ModelCatalog('http://upstream', { ttlMs: 60000, network: net4, registryFile: regFile });
+    await cat5.list(async () => 'token');
+    await cat5.list(async () => 'token', { force: true });
+    const snap = cat5.getCatalogSnapshot();
+    ok(snap.diff.added.includes('gemini-3-pro'), 'новая модель зафиксирована в diff.added');
+    ok(snap.diff.removed.includes('claude-sonnet-4-6'), 'убранная модель зафиксирована в diff.removed');
+    ok(snap.removed.some((m) => m.rawId === 'claude-sonnet-4-6' && m.removedFromCatalog), 'убранная модель сохранена в истории без удаления');
+    ok(snap.planLocked.some((m) => m.baseId === 'gemini-4-neon' && m.tagTitle === 'Paid Pro'), 'тарифная модель gemini-4-neon показана в planLocked');
+
+    cat5.addCustomModel('cloud/gemini-4-neon-high', 'Gemini 4 Neon High');
+    cat5.recordHealth('cloud/gemini-4-neon-high', { status: 'not_found', httpStatus: 404, ms: 120, error: 'HTTP 404' });
+    const catReloaded = new ModelCatalog('http://upstream', { ttlMs: 60000, network: net4, registryFile: regFile });
+    ok(catReloaded.getCustomModels().some((m) => m.id === 'gemini-4-neon-high'), 'custom-модель сохраняется на диске');
+    ok(catReloaded.getHealth('cloud/gemini-4-neon-high')?.status === 'not_found', 'результат health-check сохраняется на диске');
+    catReloaded.removeCustomModel('gemini-4-neon-high');
+    ok(catReloaded.getCustomModels().length === 0, 'custom-модель удаляется');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 
   console.log('\nИтого: ' + passed + ' ok, ' + failed + ' fail');
   process.exit(failed ? 1 : 0);

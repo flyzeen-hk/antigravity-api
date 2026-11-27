@@ -22,7 +22,11 @@
     backups: [],
     webAccounts: { activeAccount: '', accounts: [] },
     models: [],
+    catalogSnapshot: null,
     modelsServerStopped: false,
+    checkingModels: new Set(),
+    checkingAllModels: false,
+    oauthPollTimer: null,
     usageMetric: 'requests',
     usageDays: 14,
     modelFilter: 'all',
@@ -242,7 +246,7 @@
 
   // ---- Data Loading & SSE ----
 
-  async function refreshModels() {
+  async function refreshModels({ force = false } = {}) {
     if (!state.keys.apiKey) {
       try {
         state.keys = await api('GET', '/_keys');
@@ -250,13 +254,37 @@
     }
     try {
       const headers = state.keys.apiKey ? { authorization: `Bearer ${state.keys.apiKey}` } : {};
-      const res = await api('GET', '/v1/models', undefined, headers);
-      state.models = Array.isArray(res.data) ? res.data : [];
-      state.modelsServerStopped = !!res.serverStopped || state.serverState !== 'running';
-      $('nav-models-count').textContent = String(state.models.length);
-      renderModels();
+      const [modelsR, catR] = await Promise.allSettled([
+        api('GET', '/v1/models', undefined, headers),
+        api('GET', `/_models/catalog${force ? '?force=1' : ''}`),
+      ]);
+      if (modelsR.status === 'fulfilled') {
+        const res = modelsR.value;
+        state.models = Array.isArray(res.data) ? res.data : [];
+        state.modelsServerStopped = !!res.serverStopped || state.serverState !== 'running';
+      }
+      if (catR.status === 'fulfilled') {
+        state.catalogSnapshot = catR.value;
+        if (catR.value && catR.value.serverStopped) state.modelsServerStopped = true;
+      }
+      const activeCount = state.models.length;
+      $('nav-models-count').textContent = String(activeCount);
+      if (state.activeTab === 'models') renderModels();
+      else state.dirtyTabs.add('models');
       populateChatModelSelect();
       renderModelAndChatBanners();
+
+      if (force && state.catalogSnapshot) {
+        const snap = state.catalogSnapshot;
+        const addedN = (snap.diff && snap.diff.added && snap.diff.added.length) || 0;
+        const remN = (snap.diff && snap.diff.removed && snap.diff.removed.length) || 0;
+        const lockedN = (snap.planLocked && snap.planLocked.length) || 0;
+        const liveCloud = (snap.active && snap.active.length) || 0;
+        showToast(
+          `Каталог обновлён: ${liveCloud} cloud, новых +${addedN}, убрано ${remN}, по тарифу ${lockedN}`,
+          addedN > 0 ? 'ok' : 'info'
+        );
+      }
     } catch (e) {
       showToast(e.message, 'err');
     }
@@ -334,12 +362,15 @@
     return state.loadPromise;
   }
 
-  async function refreshLimits() {
+  async function refreshLimits({ force = false } = {}) {
     try {
-      state.limits = await api('GET', '/_limits');
+      state.limits = await api('GET', `/_limits${force ? '?force=1' : ''}`);
       renderLimitsAndAuth();
       renderModelAndChatBanners();
-    } catch {}
+      if (force) showToast('Квоты обновлены с сервера Google', 'ok');
+    } catch (e) {
+      if (force) showToast(e.message, 'err');
+    }
   }
 
   function openEventStream() {
@@ -545,7 +576,12 @@
         ? `auth.json OK · ${state.status.tokens.email || t('status.stopped')}`
         : t('status.stopped');
     } else if (acc && !acc.error) {
-      const parts = [acc.tier || acc.tierId, acc.region, acc.project ? `project: ${acc.project}` : ''].filter(Boolean);
+      const parts = [
+        acc.email || (state.status && state.status.tokens && state.status.tokens.email !== '(не указан)' ? state.status.tokens.email : ''),
+        acc.tierId ? `${acc.tier || 'Tier'} (${acc.tierId})` : acc.tier,
+        acc.region,
+        acc.project ? `project: ${acc.project}` : '',
+      ].filter(Boolean);
       metaEl.textContent = parts.join(' · ') || '—';
     } else if (state.status && state.status.tokens && state.status.tokens.configured) {
       metaEl.textContent = `${state.status.tokens.email || 'OAuth'} · ${t('overview.tokenExpires', {
@@ -763,16 +799,153 @@
 
   // ---- Models Tab ----
 
+  function buildUnifiedModelsList() {
+    const snap = state.catalogSnapshot;
+    const byId = new Map();
+
+    if (snap) {
+      for (const m of (snap.active || [])) {
+        byId.set(m.id, {
+          ...m,
+          context_length: m.maxTokens ?? undefined,
+          max_completion_tokens: m.maxOutputTokens ?? undefined,
+          capabilities: { tools: true, thinking: m.supportsThinking !== false },
+        });
+      }
+      for (const m of (snap.custom || [])) {
+        if (!byId.has(m.id)) {
+          byId.set(m.id, {
+            ...m,
+            capabilities: { tools: true, thinking: true },
+          });
+        }
+      }
+      for (const m of (snap.removed || [])) {
+        if (!byId.has(m.id)) {
+          byId.set(m.id, {
+            ...m,
+            context_length: m.maxTokens ?? undefined,
+            max_completion_tokens: m.maxOutputTokens ?? undefined,
+          });
+        }
+      }
+      for (const m of (snap.planLocked || [])) {
+        if (!byId.has(m.id)) {
+          byId.set(m.id, {
+            ...m,
+            context_length: m.maxTokens ?? undefined,
+            max_completion_tokens: m.maxOutputTokens ?? undefined,
+          });
+        }
+      }
+      for (const m of (snap.web || [])) {
+        byId.set(m.id, {
+          ...m,
+          capabilities: m.capabilities || { tools: 'emulated', thinking: true },
+        });
+      }
+    }
+
+    for (const m of (state.models || [])) {
+      if (!byId.has(m.id)) byId.set(m.id, m);
+    }
+    return [...byId.values()];
+  }
+
+  function renderHealthBadge(m) {
+    if (state.checkingModels.has(m.id)) {
+      return `<span class="badge badge-warn">${esc(t('models.checking'))}</span>`;
+    }
+    const h = m.health;
+    if (!h) return '';
+    const msStr = h.ms != null ? ` · ${h.ms}ms` : '';
+    const tip = h.error ? ` title="${esc(h.error)}"` : '';
+    if (h.status === 'working') return `<span class="badge badge-ok"${tip}>✓ ${esc(t('models.statusWorking'))}${esc(msStr)}</span>`;
+    if (h.status === 'not_found') return `<span class="badge badge-err"${tip}>✗ ${esc(t('models.statusNotFound'))}</span>`;
+    if (h.status === 'forbidden') return `<span class="badge badge-warn"${tip}>🔒 ${esc(t('models.statusForbidden'))}</span>`;
+    if (h.status === 'rate_limited') return `<span class="badge badge-warn"${tip}>⏳ ${esc(t('models.statusRateLimited'))}</span>`;
+    if (h.status === 'region_blocked') return `<span class="badge badge-err"${tip}>🌐 ${esc(t('models.statusRegionBlocked'))}</span>`;
+    return `<span class="badge badge-err"${tip}>✗ ${esc(t('models.statusError'))}${h.httpStatus ? ` (${h.httpStatus})` : ''}</span>`;
+  }
+
+  async function checkSingleModel(modelId) {
+    if (state.serverState !== 'running') {
+      showToast(t('models.serverStoppedBanner'), 'warn');
+      return;
+    }
+    state.checkingModels.add(modelId);
+    renderModels();
+    try {
+      const res = await api('POST', '/_models/check', { model: modelId });
+      const info = res.results && res.results[modelId];
+      applyHealthResults(res.results || {});
+      if (info) {
+        showToast(
+          info.status === 'working'
+            ? `${modelId}: ${t('models.statusWorking')} (${info.ms}ms)`
+            : `${modelId}: ${info.error || info.status}`,
+          info.status === 'working' ? 'ok' : 'warn'
+        );
+      }
+    } catch (e) {
+      showToast(e.message, 'err');
+    } finally {
+      state.checkingModels.delete(modelId);
+      renderModels();
+    }
+  }
+
+  async function checkAllModels() {
+    if (state.serverState !== 'running') {
+      showToast(t('models.serverStoppedBanner'), 'warn');
+      return;
+    }
+    if (state.checkingAllModels) return;
+    state.checkingAllModels = true;
+    const btn = $('btn-check-all-models');
+    if (btn) { btn.disabled = true; btn.textContent = t('models.checking'); }
+    try {
+      const res = await api('POST', '/_models/check', { scope: 'all' });
+      applyHealthResults(res.results || {});
+      const vals = Object.values(res.results || {});
+      const okN = vals.filter((x) => x && x.status === 'working').length;
+      const failN = vals.length - okN;
+      showToast(`Проверено моделей: ${vals.length} (работают: ${okN}, проблемы/удалены: ${failN})`, failN ? 'warn' : 'ok');
+    } catch (e) {
+      showToast(e.message, 'err');
+    } finally {
+      state.checkingAllModels = false;
+      if (btn) { btn.disabled = false; btn.textContent = t('models.checkAll'); }
+      renderModels();
+    }
+  }
+
+  function applyHealthResults(results) {
+    const snap = state.catalogSnapshot;
+    if (!snap || !results) return;
+    for (const bucket of [snap.active, snap.custom, snap.removed, snap.planLocked, snap.web]) {
+      if (!Array.isArray(bucket)) continue;
+      for (const m of bucket) {
+        if (results[m.id]) m.health = results[m.id];
+      }
+    }
+  }
+
   function renderModels() {
     const grid = $('models-grid');
     const q = ($('models-search').value || '').trim().toLowerCase();
     const f = state.modelFilter;
+    const allModels = buildUnifiedModelsList();
 
-    const list = state.models.filter((m) => {
+    const list = allModels.filter((m) => {
       const id = String(m.id || '').toLowerCase();
       const name = String(m.display_name || m.displayName || '').toLowerCase();
+      const h = m.health;
       if (f === 'cloud' && m.provider !== 'cloud') return false;
       if (f === 'web' && m.provider !== 'web') return false;
+      if (f === 'new-locked' && !m.isNew && !m.disabled && !m.custom) return false;
+      if (f === 'working' && (!h || h.status !== 'working')) return false;
+      if (f === 'broken' && !m.removedFromCatalog && (!h || h.status === 'working')) return false;
       if (f === 'claude' && !id.includes('claude')) return false;
       if (f === 'gemini' && !id.includes('gemini')) return false;
       if (f === 'gpt' && !id.includes('gpt')) return false;
@@ -789,39 +962,72 @@
       const isWeb = m.provider === 'web';
       const caps = m.capabilities || {};
       const capBadges = [];
-      if (caps.tools === 'emulated') capBadges.push('<span class="badge badge-warn">tools: emulated</span>');
-      else if (caps.tools) capBadges.push('<span class="badge badge-ok">tools</span>');
-      if (caps.thinking) capBadges.push('<span class="badge badge-accent">thinking</span>');
+      if (m.isNew) capBadges.push(`<span class="badge badge-accent">${esc(t('models.badgeNew'))}</span>`);
+      if (m.custom) capBadges.push(`<span class="badge badge-accent">${esc(t('models.badgeCustom'))}</span>`);
+      if (m.disabled) capBadges.push(`<span class="badge badge-warn" title="${esc(m.tagDescription || '')}">🔒 ${esc(m.tagTitle || 'Plan')}</span>`);
+      if (m.removedFromCatalog) capBadges.push(`<span class="badge badge-err">${esc(t('models.badgeRemoved'))}</span>`);
+      if (!m.disabled) {
+        if (caps.tools === 'emulated') capBadges.push('<span class="badge badge-warn">tools: emulated</span>');
+        else if (caps.tools) capBadges.push('<span class="badge badge-ok">tools</span>');
+        if (caps.thinking) capBadges.push('<span class="badge badge-accent">thinking</span>');
+      }
+      const healthHtml = renderHealthBadge(m);
 
       return `
         <div class="model-card">
           <div class="stack-sm">
             <div class="row-between">
-              <span class="badge ${isWeb ? 'badge-accent' : 'badge-ok'}">${esc(m.provider || 'cloud')}</span>
+              <span class="badge ${isWeb ? 'badge-accent' : (m.disabled ? 'badge-neutral' : 'badge-ok')}">${esc(m.provider || 'cloud')}</span>
               <div class="badge-row">${capBadges.join('')}</div>
             </div>
             <div class="model-id">${esc(m.id)}</div>
             <div class="muted">${esc(m.displayName || m.display_name || m.id)}</div>
+            ${m.disabled && m.tagDescription ? `<div class="hint">${esc(m.tagDescription)}</div>` : ''}
+            ${healthHtml ? `<div class="badge-row">${healthHtml}</div>` : ''}
             <div class="muted mono-num">
               ${m.context_length ? `${esc(t('models.context'))}: ${esc(fmtCompact(m.context_length))}` : ''}
               ${m.max_completion_tokens ? ` · ${esc(t('models.maxOut'))}: ${esc(fmtCompact(m.max_completion_tokens))}` : ''}
             </div>
           </div>
           <div class="btn-group">
+            <button type="button" class="btn btn-secondary btn-xs model-check-btn" data-id="${esc(m.id)}" ${state.checkingModels.has(m.id) ? 'disabled' : ''}>${esc(t('models.checkOne'))}</button>
             <button type="button" class="btn btn-ghost btn-xs model-copy-btn" data-id="${esc(m.id)}">${esc(t('models.copyId'))}</button>
-            <button type="button" class="btn btn-primary btn-xs model-chat-btn" data-id="${esc(m.id)}">${esc(t('models.testInChat'))}</button>
+            ${!m.disabled ? `<button type="button" class="btn btn-primary btn-xs model-chat-btn" data-id="${esc(m.id)}">${esc(t('models.testInChat'))}</button>` : ''}
+            ${m.custom ? `<button type="button" class="btn btn-danger-soft btn-xs model-remove-btn" data-id="${esc(m.id)}">${esc(t('models.removeCustom'))}</button>` : ''}
           </div>
         </div>`;
     }).join('');
 
+    for (const btn of grid.querySelectorAll('.model-check-btn')) {
+      btn.addEventListener('click', () => checkSingleModel(btn.dataset.id));
+    }
     for (const btn of grid.querySelectorAll('.model-copy-btn')) {
       btn.addEventListener('click', () => copyText(btn.dataset.id));
     }
     for (const btn of grid.querySelectorAll('.model-chat-btn')) {
       btn.addEventListener('click', () => {
         const sel = $('chat-model-select');
-        if (sel) sel.value = btn.dataset.id;
+        if (sel) {
+          if (![...sel.options].some((o) => o.value === btn.dataset.id)) {
+            const opt = document.createElement('option');
+            opt.value = btn.dataset.id;
+            opt.textContent = btn.dataset.id;
+            sel.appendChild(opt);
+          }
+          sel.value = btn.dataset.id;
+        }
         switchTab('chat');
+      });
+    }
+    for (const btn of grid.querySelectorAll('.model-remove-btn')) {
+      btn.addEventListener('click', async () => {
+        try {
+          await api('POST', '/_models/custom', { action: 'remove', model: btn.dataset.id });
+          showToast('Пользовательская модель удалена', 'ok');
+          await refreshModels();
+        } catch (e) {
+          showToast(e.message, 'err');
+        }
       });
     }
   }
@@ -1443,12 +1649,61 @@
     });
 
     $('btn-refresh-all').addEventListener('click', () => loadAllData().then(() => showToast('Refreshed', 'ok')));
-    $('btn-refresh-limits').addEventListener('click', refreshLimits);
-    $('btn-refresh-models').addEventListener('click', () => Promise.all([refreshModels(), refreshLimits()]));
+    $('btn-refresh-limits').addEventListener('click', () => refreshLimits({ force: true }));
+    $('btn-refresh-models').addEventListener('click', () => Promise.all([refreshModels({ force: true }), refreshLimits({ force: true })]));
+    $('btn-check-all-models').addEventListener('click', checkAllModels);
+    $('btn-toggle-add-model').addEventListener('click', () => {
+      const bar = $('add-custom-model-bar');
+      bar.classList.toggle('hidden');
+      if (!bar.classList.contains('hidden')) $('custom-model-id').focus();
+    });
+    $('btn-save-custom-model').addEventListener('click', async () => {
+      const model = $('custom-model-id').value.trim();
+      const displayName = $('custom-model-name').value.trim();
+      if (!model) { showToast('Укажите ID модели', 'warn'); return; }
+      try {
+        await api('POST', '/_models/custom', { action: 'add', model, displayName });
+        $('custom-model-id').value = '';
+        $('custom-model-name').value = '';
+        $('add-custom-model-bar').classList.add('hidden');
+        showToast(`Добавлена модель cloud/${model.replace(/^cloud\//i, '')}`, 'ok');
+        await refreshModels();
+      } catch (e) {
+        showToast(e.message, 'err');
+      }
+    });
     $('btn-refresh-installs').addEventListener('click', async () => {
       state.installs = await api('GET', '/_installs?force=1');
       renderInstalls();
     });
+
+    const startGoogleOAuthAction = async () => {
+      try {
+        const res = await api('POST', '/_auth/oauth/start', { openBrowser: true });
+        if (!res || !res.ok) throw new Error('Не удалось запустить Google OAuth');
+        showToast('Открыт браузер для входа в Google. Выберите аккаунт с подпиской.', 'info');
+        if (state.oauthPollTimer) clearInterval(state.oauthPollTimer);
+        state.oauthPollTimer = setInterval(async () => {
+          try {
+            const st = await api('GET', '/_auth/oauth/status');
+            if (st.status === 'completed') {
+              clearInterval(state.oauthPollTimer);
+              state.oauthPollTimer = null;
+              showToast(`Аккаунт подключён: ${st.email || 'Google OAuth'}`, 'ok');
+              await loadAllData();
+              await Promise.all([refreshLimits({ force: true }), refreshModels({ force: true })]);
+            } else if (st.status === 'error' || st.status === 'timeout') {
+              clearInterval(state.oauthPollTimer);
+              state.oauthPollTimer = null;
+              showToast(st.error || 'Вход отменён', 'err');
+            }
+          } catch {}
+        }, 1500);
+      } catch (e) {
+        showToast(e.message, 'err');
+      }
+    };
+    if ($('btn-google-oauth')) $('btn-google-oauth').addEventListener('click', startGoogleOAuthAction);
 
     const createBackupAction = async () => {
       try {
