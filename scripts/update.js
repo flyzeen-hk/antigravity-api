@@ -123,6 +123,17 @@ function createBackup({ rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR ||
   return { ok: true, dir: dest, manifest };
 }
 
+function countFilesShallow(dir, depth = 0) {
+  if (depth > 3 || !fs.existsSync(dir)) return 0;
+  let total = 0;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (e.name === 'node_modules' || e.name === '.git' || e.name === 'manifest.json') continue;
+    if (e.isDirectory()) total += countFilesShallow(path.join(dir, e.name), depth + 1);
+    else total++;
+  }
+  return total;
+}
+
 function listBackups({ rootDir = ROOT_DIR } = {}) {
   const bkpRoot = path.join(rootDir, '_backups');
   if (!fs.existsSync(bkpRoot)) return [];
@@ -137,6 +148,8 @@ function listBackups({ rootDir = ROOT_DIR } = {}) {
     try {
       manifest = JSON.parse(fs.readFileSync(path.join(full, 'manifest.json'), 'utf8'));
     } catch {}
+    const manifestFilesCount = manifest && manifest.files ? Object.keys(manifest.files).length : 0;
+    const fileCount = manifestFilesCount || countFilesShallow(full);
     out.push({
       id: name,
       path: full,
@@ -145,7 +158,7 @@ function listBackups({ rootDir = ROOT_DIR } = {}) {
       version: (manifest && manifest.version) || '',
       gitCommit: (manifest && manifest.gitCommit) || '',
       hasBundle: !!(manifest && manifest.hasBundle) || fs.existsSync(path.join(full, 'repo.bundle')),
-      fileCount: manifest && manifest.files ? Object.keys(manifest.files).length : 0,
+      fileCount,
     });
   }
   return out;

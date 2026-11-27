@@ -50,6 +50,10 @@ const PUBLIC_FILES = {
   '/app.js': { file: path.join(ROOT_DIR, 'public', 'app.js'), type: 'application/javascript; charset=utf-8' },
   '/i18n.js': { file: path.join(ROOT_DIR, 'public', 'i18n.js'), type: 'application/javascript; charset=utf-8' },
   '/charts.js': { file: path.join(ROOT_DIR, 'public', 'charts.js'), type: 'application/javascript; charset=utf-8' },
+  '/icon.svg': { file: path.join(ROOT_DIR, 'public', 'icon.svg'), type: 'image/svg+xml' },
+  '/icon-192.png': { file: path.join(ROOT_DIR, 'public', 'icon-192.png'), type: 'image/png' },
+  '/icon-512.png': { file: path.join(ROOT_DIR, 'public', 'icon-512.png'), type: 'image/png' },
+  '/manifest.webmanifest': { file: path.join(ROOT_DIR, 'public', 'manifest.webmanifest'), type: 'application/manifest+json; charset=utf-8' },
   '/favicon.ico': { file: path.join(ROOT_DIR, 'assets', 'antigravity_api.ico'), type: 'image/x-icon' },
 };
 
@@ -618,12 +622,32 @@ async function startSupervisor({ autoStart = null } = {}) {
     }
 
     if (pathname === '/_web/browser/open' && req.method === 'POST') {
-      return sendJson(res, 200, cdpCookies.openGeminiLoginWindow());
+      const body = await readJsonBody(req);
+      const activeAcc = (cfg.geminiWeb.accounts || []).find((a) => a.name === cfg.geminiWeb.activeAccount);
+      const rawProxy = String(
+        body.proxy
+        || (body.accountName ? ((cfg.geminiWeb.accounts || []).find((a) => a.name === body.accountName)?.proxy || '') : '')
+        || (activeAcc && activeAcc.proxy)
+        || cfg.geminiWeb.proxy
+        || cfg.network.proxy
+        || ''
+      ).trim();
+      return sendJson(res, 200, cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy }));
     }
 
     if (pathname === '/_web/browser/import-cookies' && req.method === 'POST') {
       const body = await readJsonBody(req);
-      const resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true });
+      const targetAcc = body.accountName ? (cfg.geminiWeb.accounts || []).find((a) => a.name === body.accountName) : null;
+      const activeAcc = (cfg.geminiWeb.accounts || []).find((a) => a.name === cfg.geminiWeb.activeAccount);
+      const rawProxy = String(
+        body.proxy
+        || (targetAcc && targetAcc.proxy)
+        || (activeAcc && activeAcc.proxy)
+        || cfg.geminiWeb.proxy
+        || cfg.network.proxy
+        || ''
+      ).trim();
+      const resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true, proxy: rawProxy });
       let saved = false;
       if (resCdp.cookie && body.saveTo === 'single') {
         const patch = configLib.patchConfig(cfg, {
@@ -642,6 +666,28 @@ async function startSupervisor({ autoStart = null } = {}) {
         saved = true;
       }
       return sendJson(res, 200, { ok: resCdp.ok, count: resCdp.count, hasSapisid: resCdp.hasSapisid, has1Psid: resCdp.has1Psid, domains: resCdp.domains, hasAtToken: !!resCdp.atToken, saved });
+    }
+
+    if (pathname === '/_web/test' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const webProxy = String(body.proxy !== undefined ? body.proxy : (cfg.geminiWeb.proxy || cfg.network.proxy || '')).trim();
+      const tmpNet = new NetworkManager({ ...cfg, network: { ...cfg.network, proxy: webProxy } });
+      try {
+        const [geminiProbe, accountsProbe] = await Promise.all([
+          tmpNet.probe('https://gemini.google.com/app', 'web', 6000),
+          tmpNet.probe('https://accounts.google.com/', 'web', 6000),
+        ]);
+        const proxyCheck = webProxy ? await tmpNet.probeProxy(tmpNet.proxyForHost('web', 'gemini.google.com', webProxy), 5000) : null;
+        return sendJson(res, 200, {
+          ok: geminiProbe.ok && (!proxyCheck || proxyCheck.ok),
+          proxy: webProxy || '',
+          proxyCheck,
+          gemini: geminiProbe,
+          accounts: accountsProbe,
+        });
+      } finally {
+        tmpNet.destroyAll();
+      }
     }
 
     if ((pathname === '/_auth/extract' || pathname === '/_auth/reload') && req.method === 'POST') {

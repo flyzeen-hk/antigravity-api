@@ -4,7 +4,11 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Antigravity API — Control Panel</title>
-  <link rel="icon" href="/favicon.ico">
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
+  <link rel="alternate icon" href="/favicon.ico">
+  <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -13,9 +17,9 @@
     <div class="auth-card">
       <div class="auth-brand">
         <div class="brand-logo" aria-hidden="true">
-          <svg viewBox="0 0 32 32" width="26" height="26" fill="none">
-            <path d="M16 3L28 9.5V22.5L16 29L4 22.5V9.5L16 3Z" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"/>
-            <path d="M16 9L22 21H10L16 9Z" fill="currentColor" opacity="0.92"/>
+          <svg viewBox="0 0 256 256" width="26" height="26" fill="none">
+            <path d="M128 52 L60 194 M128 52 L196 194" stroke="currentColor" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="128" cy="158" r="18" fill="#22d3ee"/>
           </svg>
         </div>
         <div>
@@ -71,9 +75,9 @@
       <div class="sidebar-header">
         <div class="brand-mini" title="Antigravity API">
           <div class="brand-logo" aria-hidden="true">
-            <svg viewBox="0 0 32 32" width="20" height="20" fill="none">
-              <path d="M16 3L28 9.5V22.5L16 29L4 22.5V9.5L16 3Z" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/>
-              <path d="M16 9L22 21H10L16 9Z" fill="currentColor"/>
+            <svg viewBox="0 0 256 256" width="22" height="22" fill="none">
+              <path d="M128 52 L60 194 M128 52 L196 194" stroke="currentColor" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+              <circle cx="128" cy="158" r="18" fill="#22d3ee"/>
             </svg>
           </div>
           <div class="brand-text">
@@ -305,30 +309,16 @@
             <div id="live-logs-list" class="log-table-wrap"></div>
           </div>
 
-          <div class="two-col">
-            <!-- Installed Tools -->
-            <div class="card">
-              <div class="card-head">
-                <div>
-                  <h3 data-i18n="overview.installsTitle">Обнаруженные программы (IDE / CLI)</h3>
-                  <p class="muted" data-i18n="overview.installsSub">Установленные клиенты, извлечение OAuth-сессии и быстрый переход в папку</p>
-                </div>
-                <button id="btn-refresh-installs" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.refresh">Обновить</button>
+          <!-- Installed Tools -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h3 data-i18n="overview.installsTitle">Обнаруженные программы</h3>
+                <p class="muted" data-i18n="overview.installsSub">Установленные клиенты (Antigravity, Antigravity IDE, CLI) и пути</p>
               </div>
-              <div id="installs-list" class="stack-sm"></div>
+              <button id="btn-refresh-installs" type="button" class="btn btn-ghost btn-sm" data-i18n="actions.refresh">Обновить</button>
             </div>
-
-            <!-- Backups -->
-            <div class="card">
-              <div class="card-head">
-                <div>
-                  <h3 data-i18n="overview.backupsTitle">Снимки и бэкапы (_backups)</h3>
-                  <p class="muted" data-i18n="overview.backupsSub">Состояние конфигурации, ключей, авторизации и git-бандлы</p>
-                </div>
-                <button id="btn-create-backup" type="button" class="btn btn-secondary btn-sm" data-i18n="overview.createBackup">Создать бэкап сейчас</button>
-              </div>
-              <div id="backups-list" class="stack-sm"></div>
-            </div>
+            <div id="installs-list" class="stack-sm"></div>
           </div>
         </section>
 
@@ -400,6 +390,18 @@
               </div>
 
               <div class="stack-md">
+                <div class="field">
+                  <span data-i18n="web.proxyLabel">Прокси / VPN для Gemini Web и импорта cookie (HTTP или SOCKS5)</span>
+                  <div class="input-row">
+                    <input id="web-proxy-input" type="text" placeholder="http://127.0.0.1:10808 или socks5://127.0.0.1:10808">
+                    <button id="btn-web-detect-proxy" type="button" class="btn btn-secondary btn-xs" data-i18n="settings.findProxies">Найти прокси</button>
+                    <button id="btn-web-test-proxy" type="button" class="btn btn-ghost btn-xs" data-i18n="web.testGemini">Проверить Gemini</button>
+                  </div>
+                  <div id="web-detected-proxies" class="badge-row hidden"></div>
+                  <div id="web-test-result" class="network-test-box hidden"></div>
+                  <p class="hint" data-i18n="web.cdpHint">Обычные cookie браузера зашифрованы Windows DPAPI / Chrome v20, поэтому кнопка «Открыть Gemini в браузере» запускает изолированное окно с указанным прокси/VPN, а «Импорт cookie (CDP)» забирает расшифрованные cookie и atToken у самого браузера.</p>
+                </div>
+
                 <div class="row-between">
                   <div class="seg-control" id="web-cookie-mode-switch">
                     <button type="button" class="seg-btn active" data-mode="raw" data-i18n="web.modeRaw">Строка Cookie</button>
@@ -434,10 +436,6 @@
                       <option value="default" data-i18n="web.thinkDefault">Обычный (default)</option>
                       <option value="extended" data-i18n="web.thinkExtended">Расширенный (extended)</option>
                     </select>
-                  </label>
-                  <label class="field">
-                    <span data-i18n="web.proxyLabel">Прокси только для Gemini Web</span>
-                    <input id="web-proxy-input" type="text" placeholder="http://127.0.0.1:10808">
                   </label>
                   <label class="field">
                     <span data-i18n="web.historyMaxCharsLabel">Лимит контекста (historyMaxChars)</span>
@@ -839,6 +837,18 @@
                 </div>
               </div>
             </div>
+          </div>
+
+          <!-- Configuration Backups & Snapshots (Service utility) -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h3 data-i18n="overview.backupsTitle">Снимки и бэкапы (_backups)</h3>
+                <p class="muted" data-i18n="overview.backupsSub">Локальные архивные точки восстановления (автобэкап при обновлении, конфиги и git-бандлы)</p>
+              </div>
+              <button id="btn-create-backup" type="button" class="btn btn-secondary btn-sm" data-i18n="overview.createBackup">Создать бэкап сейчас</button>
+            </div>
+            <div id="backups-list" class="stack-sm"></div>
           </div>
         </section>
       </main>

@@ -6,6 +6,8 @@ const http = require('http');
 const os = require('os');
 const path = require('path');
 const { buildOpenExternalCommand, startInteractiveOAuth, getOAuthStatus } = require('../lib/auth');
+const { normalizeBrowserProxy } = require('../lib/cdp_cookies');
+const { detectAutoPaths } = require('../lib/installs');
 
 let passed = 0;
 function ok(cond, name) {
@@ -21,14 +23,34 @@ async function main() {
 
   try {
     const sampleUrl = 'https://accounts.google.com/o/oauth2/v2/auth?client_id=123&redirect_uri=http%3A%2F%2F127.0.0.1%3A9999%2Foauth-callback&response_type=code&prompt=select_account+consent';
-    const winCmd = buildOpenExternalCommand(sampleUrl, 'win32');
-    ok(winCmd.file === 'powershell.exe', 'win32 external opener uses powershell.exe instead of cmd.exe');
+    const winCmd = buildOpenExternalCommand(sampleUrl, 'win32', { preferDirectBrowser: false });
+    ok(winCmd.file === 'powershell.exe', 'win32 fallback external opener uses powershell.exe instead of cmd.exe');
     const encIdx = winCmd.args.indexOf('-EncodedCommand');
     ok(encIdx >= 0 && typeof winCmd.args[encIdx + 1] === 'string', 'win32 command encodes Start-Process via -EncodedCommand');
     const decoded = Buffer.from(winCmd.args[encIdx + 1], 'base64').toString('utf16le');
     ok(decoded.includes('&response_type=code') && decoded.includes('&prompt=select_account+consent'), 'win32 decoded command preserves all query params across & without cmd splitting');
 
+    if (process.platform === 'win32') {
+      const directCmd = buildOpenExternalCommand(sampleUrl, 'win32', { preferDirectBrowser: true });
+      ok(directCmd.args.includes(sampleUrl), 'win32 direct default browser command receives unsplit full OAuth URL');
+    }
+
     assert.throws(() => buildOpenExternalCommand('javascript:alert(1)', 'win32'), /http\/https/);
+
+    ok(normalizeBrowserProxy('http://127.0.0.1:10808') === 'http://127.0.0.1:10808', 'normalizeBrowserProxy preserves http proxy');
+    ok(normalizeBrowserProxy('socks5h://user:pass@127.0.0.1:1080') === 'socks5://127.0.0.1:1080', 'normalizeBrowserProxy converts socks5h to socks5 without credentials');
+    ok(normalizeBrowserProxy('127.0.0.1:8080') === 'http://127.0.0.1:8080', 'normalizeBrowserProxy adds http scheme to bare host:port');
+
+    // Installs: Antigravity vs Antigravity IDE must stay strictly independent
+    const fakeLocal = path.join(tmpDir, 'Local');
+    const fakeHome = path.join(tmpDir, 'Home');
+    fs.mkdirSync(path.join(fakeLocal, 'Programs', 'antigravity'), { recursive: true });
+    fs.writeFileSync(path.join(fakeLocal, 'Programs', 'antigravity', 'Antigravity.exe'), 'exe');
+    fs.mkdirSync(path.join(fakeLocal, 'Programs', 'Microsoft VS Code'), { recursive: true });
+    fs.writeFileSync(path.join(fakeLocal, 'Programs', 'Microsoft VS Code', 'Code.exe'), 'exe');
+    const det = detectAutoPaths({ platform: 'win32', env: { LOCALAPPDATA: fakeLocal, PATH: '' }, home: fakeHome, force: true });
+    ok(!!det.app && !det.ide, 'Antigravity IDE is not conflated with Antigravity.exe');
+    ok(!det.vscode, 'VS Code without Antigravity extension does not falsely appear as Antigravity for VS Code');
 
     const started = await startInteractiveOAuth({ authFile, openBrowser: false });
     ok(started.ok && started.status === 'pending', 'startInteractiveOAuth returns pending status');

@@ -2241,6 +2241,10 @@ function start(config) {
     '/app.js': { file: path.join(ROOT, 'public', 'app.js'), type: 'application/javascript; charset=utf-8' },
     '/i18n.js': { file: path.join(ROOT, 'public', 'i18n.js'), type: 'application/javascript; charset=utf-8' },
     '/charts.js': { file: path.join(ROOT, 'public', 'charts.js'), type: 'application/javascript; charset=utf-8' },
+    '/icon.svg': { file: path.join(ROOT, 'public', 'icon.svg'), type: 'image/svg+xml' },
+    '/icon-192.png': { file: path.join(ROOT, 'public', 'icon-192.png'), type: 'image/png' },
+    '/icon-512.png': { file: path.join(ROOT, 'public', 'icon-512.png'), type: 'image/png' },
+    '/manifest.webmanifest': { file: path.join(ROOT, 'public', 'manifest.webmanifest'), type: 'application/manifest+json; charset=utf-8' },
     '/favicon.ico': { file: path.join(ROOT, 'assets', 'antigravity_api.ico'), type: 'image/x-icon' },
   };
 
@@ -2645,8 +2649,21 @@ function start(config) {
 
       if (p === '/_web/browser/open' && req.method === 'POST') {
         if (!requireAdmin()) return;
+        let body = {};
         try {
-          const info = cdpCookies.openGeminiLoginWindow();
+          const raw = await readBody(req, 65536);
+          if (raw && raw.trim()) body = JSON.parse(raw);
+        } catch {}
+        const activeAcc = (config.geminiWeb.accounts || []).find((a) => a.name === config.geminiWeb.activeAccount);
+        const rawProxy = String(
+          body.proxy || (body.accountName ? ((config.geminiWeb.accounts || []).find((a) => a.name === body.accountName)?.proxy || '') : '')
+          || (activeAcc && activeAcc.proxy)
+          || config.geminiWeb.proxy
+          || config.network.proxy
+          || ''
+        ).trim();
+        try {
+          const info = cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy });
           return sendJson(res, 200, info);
         } catch (e) {
           return sendJson(res, 500, { error: { message: e.message, code: e.code || 'browser_open_failed' } });
@@ -2657,8 +2674,18 @@ function start(config) {
         if (!requireAdmin()) return;
         const body = await readJsonObj(req, res);
         if (!body) return;
+        const targetAcc = body.accountName ? (config.geminiWeb.accounts || []).find((a) => a.name === body.accountName) : null;
+        const activeAcc = (config.geminiWeb.accounts || []).find((a) => a.name === config.geminiWeb.activeAccount);
+        const rawProxy = String(
+          body.proxy
+          || (targetAcc && targetAcc.proxy)
+          || (activeAcc && activeAcc.proxy)
+          || config.geminiWeb.proxy
+          || config.network.proxy
+          || ''
+        ).trim();
         try {
-          const resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true });
+          const resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true, proxy: rawProxy });
           let saved = false;
           if (resCdp.cookie && body.saveTo === 'single') {
             const patch = configLib.patchConfig(config, {
@@ -2702,6 +2729,33 @@ function start(config) {
           });
         } catch (e) {
           return sendJson(res, 500, { error: { message: e.message, code: e.code || 'cdp_import_failed' } });
+        }
+      }
+
+      if (p === '/_web/test' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        const body = await readJsonObj(req, res);
+        if (!body) return;
+        const webProxy = String(body.proxy !== undefined ? body.proxy : (config.geminiWeb.proxy || config.network.proxy || '')).trim();
+        const tmpNet = new NetworkManager({
+          ...config,
+          network: { ...config.network, proxy: webProxy },
+        });
+        try {
+          const [geminiProbe, accountsProbe] = await Promise.all([
+            tmpNet.probe('https://gemini.google.com/app', 'web', 6000),
+            tmpNet.probe('https://accounts.google.com/', 'web', 6000),
+          ]);
+          const proxyCheck = webProxy ? await tmpNet.probeProxy(tmpNet.proxyForHost('web', 'gemini.google.com', webProxy), 5000) : null;
+          return sendJson(res, 200, {
+            ok: geminiProbe.ok && (!proxyCheck || proxyCheck.ok),
+            proxy: webProxy || '',
+            proxyCheck,
+            gemini: geminiProbe,
+            accounts: accountsProbe,
+          });
+        } finally {
+          tmpNet.destroyAll();
         }
       }
 

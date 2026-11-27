@@ -200,6 +200,10 @@
       stopBtn.classList.toggle('hidden', st !== 'running');
       stopBtn.disabled = busy;
     }
+    const logoutBtn = $('btn-logout');
+    if (logoutBtn) {
+      logoutBtn.classList.toggle('hidden', !!state.supervisorManaged);
+    }
 
     if (st !== 'running') {
       state.uptimeSyncedAt = 0;
@@ -498,7 +502,6 @@
       renderUsageSection();
       renderLogsAndTelemetry();
       renderInstalls();
-      renderBackups();
     } else if (tabName === 'models') {
       renderModels();
       renderModelAndChatBanners();
@@ -512,6 +515,7 @@
       renderConnection();
     } else if (tabName === 'settings') {
       renderSettings();
+      renderBackups();
     }
   }
 
@@ -714,7 +718,7 @@
           <div class="btn-group">
             ${item.found ? `<button type="button" class="btn btn-secondary btn-xs install-open-btn" data-key="${esc(item.key)}">${esc(t('actions.openFolder'))}</button>` : ''}
             ${hasPath ? `<button type="button" class="btn btn-ghost btn-xs install-copy-btn" data-path="${esc(item.path)}">${esc(t('actions.copy'))}</button>` : ''}
-            ${item.key === 'app' && item.found ? `<button type="button" class="btn btn-primary btn-xs install-extract-btn">${esc(t('overview.extractToken'))}</button>` : ''}
+            ${item.key === 'ide' && item.found ? `<button type="button" class="btn btn-primary btn-xs install-extract-btn">${esc(t('overview.extractToken'))}</button>` : ''}
             <button type="button" class="btn btn-ghost btn-xs install-edit-btn" data-key="${esc(item.key)}">${esc(isEditing ? t('actions.cancel') : t('actions.editPath'))}</button>
           </div>
           ${isEditing ? `
@@ -792,7 +796,7 @@
         </div>
         <div class="row-between muted">
           <span>${esc(b.createdAt ? new Date(b.createdAt).toLocaleString() : '—')}</span>
-          <span>v${esc(b.version || '?')} · ${esc(b.fileCount || 0)} state files</span>
+          <span>${b.version ? `v${esc(b.version)} · ` : ''}${esc(b.fileCount || 0)} files</span>
         </div>
       </div>`).join('');
   }
@@ -1779,10 +1783,61 @@
     $('web-cookie-input').addEventListener('input', updateCookieValidationBadges);
     $('web-cookie-file-input').addEventListener('input', updateCookieValidationBadges);
 
+    $('btn-web-detect-proxy').addEventListener('click', async () => {
+      const wrap = $('web-detected-proxies');
+      try {
+        const res = await api('POST', '/_network/detect-proxy', {});
+        const proxies = res.proxies || [];
+        if (!proxies.length) {
+          wrap.innerHTML = '<span class="muted">Локальный прокси/VPN не найден. Укажите URL прокси вручную (http:// или socks5://) или включите системный VPN.</span>';
+          wrap.classList.remove('hidden');
+          return;
+        }
+        wrap.innerHTML = proxies.map((p) => `
+          <button type="button" class="pill" data-proxy="${esc(p.url)}" title="${esc(p.source)}">
+            ${esc(p.maskedUrl || p.url)} (${esc(p.source)}${p.reachable ? ' ✓' : ''})
+          </button>`).join('');
+        wrap.classList.remove('hidden');
+        for (const btn of wrap.querySelectorAll('.pill[data-proxy]')) {
+          btn.addEventListener('click', () => {
+            $('web-proxy-input').value = btn.dataset.proxy;
+            showToast('Прокси подставлен в поле Gemini Web', 'info');
+          });
+        }
+      } catch (e) {
+        showToast(e.message, 'err');
+      }
+    });
+
+    $('btn-web-test-proxy').addEventListener('click', async () => {
+      const box = $('web-test-result');
+      box.classList.remove('hidden');
+      box.textContent = 'Проверка доступа к gemini.google.com и accounts.google.com…';
+      try {
+        const proxy = $('web-proxy-input').value.trim();
+        const res = await api('POST', '/_web/test', { proxy });
+        const parts = [];
+        if (res.proxyCheck) {
+          parts.push(`<span class="badge ${res.proxyCheck.ok ? 'badge-ok' : 'badge-err'}">Proxy: ${res.proxyCheck.ok ? `OK (${res.proxyCheck.ms}ms)` : esc(res.proxyCheck.error || 'ERR')}</span>`);
+        }
+        if (res.gemini) {
+          parts.push(`<span class="badge ${res.gemini.ok ? 'badge-ok' : 'badge-err'}">Gemini Web: ${res.gemini.ok ? `OK (${res.gemini.ms}ms, ${res.gemini.via})` : esc(res.gemini.error || 'ERR')}</span>`);
+        }
+        if (res.accounts) {
+          parts.push(`<span class="badge ${res.accounts.ok ? 'badge-ok' : 'badge-err'}">Google Login: ${res.accounts.ok ? `OK (${res.accounts.ms}ms, ${res.accounts.via})` : esc(res.accounts.error || 'ERR')}</span>`);
+        }
+        box.innerHTML = `<div class="badge-row">${parts.join(' ')}</div>`;
+      } catch (e) {
+        box.textContent = `Ошибка теста: ${e.message}`;
+      }
+    });
+
     $('btn-web-open-browser').addEventListener('click', async () => {
       try {
-        const res = await api('POST', '/_web/browser/open', {});
-        showToast(`Opened browser (${res.executable ? res.executable.split(/[\\/]/).pop() : 'CDP'})`, 'ok');
+        const proxy = $('web-proxy-input').value.trim();
+        const res = await api('POST', '/_web/browser/open', { proxy });
+        const proxyNote = res.proxy ? ` через ${res.proxy}` : '';
+        showToast(`Открыт браузер (${res.executable ? res.executable.split(/[\\/]/).pop() : 'CDP'})${proxyNote}`, 'ok');
       } catch (e) {
         showToast(e.message, 'err');
       }
@@ -1790,7 +1845,8 @@
 
     $('btn-web-import-cdp').addEventListener('click', async () => {
       try {
-        const res = await api('POST', '/_web/browser/import-cookies', { saveTo: 'single' });
+        const proxy = $('web-proxy-input').value.trim();
+        const res = await api('POST', '/_web/browser/import-cookies', { saveTo: 'single', proxy });
         showToast(`Imported ${res.count || 0} cookies (SAPISID: ${res.hasSapisid ? 'OK' : 'No'})`, res.hasSapisid ? 'ok' : 'warn');
         state.config = await api('GET', '/_config');
         renderWebSection();
@@ -1884,7 +1940,8 @@
       const accountName = $('acc-name-input').value.trim();
       if (!accountName) { showToast('Enter Account Name first', 'warn'); return; }
       try {
-        const res = await api('POST', '/_web/browser/import-cookies', { saveTo: 'account', accountName });
+        const proxy = $('acc-proxy-input').value.trim() || $('web-proxy-input').value.trim();
+        const res = await api('POST', '/_web/browser/import-cookies', { saveTo: 'account', accountName, proxy });
         showToast(`Imported ${res.count || 0} cookies -> ${accountName}`, 'ok');
         state.webAccounts = await api('GET', '/_web/accounts');
         state.config = await api('GET', '/_config');

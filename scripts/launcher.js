@@ -22,6 +22,7 @@ const http = require('http');
 const { spawn } = require('child_process');
 const { readJsonFile } = require('../lib/safe_files');
 const { findBrowserExecutable } = require('../lib/cdp_cookies');
+const { openExternalUrl } = require('../lib/auth');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT_DIR;
@@ -127,18 +128,12 @@ function openUiWindow(url, { preferBrowser = false } = {}) {
     }
   }
 
-  if (process.platform === 'win32') {
+  if (!openExternalUrl(url)) {
     const psScript = `Start-Process -FilePath '${String(url).replace(/'/g, "''")}'`;
     const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
     const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded], {
       detached: true, stdio: 'ignore', windowsHide: true,
     });
-    child.unref();
-  } else if (process.platform === 'darwin') {
-    const child = spawn('open', [url], { detached: true, stdio: 'ignore' });
-    child.unref();
-  } else {
-    const child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
     child.unref();
   }
   return { mode: 'browser' };
