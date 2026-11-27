@@ -435,6 +435,8 @@ async function startSupervisor({ autoStart = null } = {}) {
     return await startServer();
   }
 
+  const proxyAgent = new http.Agent({ keepAlive: true, maxSockets: 16 });
+
   function proxyToRunningServer(req, res, pathnameAndQuery) {
     const cfg = readNormalizedConfig();
     const adminKey = cfg.adminKey || cfg.apiKey || '';
@@ -450,6 +452,7 @@ async function startSupervisor({ autoStart = null } = {}) {
       headers.authorization = `Bearer ${adminKey}`;
     }
     const upReq = http.request({
+      agent: proxyAgent,
       host: activeHost,
       port: activePort,
       path: pathnameAndQuery,
@@ -652,7 +655,10 @@ async function startSupervisor({ autoStart = null } = {}) {
     }
 
     if (pathname === '/_installs') {
-      if (req.method === 'GET') return sendJson(res, 200, installsLib.detectInstallations(DATA_DIR));
+      if (req.method === 'GET') {
+        const force = /[?&]force=1(?:&|$)/.test(req.url || '');
+        return sendJson(res, 200, installsLib.detectInstallations(DATA_DIR, { force }));
+      }
       const body = await readJsonBody(req);
       return sendJson(res, 200, installsLib.setInstallPath(DATA_DIR, body.key, body.path));
     }

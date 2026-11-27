@@ -323,7 +323,7 @@ async function main() {
   assert.ok(Date.now() - started < 5000, 'таймаут сработал за ' + (Date.now() - started) + ' мс');
   assert.ok(/timed out|aborted|socket hang up/i.test(String(bodyErr.message || bodyErr)), 'ошибка таймаута: ' + bodyErr.message);
 
-  // Мёртвый прокси обязан отказать (ECONNREFUSED), а не молча пойти напрямую.
+  // Мёртвый прокси обязан отказать (ECONNREFUSED), а не молча пойти напрямую при прямом запросе.
   const deadSrv = net.createServer();
   const deadPort = await listen(deadSrv);
   await new Promise((r) => deadSrv.close(r));
@@ -331,6 +331,10 @@ async function main() {
   const deadProbe = await deadMgr.probe(`https://127.0.0.1:${slowTlsPort}/`, 'upstream', 1500);
   assert.strictEqual(deadProbe.ok, false, 'недоступный прокси не должен молча обходиться напрямую');
   assert.match(String(deadProbe.error || ''), /ECONNREFUSED|refused|timeout/i);
+  // А autoDetect() при старте сервера обязан распознать незапущенный loopback-прокси и переключиться на direct/relay.
+  await deadMgr.autoDetect();
+  assert.strictEqual(deadMgr.summary().deadProxy, `http://127.0.0.1:${deadPort}`, 'autoDetect фиксирует deadProxy');
+  assert.strictEqual(deadMgr.proxyForHost('oauth', 'oauth2.googleapis.com'), null, 'мёртвый loopback-прокси обходится после autoDetect');
   deadMgr.destroyAll();
   netMgr.destroyAll();
   removeTree(tlsDir);

@@ -116,6 +116,10 @@ function openUiWindow(url, { preferBrowser = false } = {}) {
         '--no-first-run',
         '--no-default-browser-check',
         '--disable-extensions',
+        '--disable-sync',
+        '--disable-background-networking',
+        '--disable-component-update',
+        '--disable-features=TranslateUI',
         '--window-size=1320,880',
       ], { detached: true, stdio: 'ignore' });
       child.unref();

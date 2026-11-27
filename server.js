@@ -523,9 +523,9 @@ function start(config) {
   const stats = { startedAt: new Date().toISOString(), requests: 0, errors: 0, blocked: 0 };
   let lastCatalogError = '';
   const waitNetworkReady = async () => {
-    if (network && network._autoDnsPromise) {
+    if (network && typeof network.autoDetect === 'function') {
       try {
-        await Promise.race([network._autoDnsPromise, new Promise((r) => setTimeout(r, 1500))]);
+        await Promise.race([network.autoDetect(), new Promise((r) => setTimeout(r, 1500))]);
       } catch {}
     }
   };
@@ -2690,6 +2690,7 @@ function start(config) {
         guard.updateConfig(config.safeMode);
         webBridge.updateConfig(config.geminiWeb);
         network.updateConfig(config);
+        if (typeof network.autoDetect === 'function') network.autoDetect();
 
         if (patch.applied.length) {
           const saveErr = saveConfigFile();
@@ -2748,7 +2749,8 @@ function start(config) {
       if (p === '/_installs') {
         if (!requireAdmin()) return;
         if (req.method === 'GET') {
-          return sendJson(res, 200, installsLib.detectInstallations(DATA_DIR));
+          const force = u.searchParams.get('force') === '1';
+          return sendJson(res, 200, installsLib.detectInstallations(DATA_DIR, { force }));
         }
         if (req.method === 'POST') {
           const body = await readJsonObj(req, res);

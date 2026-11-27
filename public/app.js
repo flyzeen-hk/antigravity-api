@@ -35,6 +35,10 @@
     uptimeBase: 0,
     uptimeSyncedAt: 0,
     es: null,
+    loadPromise: null,
+    dirtyTabs: new Set(),
+    logsRenderTimer: null,
+    lastControlSig: '',
   };
 
   const $ = (id) => document.getElementById(id);
@@ -142,8 +146,11 @@
     return `${r}s`;
   }
 
-  function updateServerControls() {
+  function updateServerControls(force = false) {
     const st = state.serverState;
+    const sig = `${state.supervisorManaged ? 1 : 0}|${st}|${getLang()}`;
+    if (!force && sig === state.lastControlSig) return;
+    state.lastControlSig = sig;
     const pill = $('live-status-pill');
     const txt = $('live-status-text');
     const startBtn = $('btn-start-server');
@@ -206,6 +213,9 @@
       sec.classList.toggle('active', sec.id === `tab-${tabName}`);
     }
     $('sidebar').classList.remove('mobile-open');
+    if (state.dirtyTabs.has(tabName)) {
+      renderTab(tabName);
+    }
   }
 
   function askConfirm(title, message, okDanger = true) {
@@ -268,56 +278,60 @@
   }
 
   async function loadAllData() {
-    await refreshSupervisorStatus();
+    if (state.loadPromise) return state.loadPromise;
+    state.loadPromise = (async () => {
+      await refreshSupervisorStatus();
 
-    const [statusR, configR, keysR, usageR, logsR, installsR, startupR, backupsR, accountsR] = await Promise.allSettled([
-      api('GET', '/_status'),
-      api('GET', '/_config'),
-      api('GET', '/_keys'),
-      api('GET', '/_usage'),
-      api('GET', '/_logs'),
-      api('GET', '/_installs'),
-      api('GET', '/_startup'),
-      api('GET', '/_backups'),
-      api('GET', '/_web/accounts'),
-    ]);
+      const [statusR, configR, keysR, usageR, logsR, installsR, startupR, backupsR, accountsR] = await Promise.allSettled([
+        api('GET', '/_status'),
+        api('GET', '/_config'),
+        api('GET', '/_keys'),
+        api('GET', '/_usage'),
+        api('GET', '/_logs'),
+        api('GET', '/_installs'),
+        api('GET', '/_startup'),
+        api('GET', '/_backups'),
+        api('GET', '/_web/accounts'),
+      ]);
 
-    if (statusR.status === 'fulfilled') {
-      state.status = statusR.value;
-      if (state.status.serverRunning === false) {
-        state.serverState = 'stopped';
-      } else if (!state.supervisorManaged) {
-        state.serverState = 'running';
+      if (statusR.status === 'fulfilled') {
+        state.status = statusR.value;
+        if (state.status.serverRunning === false) {
+          state.serverState = 'stopped';
+        } else if (!state.supervisorManaged) {
+          state.serverState = 'running';
+        }
+        if (state.serverState === 'running') {
+          state.uptimeBase = Number(state.status.uptime) || 0;
+          state.uptimeSyncedAt = Date.now();
+        }
       }
-      if (state.serverState === 'running') {
-        state.uptimeBase = Number(state.status.uptime) || 0;
-        state.uptimeSyncedAt = Date.now();
+      if (configR.status === 'fulfilled') {
+        state.config = configR.value;
+        if (state.config.language && state.config.language !== getLang()) {
+          setLang(state.config.language);
+          applyTranslations();
+          $('lang-btn').textContent = getLang().toUpperCase();
+        }
+        applyTheme(state.config.theme === 'light' ? 'light' : 'dark');
       }
-    }
-    if (configR.status === 'fulfilled') {
-      state.config = configR.value;
-      if (state.config.language && state.config.language !== getLang()) {
-        setLang(state.config.language);
-        applyTranslations();
-        $('lang-btn').textContent = getLang().toUpperCase();
-      }
-      applyTheme(state.config.theme === 'light' ? 'light' : 'dark');
-    }
-    if (keysR.status === 'fulfilled') state.keys = keysR.value;
-    if (usageR.status === 'fulfilled') state.usage = usageR.value;
-    if (logsR.status === 'fulfilled') state.logs = Array.isArray(logsR.value.logs) ? logsR.value.logs : [];
-    if (installsR.status === 'fulfilled') state.installs = installsR.value;
-    if (startupR.status === 'fulfilled') state.startup = startupR.value;
-    if (backupsR.status === 'fulfilled') state.backups = Array.isArray(backupsR.value.backups) ? backupsR.value.backups : [];
-    if (accountsR.status === 'fulfilled') state.webAccounts = accountsR.value;
+      if (keysR.status === 'fulfilled') state.keys = keysR.value;
+      if (usageR.status === 'fulfilled') state.usage = usageR.value;
+      if (logsR.status === 'fulfilled') state.logs = Array.isArray(logsR.value.logs) ? logsR.value.logs : [];
+      if (installsR.status === 'fulfilled') state.installs = installsR.value;
+      if (startupR.status === 'fulfilled') state.startup = startupR.value;
+      if (backupsR.status === 'fulfilled') state.backups = Array.isArray(backupsR.value.backups) ? backupsR.value.backups : [];
+      if (accountsR.status === 'fulfilled') state.webAccounts = accountsR.value;
 
-    updateServerControls();
-    renderAll();
+      updateServerControls();
+      renderAll();
 
-    await Promise.allSettled([
-      refreshLimits(),
-      refreshModels(),
-    ]);
+      await Promise.allSettled([
+        refreshLimits(),
+        refreshModels(),
+      ]);
+    })().finally(() => { state.loadPromise = null; });
+    return state.loadPromise;
   }
 
   async function refreshLimits() {
@@ -393,7 +407,10 @@
           state.status.blocked = hb.blocked;
           state.uptimeBase = Number(hb.uptime) || 0;
           state.uptimeSyncedAt = Date.now();
-          renderOverviewKpis();
+          if (state.activeTab === 'overview') {
+            $('kpi-requests').textContent = fmtCompact(hb.requests || 0);
+            $('kpi-errors').textContent = `${hb.errors || 0} / ${hb.blocked || 0}`;
+          }
         }
         updateServerControls();
       } catch {}
@@ -410,11 +427,27 @@
           state.status.requests = data.stats.requests;
           state.status.errors = data.stats.errors;
           state.status.blocked = data.stats.blocked;
-          renderOverviewKpis();
+          if (state.activeTab === 'overview') {
+            $('kpi-requests').textContent = fmtCompact(data.stats.requests || 0);
+            $('kpi-errors').textContent = `${data.stats.errors || 0} / ${data.stats.blocked || 0}`;
+          }
         }
-        renderLogsAndTelemetry();
+        scheduleLogsRender();
       } catch {}
     });
+  }
+
+  function scheduleLogsRender() {
+    if (state.activeTab !== 'overview') {
+      state.dirtyTabs.add('overview');
+      return;
+    }
+    if (state.logsRenderTimer) return;
+    state.logsRenderTimer = setTimeout(() => {
+      state.logsRenderTimer = null;
+      if (state.activeTab === 'overview') renderLogsAndTelemetry();
+      else state.dirtyTabs.add('overview');
+    }, 150);
   }
 
   function closeEventStream() {
@@ -426,20 +459,41 @@
 
   // ---- Rendering ----
 
+  function renderTab(tabName) {
+    state.dirtyTabs.delete(tabName);
+    if (tabName === 'overview') {
+      renderOverviewKpis();
+      renderLimitsAndAuth();
+      renderUsageSection();
+      renderLogsAndTelemetry();
+      renderInstalls();
+      renderBackups();
+    } else if (tabName === 'models') {
+      renderModels();
+      renderModelAndChatBanners();
+    } else if (tabName === 'gemini-web') {
+      renderWebSection();
+    } else if (tabName === 'chat') {
+      populateChatModelSelect();
+      renderChatMessages();
+      renderModelAndChatBanners();
+    } else if (tabName === 'connection') {
+      renderConnection();
+    } else if (tabName === 'settings') {
+      renderSettings();
+    }
+  }
+
   function renderAll() {
-    renderOverviewKpis();
-    renderLimitsAndAuth();
-    renderUsageSection();
-    renderLogsAndTelemetry();
-    renderInstalls();
-    renderBackups();
-    renderModels();
-    renderModelAndChatBanners();
-    renderWebSection();
-    renderConnection();
-    renderSettings();
-    populateChatModelSelect();
-    renderChatMessages();
+    for (const tab of ['overview', 'models', 'gemini-web', 'chat', 'connection', 'settings']) {
+      state.dirtyTabs.add(tab);
+    }
+    if (state.status) {
+      $('sidebar-version').textContent = `v${state.status.version || '2.0.0'}`;
+      $('sidebar-listen').textContent = `${state.status.host || '127.0.0.1'}:${state.status.port || 8317}`;
+      $('sidebar-node').textContent = state.status.nodeVersion || '—';
+    }
+    renderTab(state.activeTab);
   }
 
   function renderOverviewKpis() {
@@ -624,7 +678,7 @@
           <div class="btn-group">
             ${item.found ? `<button type="button" class="btn btn-secondary btn-xs install-open-btn" data-key="${esc(item.key)}">${esc(t('actions.openFolder'))}</button>` : ''}
             ${hasPath ? `<button type="button" class="btn btn-ghost btn-xs install-copy-btn" data-path="${esc(item.path)}">${esc(t('actions.copy'))}</button>` : ''}
-            ${item.key === 'ide' && item.found ? `<button type="button" class="btn btn-primary btn-xs install-extract-btn">${esc(t('overview.extractToken'))}</button>` : ''}
+            ${item.key === 'app' && item.found ? `<button type="button" class="btn btn-primary btn-xs install-extract-btn">${esc(t('overview.extractToken'))}</button>` : ''}
             <button type="button" class="btn btn-ghost btn-xs install-edit-btn" data-key="${esc(item.key)}">${esc(isEditing ? t('actions.cancel') : t('actions.editPath'))}</button>
           </div>
           ${isEditing ? `
@@ -1366,7 +1420,7 @@
         applyTranslations();
         $('lang-btn').textContent = next.toUpperCase();
         applyTheme(state.theme);
-        updateServerControls();
+        updateServerControls(true);
         renderAll();
         await persistUiPref({ language: next });
       });
@@ -1392,7 +1446,7 @@
     $('btn-refresh-limits').addEventListener('click', refreshLimits);
     $('btn-refresh-models').addEventListener('click', () => Promise.all([refreshModels(), refreshLimits()]));
     $('btn-refresh-installs').addEventListener('click', async () => {
-      state.installs = await api('GET', '/_installs');
+      state.installs = await api('GET', '/_installs?force=1');
       renderInstalls();
     });
 
@@ -1785,7 +1839,7 @@
         const elapsed = Math.floor((Date.now() - state.uptimeSyncedAt) / 1000);
         $('topbar-uptime').textContent = formatUptime(state.uptimeBase + elapsed);
       }
-      if (state.serverState === 'running') {
+      if (state.serverState === 'running' && state.activeTab === 'overview') {
         tickResetCountdowns($('quota-gauges-root'), t);
       }
     }, 1000);
