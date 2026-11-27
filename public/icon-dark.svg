@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs>
+  <linearGradient id="whiteTileBg" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#FFFFFF"/>
+    <stop offset="100%" stop-color="#F1F5F9"/>
+  </linearGradient>
+  <linearGradient id="darkTileBg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#1E293B"/>
+    <stop offset="60%" stop-color="#0F172A"/>
+    <stop offset="100%" stop-color="#090D16"/>
+  </linearGradient>
+  <linearGradient id="pillBlue" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#388BFF"/>
+    <stop offset="100%" stop-color="#1D4ED8"/>
+  </linearGradient>
+  <linearGradient id="pillDark" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#1E293B"/>
+    <stop offset="100%" stop-color="#0F172A"/>
+  </linearGradient>
+  <linearGradient id="meshBgBase" x1="0" y1="1" x2="1" y2="0">
+    <stop offset="0%" stop-color="#2563EB"/>
+    <stop offset="100%" stop-color="#3182FF"/>
+  </linearGradient>
+  <radialGradient id="meshGreen" cx="15%" cy="32%" r="65%">
+    <stop offset="0%" stop-color="#34A853" stop-opacity="0.96"/>
+    <stop offset="100%" stop-color="#34A853" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="meshGold" cx="54%" cy="10%" r="55%">
+    <stop offset="0%" stop-color="#FBBC05" stop-opacity="0.96"/>
+    <stop offset="100%" stop-color="#FBBC05" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="meshRed" cx="88%" cy="22%" r="62%">
+    <stop offset="0%" stop-color="#EA4335" stop-opacity="0.96"/>
+    <stop offset="100%" stop-color="#EA4335" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="rainbowStroke" x1="0" y1="1" x2="1" y2="0">
+    <stop offset="0%" stop-color="#3182FF"/>
+    <stop offset="35%" stop-color="#34A853"/>
+    <stop offset="68%" stop-color="#FBBC05"/>
+    <stop offset="100%" stop-color="#EA4335"/>
+  </linearGradient>
+</defs>
+      <rect x="12" y="12" width="232" height="232" rx="54" fill="url(#rainbowStroke)"/>
+      <clipPath id="f08-clip"><rect x="19" y="19" width="218" height="218" rx="47"/></clipPath>
+      <g clip-path="url(#f08-clip)">
+        <rect x="19" y="19" width="218" height="218" fill="url(#darkTileBg)"/>
+        <rect x="19" y="19" width="218" height="54" fill="#1E293B"/>
+        <line x1="19" y1="73" x2="237" y2="73" stroke="#334155" stroke-width="2"/>
+        <circle cx="64" cy="46" r="8.5" fill="#EA4335"/>
+        <circle cx="90" cy="46" r="8.5" fill="#FBBC05"/>
+        <circle cx="116" cy="46" r="8.5" fill="#34A853"/>
+        <path d="M 168 38 L 181 46 L 168 54" fill="none" stroke="#93C5FD" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <line x1="186" y1="53" x2="199" y2="53" stroke="#60A5FA" stroke-width="5.2" stroke-linecap="round"/>
+        
+  <defs>
+    <path id="f08-shape" d="M 128 52 C 146 52, 158 76, 167 109 C 177 143, 188 172, 203 187 C 209 193, 203 201, 193 198 C 180 194, 168 175, 157 156 C 146 138, 138 133, 128 133 C 118 133, 110 138, 99 156 C 88 175, 76 194, 63 198 C 53 201, 47 193, 53 187 C 68 172, 79 143, 89 109 C 98 76, 110 52, 128 52 Z"/>
+    <linearGradient id="f08-blue" x1="0.2" y1="0.9" x2="0.8" y2="0.1">
+      <stop offset="0%" stop-color="#53A3FF"/>
+      <stop offset="45%" stop-color="#2B7BFF"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <radialGradient id="f08-green" cx="31%" cy="40%" r="32%">
+      <stop offset="0%" stop-color="#34A853" stop-opacity="0.98"/>
+      <stop offset="55%" stop-color="#34A853" stop-opacity="0.65"/>
+      <stop offset="100%" stop-color="#34A853" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="f08-yellow" cx="44%" cy="14%" r="24%">
+      <stop offset="0%" stop-color="#FBBC05" stop-opacity="1"/>
+      <stop offset="65%" stop-color="#F59E0B" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#FBBC05" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="f08-red" cx="62%" cy="22%" r="30%">
+      <stop offset="0%" stop-color="#EA4335" stop-opacity="0.98"/>
+      <stop offset="60%" stop-color="#F43F5E" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#EA4335" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <g transform="translate(114,142) scale(0.72) translate(-128,-128)">
+    <use href="#f08-shape" fill="url(#f08-blue)"/>
+    <use href="#f08-shape" fill="url(#f08-green)"/>
+    <use href="#f08-shape" fill="url(#f08-yellow)"/>
+    <use href="#f08-shape" fill="url(#f08-red)"/>
+  </g>
+        <rect x="103" y="162" width="114" height="54" rx="18" fill="#0F172A"/>
+        <rect x="109" y="168" width="102" height="42" rx="13" fill="url(#pillBlue)"/>
+        <text x="160" y="199" text-anchor="middle" font-family="Segoe UI, Inter, Arial, sans-serif" font-weight="900" font-size="29" letter-spacing="1.5" fill="#FFFFFF">API</text>
+      </g>
+    </svg>

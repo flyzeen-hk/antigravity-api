@@ -44,10 +44,11 @@ function request(urlStr, opts = {}) {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf8');
+        const buf = Buffer.concat(chunks);
+        const text = buf.toString('utf8');
         let json = null;
         try { json = JSON.parse(text); } catch {}
-        resolve({ status: res.statusCode, headers: res.headers, text, json });
+        resolve({ status: res.statusCode, headers: res.headers, buf, text, json });
       });
     });
     req.on('error', reject);
@@ -116,6 +117,27 @@ async function main() {
     }
     const statusOff = await request(`${base}/_status`, { headers });
     ok(statusOff.json?.supervised === true && statusOff.json?.serverRunning === false, '/_status reports supervised=true serverRunning=false offline');
+
+    const darkSvg = await request(`${base}/icon-dark.svg`);
+    const lightSvg = await request(`${base}/icon-light.svg`);
+    const darkIco = await request(`${base}/favicon-dark.ico`);
+    const lightIco = await request(`${base}/favicon-light.ico`);
+    ok(darkSvg.status === 200 && lightSvg.status === 200 && darkSvg.text !== lightSvg.text, '/icon-dark.svg and /icon-light.svg serve distinct theme SVGs');
+    ok(darkIco.status === 200 && lightIco.status === 200 && !darkIco.buf.equals(lightIco.buf), '/favicon-dark.ico and /favicon-light.ico serve distinct ICOs');
+
+    const initIcon = await request(`${base}/icon.svg`);
+    const initManifest = await request(`${base}/manifest.webmanifest`);
+    ok(initIcon.text === darkSvg.text && initManifest.json?.background_color === '#0b0f17', 'default dark theme serves #8 dark icon & manifest');
+
+    const setLightRes = await request(`${base}/_config`, { method: 'POST', headers, body: { theme: 'light' } });
+    ok(setLightRes.status === 200 && setLightRes.json?.ok === true, 'POST /_config switches theme to light');
+    const lightActiveSvg = await request(`${base}/icon.svg`);
+    const lightActiveIco = await request(`${base}/favicon.ico`);
+    const lightManifest = await request(`${base}/manifest.webmanifest`);
+    ok(lightActiveSvg.text === lightSvg.text && lightActiveIco.buf.equals(lightIco.buf) && lightManifest.json?.background_color === '#f1f5f9', 'light theme dynamically serves #7 light icon, favicon & manifest');
+
+    const setDarkRes = await request(`${base}/_config`, { method: 'POST', headers, body: { theme: 'dark' } });
+    ok(setDarkRes.status === 200 && (await request(`${base}/icon.svg`)).text === darkSvg.text, 'switching back to dark restores #8 dark icon');
 
     const chatStopped = await request(`${base}/api/diagnostics/chat`, {
       method: 'POST',

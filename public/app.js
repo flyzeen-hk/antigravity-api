@@ -114,10 +114,27 @@
     return json;
   }
 
+  function updateThemeIcons(theme) {
+    const tName = theme === 'light' ? 'light' : 'dark';
+    for (const img of document.querySelectorAll('.brand-icon-img')) {
+      img.setAttribute('src', `/icon-${tName}.svg`);
+    }
+    const favSvg = $('favicon-svg');
+    const fav512 = $('favicon-512');
+    const fav192 = $('favicon-192');
+    const favIco = $('favicon-ico');
+    if (favSvg) favSvg.setAttribute('href', `/icon-${tName}.svg`);
+    if (fav512) fav512.setAttribute('href', `/icon-${tName}-512.png`);
+    if (fav192) fav192.setAttribute('href', `/icon-${tName}-192.png`);
+    if (favIco) favIco.setAttribute('href', `/favicon-${tName}.ico`);
+  }
+
   function applyTheme(theme) {
     const target = theme === 'light' ? 'light' : 'dark';
     state.theme = target;
     document.documentElement.setAttribute('data-theme', target);
+    try { localStorage.setItem('ag_theme', target); } catch {}
+    updateThemeIcons(target);
     const label = t(target === 'dark' ? 'actions.themeDark' : 'actions.themeLight');
     for (const btn of document.querySelectorAll('.theme-toggle-btn')) {
       btn.textContent = label;
@@ -2157,7 +2174,11 @@
 
   async function init() {
     applyTranslations();
-    applyTheme('dark');
+    let initialTheme = 'dark';
+    try {
+      if (localStorage.getItem('ag_theme') === 'light') initialTheme = 'light';
+    } catch {}
+    applyTheme(initialTheme);
     bindEvents();
 
     setInterval(() => {

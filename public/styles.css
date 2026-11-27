@@ -177,9 +177,10 @@ input[readonly] { background: var(--bg-subtle); cursor: default; }
 }
 .auth-brand { display: flex; align-items: center; gap: 14px; margin-bottom: 22px; }
 .brand-logo {
-  width: 42px; height: 42px; border-radius: 11px; display: grid; place-items: center;
-  background: var(--accent-soft); color: var(--accent); border: 1px solid rgba(99, 102, 241, 0.35); flex-shrink: 0;
+  width: 42px; height: 42px; border-radius: 10px; display: grid; place-items: center;
+  background: transparent; border: 0; overflow: hidden; flex-shrink: 0;
 }
+.brand-icon-img { width: 100%; height: 100%; display: block; object-fit: contain; }
 .auth-footer { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; }
 
 /* Shell Layout */
@@ -205,7 +206,7 @@ input[readonly] { background: var(--bg-subtle); cursor: default; }
 .sidebar.collapsed .nav-item { justify-content: center; padding: 10px; }
 
 .brand-mini { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.brand-mini .brand-logo { width: 34px; height: 34px; border-radius: 9px; }
+.brand-mini .brand-logo { width: 36px; height: 36px; border-radius: 9px; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.2; min-width: 0; }
 .brand-text strong { font-size: 13.5px; white-space: nowrap; }
 

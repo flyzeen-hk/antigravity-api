@@ -33,6 +33,7 @@ const installsLib = require('../lib/installs');
 const cdpCookies = require('../lib/cdp_cookies');
 const shortcuts = require('./shortcuts');
 const updater = require('./update');
+const { resolvePublicAsset, normalizeIconTheme } = require('../lib/theme_icons');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT_DIR;
@@ -42,20 +43,6 @@ const RESTART_EXIT_CODE = 75;
 const APP_VERSION = (() => {
   try { return String(require('../package.json').version || '2.0.0'); } catch { return '2.0.0'; }
 })();
-
-const PUBLIC_FILES = {
-  '/': { file: path.join(ROOT_DIR, 'public', 'index.html'), type: 'text/html; charset=utf-8' },
-  '/index.html': { file: path.join(ROOT_DIR, 'public', 'index.html'), type: 'text/html; charset=utf-8' },
-  '/styles.css': { file: path.join(ROOT_DIR, 'public', 'styles.css'), type: 'text/css; charset=utf-8' },
-  '/app.js': { file: path.join(ROOT_DIR, 'public', 'app.js'), type: 'application/javascript; charset=utf-8' },
-  '/i18n.js': { file: path.join(ROOT_DIR, 'public', 'i18n.js'), type: 'application/javascript; charset=utf-8' },
-  '/charts.js': { file: path.join(ROOT_DIR, 'public', 'charts.js'), type: 'application/javascript; charset=utf-8' },
-  '/icon.svg': { file: path.join(ROOT_DIR, 'public', 'icon.svg'), type: 'image/svg+xml' },
-  '/icon-192.png': { file: path.join(ROOT_DIR, 'public', 'icon-192.png'), type: 'image/png' },
-  '/icon-512.png': { file: path.join(ROOT_DIR, 'public', 'icon-512.png'), type: 'image/png' },
-  '/manifest.webmanifest': { file: path.join(ROOT_DIR, 'public', 'manifest.webmanifest'), type: 'application/manifest+json; charset=utf-8' },
-  '/favicon.ico': { file: path.join(ROOT_DIR, 'assets', 'antigravity_api.ico'), type: 'image/x-icon' },
-};
 
 function readNormalizedConfig() {
   let raw = {};
@@ -554,8 +541,13 @@ async function startSupervisor({ autoStart = null } = {}) {
       if (req.method === 'GET') return sendJson(res, 200, sanitizeConfig(cfg));
       if (req.method === 'POST') {
         const body = await readJsonBody(req);
+        const prevTheme = normalizeIconTheme(cfg.theme);
         const patch = configLib.patchConfig(cfg, body);
         saveConfigDirect(patch.config);
+        const nextTheme = normalizeIconTheme(patch.config.theme);
+        if (prevTheme !== nextTheme) {
+          shortcuts.syncShortcutTheme({ rootDir: ROOT_DIR, dataDir: DATA_DIR, theme: nextTheme });
+        }
         activePort = portOf(patch.config);
         activeHost = connectHostOf(patch.config);
         broadcastSse('supervisor', getSupervisorStatus());
@@ -831,11 +823,14 @@ async function startSupervisor({ autoStart = null } = {}) {
         }
       }
 
-      if (req.method === 'GET' && PUBLIC_FILES[p]) {
-        const asset = PUBLIC_FILES[p];
-        const data = fs.readFileSync(asset.file);
-        res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-cache' });
-        return res.end(data);
+      if (req.method === 'GET') {
+        const curCfg = readNormalizedConfig();
+        const asset = resolvePublicAsset(ROOT_DIR, p, { theme: normalizeIconTheme(curCfg.theme) });
+        if (asset) {
+          const data = asset.body || fs.readFileSync(asset.file);
+          res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-cache' });
+          return res.end(data);
+        }
       }
 
       const sid = parseCookies(req).ag_sup_session;

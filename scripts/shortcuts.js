@@ -7,7 +7,8 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
+const { normalizeIconTheme, getThemeAssetPaths } = require('../lib/theme_icons');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const SHORTCUT_NAME = 'Antigravity API.lnk';
@@ -81,9 +82,30 @@ function createWindowsLnk({ lnkPath, targetPath, args = '', workingDir, iconPath
   });
 }
 
-function createShortcuts({ rootDir = ROOT_DIR } = {}) {
+function clearAppFaviconCache(theme) {
+  const defaultDir = path.join(os.tmpdir(), 'antigravity-api-ui-profile', 'Default');
+  try {
+    if (fs.existsSync(defaultDir)) {
+      for (const name of fs.readdirSync(defaultDir)) {
+        if (/^Favicons/i.test(name)) {
+          try { fs.unlinkSync(path.join(defaultDir, name)); } catch {}
+        }
+      }
+    }
+  } catch {}
+  if (theme) {
+    const appProf = path.join(os.tmpdir(), 'antigravity-api-ui-profile');
+    try {
+      fs.mkdirSync(appProf, { recursive: true });
+      fs.writeFileSync(path.join(appProf, '.ag-theme'), normalizeIconTheme(theme), 'utf8');
+    } catch {}
+  }
+}
+
+function createShortcuts({ rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || rootDir, theme } = {}) {
   rootDir = path.resolve(rootDir);
-  const icoPath = path.resolve(rootDir, 'assets', 'antigravity_api.ico');
+  const effectiveTheme = normalizeIconTheme(theme, { dataDir });
+  const { ico: icoPath, png512 } = getThemeAssetPaths(rootDir, effectiveTheme);
 
   if (process.platform === 'win32') {
     const vbsPath = path.resolve(rootDir, 'scripts', 'run_hidden.vbs');
@@ -115,9 +137,10 @@ function createShortcuts({ rootDir = ROOT_DIR } = {}) {
       });
       created.push({ label: t.label, path: t.lnk });
     }
+    clearAppFaviconCache(effectiveTheme);
     try { execFileSync('ie4uinit.exe', ['-ClearIconCache'], { stdio: 'ignore', timeout: 3000 }); } catch {}
     try { execFileSync('ie4uinit.exe', ['-show'], { stdio: 'ignore', timeout: 3000 }); } catch {}
-    return { ok: true, created };
+    return { ok: true, theme: effectiveTheme, iconPath: icoPath, created };
   }
 
   if (process.platform === 'linux') {
@@ -125,23 +148,22 @@ function createShortcuts({ rootDir = ROOT_DIR } = {}) {
     fs.mkdirSync(appsDir, { recursive: true });
     const desktopFile = path.join(appsDir, 'antigravity-api.desktop');
     const runSh = path.resolve(rootDir, 'run.sh');
-    const iconPng = path.resolve(rootDir, 'assets', 'antigravity_icon_512.png');
     fs.writeFileSync(desktopFile, [
       '[Desktop Entry]',
       'Name=Antigravity API',
       'Comment=Local OpenAI, Anthropic & Gemini API Gateway',
       `Exec="${runSh}"`,
-      `Icon=${iconPng}`,
+      `Icon=${png512}`,
       'Terminal=false',
       'Type=Application',
       'Categories=Development;Utility;',
       '',
     ].join('\n'), 'utf8');
     fs.chmodSync(desktopFile, 0o755);
-    return { ok: true, created: [{ label: 'Applications', path: desktopFile }] };
+    return { ok: true, theme: effectiveTheme, iconPath: png512, created: [{ label: 'Applications', path: desktopFile }] };
   }
 
-  return { ok: true, created: [] };
+  return { ok: true, theme: effectiveTheme, created: [] };
 }
 
 function getAutostartInfo({ rootDir = ROOT_DIR } = {}) {
@@ -168,8 +190,10 @@ function getAutostartInfo({ rootDir = ROOT_DIR } = {}) {
   return { supported: false, enabled: false, path: '' };
 }
 
-function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
+function setAutostart(enabled, { rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || rootDir, theme } = {}) {
   rootDir = path.resolve(rootDir);
+  const effectiveTheme = normalizeIconTheme(theme, { dataDir });
+  const { ico: icoPath, png512 } = getThemeAssetPaths(rootDir, effectiveTheme);
   const on = !!enabled;
   if (process.platform === 'win32') {
     const dir = getWindowsStartupFolder();
@@ -184,7 +208,6 @@ function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
     }
     const vbsPath = path.resolve(rootDir, 'scripts', 'run_hidden.vbs');
     const wscript = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'wscript.exe');
-    const icoPath = path.resolve(rootDir, 'assets', 'antigravity_api.ico');
     createWindowsLnk({
       lnkPath: lnk,
       targetPath: wscript,
@@ -210,7 +233,7 @@ function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
       'Type=Application',
       'Name=Antigravity API',
       `Exec="${path.resolve(rootDir, 'run.sh')}" --hidden`,
-      `Icon=${path.resolve(rootDir, 'assets', 'antigravity_icon_512.png')}`,
+      `Icon=${png512}`,
       'X-GNOME-Autostart-enabled=true',
       '',
     ].join('\n'), 'utf8');
@@ -248,22 +271,101 @@ function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
   throw new Error(`Autostart is not supported on ${process.platform}`);
 }
 
+/**
+ * Updates existing Desktop / Start Menu / Autostart shortcuts owned by `rootDir`
+ * to match the selected theme icon (`#7` light or `#8` dark) without blocking HTTP replies.
+ */
+function syncShortcutTheme({ rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || rootDir, theme } = {}) {
+  rootDir = path.resolve(rootDir);
+  if (process.env.AG_NO_SHORTCUT_SYNC === '1') return { skipped: true };
+  if (dataDir && path.resolve(dataDir) !== rootDir) return { skipped: true };
+
+  const effectiveTheme = normalizeIconTheme(theme, { dataDir });
+  const { ico: icoPath, png512 } = getThemeAssetPaths(rootDir, effectiveTheme);
+  clearAppFaviconCache(effectiveTheme);
+
+  if (process.platform === 'win32') {
+    const ps = [
+      '$ws = New-Object -ComObject WScript.Shell;',
+      `$rootNorm = '${psEscape(rootDir.replace(/[\\/]+$/, '').toLowerCase())}';`,
+      `$targetIcon = '${psEscape(icoPath)},0';`,
+      '$dirs = New-Object System.Collections.Generic.List[string];',
+      'try { $d = (Get-ItemProperty "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders" -Name Desktop -ErrorAction Stop).Desktop; if ($d) { $dirs.Add([Environment]::ExpandEnvironmentVariables($d)) } } catch {};',
+      '$dirs.Add([Environment]::GetFolderPath("Desktop"));',
+      '$dirs.Add((Join-Path $env:USERPROFILE "OneDrive\\Рабочий стол"));',
+      '$dirs.Add((Join-Path $env:USERPROFILE "OneDrive\\Desktop"));',
+      '$dirs.Add((Join-Path $env:APPDATA "Microsoft\\Windows\\Start Menu\\Programs"));',
+      '$dirs.Add((Join-Path $env:APPDATA "Microsoft\\Windows\\Start Menu\\Programs\\Startup"));',
+      '$updated = 0;',
+      'foreach ($dir in ($dirs | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique)) {',
+      `  foreach ($name in @('${SHORTCUT_NAME}', '${STARTUP_NAME}')) {`,
+      '    $lnk = Join-Path $dir $name;',
+      '    if (Test-Path $lnk) {',
+      '      try {',
+      '        $sc = $ws.CreateShortcut($lnk);',
+      '        $wd = ($sc.WorkingDirectory -replace "[\\\\/]+$", "").ToLowerInvariant();',
+      '        if ($wd -eq $rootNorm -and $sc.IconLocation -ne $targetIcon) {',
+      '          $sc.IconLocation = $targetIcon;',
+      '          $sc.Save();',
+      '          $updated++;',
+      '        }',
+      '      } catch {}',
+      '    }',
+      '  }',
+      '};',
+      'if ($updated -gt 0) {',
+      '  try { Start-Process -FilePath "ie4uinit.exe" -ArgumentList "-ClearIconCache" -WindowStyle Hidden -Wait -ErrorAction SilentlyContinue } catch {};',
+      '  try { Start-Process -FilePath "ie4uinit.exe" -ArgumentList "-show" -WindowStyle Hidden -ErrorAction SilentlyContinue } catch {};',
+      '}',
+    ].join('\n');
+    const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+    try {
+      const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encoded], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+      child.unref();
+    } catch {}
+    return { ok: true, theme: effectiveTheme, iconPath: icoPath };
+  }
+
+  if (process.platform === 'linux') {
+    for (const file of [
+      path.join(os.homedir(), '.local', 'share', 'applications', 'antigravity-api.desktop'),
+      path.join(os.homedir(), '.config', 'autostart', 'antigravity-api.desktop'),
+    ]) {
+      try {
+        if (!fs.existsSync(file)) continue;
+        const txt = fs.readFileSync(file, 'utf8').replace(/^Icon=.*$/m, `Icon=${png512}`);
+        fs.writeFileSync(file, txt, 'utf8');
+      } catch {}
+    }
+    return { ok: true, theme: effectiveTheme, iconPath: png512 };
+  }
+
+  return { ok: true, theme: effectiveTheme };
+}
+
 function main(argv = process.argv.slice(2)) {
   try {
+    const themeIdx = argv.indexOf('--theme');
+    const cliTheme = themeIdx !== -1 ? argv[themeIdx + 1] : undefined;
+
     if (argv.includes('--autostart')) {
       const idx = argv.indexOf('--autostart');
       const mode = (argv[idx + 1] || 'status').toLowerCase();
       if (mode === 'on' || mode === 'true' || mode === '1') {
-        console.log(JSON.stringify(setAutostart(true), null, 2));
+        console.log(JSON.stringify(setAutostart(true, { theme: cliTheme }), null, 2));
       } else if (mode === 'off' || mode === 'false' || mode === '0') {
-        console.log(JSON.stringify(setAutostart(false), null, 2));
+        console.log(JSON.stringify(setAutostart(false, { theme: cliTheme }), null, 2));
       } else {
         console.log(JSON.stringify(getAutostartInfo(), null, 2));
       }
       return;
     }
 
-    const res = createShortcuts();
+    const res = createShortcuts({ theme: cliTheme });
     for (const item of res.created) {
       console.log(`[OK] Shortcut created [${item.label}]: ${item.path}`);
     }
@@ -281,5 +383,7 @@ module.exports = {
   createShortcuts,
   getAutostartInfo,
   setAutostart,
+  syncShortcutTheme,
+  clearAppFaviconCache,
   psEscape,
 };

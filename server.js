@@ -47,6 +47,7 @@ const installsLib = require('./lib/installs');
 const cdpCookies = require('./lib/cdp_cookies');
 const shortcuts = require('./scripts/shortcuts');
 const updater = require('./scripts/update');
+const { resolvePublicAsset, normalizeIconTheme } = require('./lib/theme_icons');
 
 const ROOT = __dirname; // код
 // Данные (config.json, apikey.txt, auth.json, usage.json, backups/) можно
@@ -2234,25 +2235,11 @@ function start(config) {
 
   // ---- статические ассеты веб-панели и вспомогательные ответы ----
 
-  const PUBLIC_FILES = {
-    '/': { file: path.join(ROOT, 'public', 'index.html'), type: 'text/html; charset=utf-8' },
-    '/index.html': { file: path.join(ROOT, 'public', 'index.html'), type: 'text/html; charset=utf-8' },
-    '/styles.css': { file: path.join(ROOT, 'public', 'styles.css'), type: 'text/css; charset=utf-8' },
-    '/app.js': { file: path.join(ROOT, 'public', 'app.js'), type: 'application/javascript; charset=utf-8' },
-    '/i18n.js': { file: path.join(ROOT, 'public', 'i18n.js'), type: 'application/javascript; charset=utf-8' },
-    '/charts.js': { file: path.join(ROOT, 'public', 'charts.js'), type: 'application/javascript; charset=utf-8' },
-    '/icon.svg': { file: path.join(ROOT, 'public', 'icon.svg'), type: 'image/svg+xml' },
-    '/icon-192.png': { file: path.join(ROOT, 'public', 'icon-192.png'), type: 'image/png' },
-    '/icon-512.png': { file: path.join(ROOT, 'public', 'icon-512.png'), type: 'image/png' },
-    '/manifest.webmanifest': { file: path.join(ROOT, 'public', 'manifest.webmanifest'), type: 'application/manifest+json; charset=utf-8' },
-    '/favicon.ico': { file: path.join(ROOT, 'assets', 'antigravity_api.ico'), type: 'image/x-icon' },
-  };
-
   function servePublicAsset(res, pathname) {
-    const asset = PUBLIC_FILES[pathname];
+    const asset = resolvePublicAsset(ROOT, pathname, { theme: normalizeIconTheme(config.theme) });
     if (!asset) return false;
     try {
-      const data = fs.readFileSync(asset.file);
+      const data = asset.body || fs.readFileSync(asset.file);
       res.writeHead(200, { 'content-type': asset.type, 'cache-control': 'no-cache' });
       res.end(data);
     } catch {
@@ -2468,8 +2455,8 @@ function start(config) {
         return servePublicAsset(res, '/');
       }
 
-      if (req.method === 'GET' && p !== '/' && PUBLIC_FILES[p]) {
-        return servePublicAsset(res, p);
+      if (req.method === 'GET' && p !== '/' && servePublicAsset(res, p)) {
+        return;
       }
 
       const blockedUntil = authBlocked(req);
@@ -2773,6 +2760,7 @@ function start(config) {
 
         const prevPort = config.port;
         const prevHost = config.host;
+        const prevTheme = normalizeIconTheme(config.theme);
         const patch = configLib.patchConfig(config, parsed);
         Object.assign(config, patch.config);
         syncOutputHeadroom(config);
@@ -2786,6 +2774,10 @@ function start(config) {
           const saveErr = saveConfigFile();
           if (saveErr) {
             return sendJson(res, 500, { error: { message: `Не удалось записать config.json: ${saveErr.message}`, type: 'internal_error' } });
+          }
+          const nextTheme = normalizeIconTheme(config.theme);
+          if (prevTheme !== nextTheme) {
+            shortcuts.syncShortcutTheme({ rootDir: ROOT, dataDir: DATA_DIR, theme: nextTheme });
           }
         }
 

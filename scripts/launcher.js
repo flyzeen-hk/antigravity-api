@@ -23,6 +23,8 @@ const { spawn } = require('child_process');
 const { readJsonFile } = require('../lib/safe_files');
 const { findBrowserExecutable } = require('../lib/cdp_cookies');
 const { openExternalUrl } = require('../lib/auth');
+const { normalizeIconTheme } = require('../lib/theme_icons');
+const { clearAppFaviconCache } = require('./shortcuts');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT_DIR;
@@ -109,6 +111,12 @@ function openUiWindow(url, { preferBrowser = false } = {}) {
     if (browserExe) {
       const appProfile = path.join(os.tmpdir(), 'antigravity-api-ui-profile');
       try { fs.mkdirSync(appProfile, { recursive: true }); } catch {}
+      const desiredTheme = normalizeIconTheme(null, { dataDir: DATA_DIR });
+      let cachedTheme = '';
+      try { cachedTheme = fs.readFileSync(path.join(appProfile, '.ag-theme'), 'utf8').trim(); } catch {}
+      if (cachedTheme !== desiredTheme) {
+        clearAppFaviconCache(desiredTheme);
+      }
       // Dedicated --user-data-dir keeps Chromium/Edge in single-profile app mode so
       // Windows taskbar shows our icon cleanly without a browser profile avatar badge.
       const child = spawn(browserExe, [
