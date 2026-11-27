@@ -58,18 +58,23 @@ function getWindowsStartupFolder() {
 }
 
 function createWindowsLnk({ lnkPath, targetPath, args = '', workingDir, iconPath, description, windowStyle = 1 }) {
+  const absLnk = path.resolve(lnkPath);
+  const absTarget = path.resolve(targetPath);
+  const absWork = path.resolve(workingDir);
+  const absIcon = path.resolve(iconPath);
   const cmd = [
     '$ws = New-Object -ComObject WScript.Shell;',
-    `$s = $ws.CreateShortcut('${psEscape(lnkPath)}');`,
-    `$s.TargetPath = '${psEscape(targetPath)}';`,
+    `$s = $ws.CreateShortcut('${psEscape(absLnk)}');`,
+    `$s.TargetPath = '${psEscape(absTarget)}';`,
     `$s.Arguments = '${psEscape(args)}';`,
-    `$s.WorkingDirectory = '${psEscape(workingDir)}';`,
-    `$s.IconLocation = '${psEscape(iconPath)},0';`,
+    `$s.WorkingDirectory = '${psEscape(absWork)}';`,
+    `$s.IconLocation = '${psEscape(absIcon)},0';`,
     `$s.Description = '${psEscape(description)}';`,
     `$s.WindowStyle = ${Number(windowStyle) || 1};`,
     '$s.Save();',
-  ].join(' ');
-  execFileSync('powershell', ['-NoProfile', '-Command', cmd], {
+  ].join('\n');
+  const encoded = Buffer.from(cmd, 'utf16le').toString('base64');
+  execFileSync('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
     encoding: 'utf8',
     timeout: 15000,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -77,12 +82,13 @@ function createWindowsLnk({ lnkPath, targetPath, args = '', workingDir, iconPath
 }
 
 function createShortcuts({ rootDir = ROOT_DIR } = {}) {
-  const icoPath = path.join(rootDir, 'assets', 'antigravity_api.ico');
+  rootDir = path.resolve(rootDir);
+  const icoPath = path.resolve(rootDir, 'assets', 'antigravity_api.ico');
 
   if (process.platform === 'win32') {
-    const vbsPath = path.join(rootDir, 'scripts', 'run_hidden.vbs');
+    const vbsPath = path.resolve(rootDir, 'scripts', 'run_hidden.vbs');
     const wscript = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'wscript.exe');
-    const targetPath = fs.existsSync(vbsPath) && fs.existsSync(wscript) ? wscript : path.join(rootDir, 'run.bat');
+    const targetPath = fs.existsSync(vbsPath) && fs.existsSync(wscript) ? wscript : path.resolve(rootDir, 'run.bat');
     const args = targetPath === wscript ? `//B "${vbsPath}"` : '';
 
     const targets = [];
@@ -109,6 +115,7 @@ function createShortcuts({ rootDir = ROOT_DIR } = {}) {
       });
       created.push({ label: t.label, path: t.lnk });
     }
+    try { execFileSync('ie4uinit.exe', ['-ClearIconCache'], { stdio: 'ignore', timeout: 3000 }); } catch {}
     try { execFileSync('ie4uinit.exe', ['-show'], { stdio: 'ignore', timeout: 3000 }); } catch {}
     return { ok: true, created };
   }
@@ -117,8 +124,8 @@ function createShortcuts({ rootDir = ROOT_DIR } = {}) {
     const appsDir = path.join(os.homedir(), '.local', 'share', 'applications');
     fs.mkdirSync(appsDir, { recursive: true });
     const desktopFile = path.join(appsDir, 'antigravity-api.desktop');
-    const runSh = path.join(rootDir, 'run.sh');
-    const iconPng = path.join(rootDir, 'assets', 'antigravity_icon_512.png');
+    const runSh = path.resolve(rootDir, 'run.sh');
+    const iconPng = path.resolve(rootDir, 'assets', 'antigravity_icon_512.png');
     fs.writeFileSync(desktopFile, [
       '[Desktop Entry]',
       'Name=Antigravity API',
@@ -138,6 +145,7 @@ function createShortcuts({ rootDir = ROOT_DIR } = {}) {
 }
 
 function getAutostartInfo({ rootDir = ROOT_DIR } = {}) {
+  rootDir = path.resolve(rootDir);
   if (process.platform === 'win32') {
     const dir = getWindowsStartupFolder();
     const lnk = dir ? path.join(dir, STARTUP_NAME) : '';
@@ -161,6 +169,7 @@ function getAutostartInfo({ rootDir = ROOT_DIR } = {}) {
 }
 
 function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
+  rootDir = path.resolve(rootDir);
   const on = !!enabled;
   if (process.platform === 'win32') {
     const dir = getWindowsStartupFolder();
@@ -173,9 +182,9 @@ function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
       }
       return getAutostartInfo({ rootDir });
     }
-    const vbsPath = path.join(rootDir, 'scripts', 'run_hidden.vbs');
+    const vbsPath = path.resolve(rootDir, 'scripts', 'run_hidden.vbs');
     const wscript = path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'wscript.exe');
-    const icoPath = path.join(rootDir, 'assets', 'antigravity_api.ico');
+    const icoPath = path.resolve(rootDir, 'assets', 'antigravity_api.ico');
     createWindowsLnk({
       lnkPath: lnk,
       targetPath: wscript,
@@ -200,8 +209,8 @@ function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
       '[Desktop Entry]',
       'Type=Application',
       'Name=Antigravity API',
-      `Exec="${path.join(rootDir, 'run.sh')}" --hidden`,
-      `Icon=${path.join(rootDir, 'assets', 'antigravity_icon_512.png')}`,
+      `Exec="${path.resolve(rootDir, 'run.sh')}" --hidden`,
+      `Icon=${path.resolve(rootDir, 'assets', 'antigravity_icon_512.png')}`,
       'X-GNOME-Autostart-enabled=true',
       '',
     ].join('\n'), 'utf8');
@@ -224,7 +233,7 @@ function setAutostart(enabled, { rootDir = ROOT_DIR } = {}) {
   <key>ProgramArguments</key>
   <array>
     <string>${process.execPath}</string>
-    <string>${path.join(rootDir, 'scripts', 'launcher.js')}</string>
+    <string>${path.resolve(rootDir, 'scripts', 'launcher.js')}</string>
     <string>--hidden</string>
   </array>
   <key>WorkingDirectory</key><string>${rootDir}</string>
