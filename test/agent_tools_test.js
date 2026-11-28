@@ -327,12 +327,14 @@ const ex = createExecutor({ workspaceRoot: tmp, auditFile: path.join(projectDir,
   const exShell = createExecutor({ workspaceRoot: path.join(projectDir, 'ws-shell'), allowShell: true, auditFile: path.join(projectDir, 'audit-shell.jsonl') }, projectDir);
   r = await exShell.execute('run_command', { command: 'exit 3' });
   ok(r.ok === false && r.exit_code === 3, 'run_command: ненулевой код -> ok=false, exit_code=3');
-  r = await exShell.execute('run_command', { command: 'echo привет' });
-  ok(r.ok === true && r.exit_code === 0 && /привет/.test(r.stdout), 'run_command: успешная команда -> ok=true');
+  r = await exShell.execute('run_command', { command: 'echo hello-ok' });
+  ok(r.ok === true && r.exit_code === 0 && /hello-ok/.test(r.stdout), 'run_command: успешная команда -> ok=true');
 
   if (process.platform === 'win32') {
-    // cmd пишет cp866, node/python — UTF-8; построчное определение кодировки.
-    r = await exShell.execute('run_command', { command: 'echo привет & node -e "process.stdout.write(\'мир\\n\')"' });
+    // cmd пишет cp866, node/python — UTF-8; построчное определение кодировки (независимо от OEM-локали runner'а).
+    r = await exShell.execute('run_command', {
+      command: 'node -e "process.stdout.write(Buffer.from([0xaf,0xe0,0xa8,0xa2,0xa5,0xe2,0x0d,0x0a])); process.stdout.write(Buffer.from(\'мир\\n\',\'utf8\'))"',
+    });
     ok(r.ok === true && r.stdout.includes('привет') && r.stdout.includes('мир'),
       'смешанный вывод cmd(cp866)+node(utf8) читается: ' + JSON.stringify(r.stdout));
   }
