@@ -67,9 +67,26 @@ async function main() {
         res.on('end', () => resolve({ status: res.statusCode, html }));
       }).on('error', reject);
     });
-    ok(denyRes.status === 200 && denyRes.html.includes('access_denied'), 'OAuth callback reports error cleanly');
+    ok(denyRes.status === 200 && denyRes.html.includes('access_denied') && denyRes.html.includes('Вход отменён'), 'OAuth callback reports error cleanly in Russian by default');
     const st = getOAuthStatus();
     ok(st.status === 'error' && st.error.includes('access_denied'), 'getOAuthStatus reflects error state cleanly');
+
+    const startedEn = await startInteractiveOAuth({ authFile, openBrowser: false, lang: 'en', theme: 'light' });
+    const cbUrlEn = new URL(new URL(startedEn.authUrl).searchParams.get('redirect_uri'));
+    const denyResEn = await new Promise((resolve, reject) => {
+      http.get(`${cbUrlEn.origin}${cbUrlEn.pathname}?error=access_denied`, (res) => {
+        let html = '';
+        res.on('data', (c) => { html += c; });
+        res.on('end', () => resolve({ status: res.statusCode, html }));
+      }).on('error', reject);
+    });
+    ok(
+      denyResEn.status === 200
+      && denyResEn.html.includes('lang="en"')
+      && denyResEn.html.includes('Sign-in Cancelled')
+      && !denyResEn.html.includes('Вход отменён'),
+      'OAuth callback renders localized English HTML when lang=en'
+    );
 
     console.log(`\nALL PASSED (${passed} checks)`);
   } finally {

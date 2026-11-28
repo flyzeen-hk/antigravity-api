@@ -259,6 +259,13 @@ async function main() {
     });
     ok(chatProxied.status === 400, 'proxied chat reaches live server validation instead of 503 server_stopped');
 
+    // Verify catalog.invalidate() works cleanly when reloading auth on a live gateway (CLOUD_DISABLED=0 subprocess check)
+    const { ModelCatalog } = require('../lib/models');
+    const tmpCat = new ModelCatalog('https://daily-cloudcode-pa.googleapis.com');
+    tmpCat.cache = { at: Date.now(), models: new Map([['gemini-2.5-flash', {}]]) };
+    tmpCat.invalidate();
+    ok(tmpCat.cache === null, 'ModelCatalog.invalidate() clears cached models cleanly');
+
     const stopRes = await request(`${base}/_supervisor/stop`, { method: 'POST', headers });
     ok(stopRes.status === 200 && stopRes.json?.state === 'stopped' && stopRes.json?.running === false, 'POST /_supervisor/stop stops gateway cleanly');
 

@@ -539,7 +539,7 @@
       state.dirtyTabs.add(tab);
     }
     if (state.status) {
-      $('sidebar-version').textContent = `v${state.status.version || '2.2.0'}`;
+      $('sidebar-version').textContent = `v${state.status.version || '2.2.1'}`;
       $('sidebar-listen').textContent = `${state.status.host || '127.0.0.1'}:${state.status.port || 8317}`;
       $('sidebar-node').textContent = state.status.nodeVersion || '—';
     }
@@ -740,7 +740,7 @@
           <div class="btn-group">
             ${item.found ? `<button type="button" class="btn btn-secondary btn-xs install-open-btn" data-key="${esc(item.key)}">${esc(t('actions.openFolder'))}</button>` : ''}
             ${hasPath ? `<button type="button" class="btn btn-ghost btn-xs install-copy-btn" data-path="${esc(item.path)}">${esc(t('actions.copy'))}</button>` : ''}
-            ${item.key === 'ide' && item.found ? `<button type="button" class="btn btn-primary btn-xs install-extract-btn">${esc(t('overview.extractToken'))}</button>` : ''}
+            ${(item.key === 'app' || item.key === 'ide') && item.found ? `<button type="button" class="btn btn-primary btn-xs install-extract-btn">${esc(t('overview.extractToken'))}</button>` : ''}
             <button type="button" class="btn btn-ghost btn-xs install-edit-btn" data-key="${esc(item.key)}">${esc(isEditing ? t('actions.cancel') : t('actions.editPath'))}</button>
           </div>
           ${isEditing ? `
@@ -1590,8 +1590,9 @@
   async function extractIdeTokenAction() {
     try {
       const res = await api('POST', '/_auth/extract', {});
-      showToast(`Extracted (${res.dbSource || 'IDE'})`, 'ok');
+      showToast(`Extracted (${res.dbSource || 'Antigravity'})`, 'ok');
       await loadAllData();
+      await Promise.allSettled([refreshLimits({ force: true }), refreshModels({ force: true })]);
     } catch (e) {
       showToast(e.message, 'err');
     }
@@ -1722,7 +1723,7 @@
 
     const startGoogleOAuthAction = async () => {
       try {
-        const res = await api('POST', '/_auth/oauth/start', { openBrowser: true });
+        const res = await api('POST', '/_auth/oauth/start', { openBrowser: true, lang: getLang(), theme: state.theme });
         if (!res || !res.ok || !res.authUrl) throw new Error(t('toast.oauthFailed'));
         pendingOAuthUrl = res.authUrl;
         if (oauthLink) oauthLink.href = pendingOAuthUrl;

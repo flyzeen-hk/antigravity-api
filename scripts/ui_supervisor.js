@@ -878,6 +878,8 @@ async function startSupervisor({ autoStart = null } = {}) {
         authFile,
         network: net,
         openBrowser: body.openBrowser !== false,
+        lang: body.lang || cfg.language || 'ru',
+        theme: body.theme || cfg.theme || 'dark',
         onSuccess: () => { net.destroyAll(); },
       });
       return sendJson(res, 200, started);

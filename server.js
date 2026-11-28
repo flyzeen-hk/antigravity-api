@@ -475,7 +475,7 @@ function start(config) {
     tokens = new TokenManager(authFile, { network, allowMissing: true });
     if (!tokens.hasCredentials()) {
       console.log(`\n  i ${path.basename(authFile)} не найден — сервер запущен в режиме Web-Only (web/* модели).`);
-      console.log('    Подключите токен Antigravity IDE в веб-панели или командой: npm run extract-token\n');
+      console.log('    Подключите токен Antigravity в веб-панели или командой: npm run extract-token\n');
     }
   }
   const catalog = new ModelCatalog(config.upstreamHost, {
@@ -2898,11 +2898,13 @@ function start(config) {
           authFile,
           network,
           openBrowser: body.openBrowser !== false,
+          lang: body.lang || config.language || 'ru',
+          theme: body.theme || config.theme || 'dark',
           onSuccess: async () => {
             tokens.reloadFromDisk();
             upstream._accInfo = null;
             upstream._quotaSummary = null;
-            catalog.cache = null;
+            catalog.invalidate();
             catalog.project = tokens.projectId || '';
           },
         });
