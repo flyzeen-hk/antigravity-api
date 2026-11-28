@@ -84,7 +84,7 @@
           </div>
           <div class="brand-text">
             <strong>Antigravity API</strong>
-            <span id="sidebar-version" class="badge badge-neutral">v2.2.1</span>
+            <span id="sidebar-version" class="badge badge-neutral">v2.3.0</span>
           </div>
         </div>
       </div>
@@ -385,10 +385,41 @@
               </div>
 
               <div class="stack-md">
+                <div class="free-tunnel-box" id="free-tunnel-box">
+                  <div class="row-between">
+                    <div class="ft-head-text">
+                      <div class="badge-row">
+                        <strong data-i18n="web.freeTunnelTitle">Бесплатный авто-прокси для Gemini (опционально)</strong>
+                        <span id="free-tunnel-badge" class="badge badge-neutral" data-i18n="web.freeTunnelOff">Выключен</span>
+                      </div>
+                      <p id="free-tunnel-desc" class="hint mt-xs" data-i18n="web.freeTunnelDesc">Включается только по вашему желанию: автоматически подбирает бесплатный зарубежный узел VLESS Reality (через локальный Xray-core) для разблокировки сайта Gemini и моделей web/* без системного VPN.</p>
+                    </div>
+                    <div class="btn-group">
+                      <button id="btn-free-tunnel-rotate" type="button" class="btn btn-secondary btn-xs hidden" data-i18n="web.freeTunnelRotate">Сменить узел</button>
+                      <label class="switch" title="Free Auto-Proxy">
+                        <input id="free-tunnel-toggle" type="checkbox">
+                        <span class="slider"></span>
+                      </label>
+                    </div>
+                  </div>
+                  <div id="free-tunnel-progress-wrap" class="ft-progress-wrap hidden">
+                    <div class="ft-progress-bar"><div id="free-tunnel-progress-fill" class="ft-progress-fill" style="width: 0%"></div></div>
+                  </div>
+                  <details class="adv-details ft-custom-details">
+                    <summary data-i18n="web.freeTunnelCustomSummary">Свой бесплатный ключ vless:// или ссылка подписки (необязательно)</summary>
+                    <div class="adv-details-body stack-sm">
+                      <div class="input-row">
+                        <input id="free-tunnel-custom-input" type="text" data-i18n-placeholder="web.freeTunnelCustomPlaceholder" placeholder="Оставьте пустым для авто-пула GitHub или вставьте vless://... / https://...">
+                        <button id="btn-free-tunnel-apply-custom" type="button" class="btn btn-secondary btn-xs" data-i18n="actions.save">Сохранить</button>
+                      </div>
+                    </div>
+                  </details>
+                </div>
+
                 <div class="field">
-                  <span data-i18n="web.proxyLabel">Прокси / VPN для Gemini Web и импорта cookie (HTTP или SOCKS5)</span>
+                  <span data-i18n="web.proxyLabel">Ручной прокси / VPN для Gemini Web (HTTP, SOCKS5 или tg://socks)</span>
                   <div class="input-row">
-                    <input id="web-proxy-input" type="text" placeholder="http://127.0.0.1:10808 или socks5://127.0.0.1:10808">
+                    <input id="web-proxy-input" type="text" placeholder="http://127.0.0.1:10808, socks5://... или tg://socks?...">
                     <button id="btn-web-detect-proxy" type="button" class="btn btn-secondary btn-xs" data-i18n="settings.findProxies">Найти прокси</button>
                     <button id="btn-web-test-proxy" type="button" class="btn btn-ghost btn-xs" data-i18n="web.testGemini">Проверить Gemini</button>
                   </div>

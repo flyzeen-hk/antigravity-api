@@ -7,6 +7,17 @@ const net = require('net');
 const os = require('os');
 const path = require('path');
 const { resolveDataDir, migrateLegacyStateFiles } = require('../lib/data_dir');
+const {
+  parseVlessUri,
+  parseTrojanUri,
+  parseHy2Uri,
+  buildXrayOutbound,
+  buildFragmentOutbound,
+  convertTelegramSocksLink,
+  extractProxyLinesFromText,
+  extractVlessLinesFromText,
+} = require('../lib/free_tunnel');
+const configLib = require('../lib/config');
 
 let passed = 0;
 function ok(cond, name) {
@@ -61,6 +72,50 @@ function request(urlStr, opts = {}) {
 
 async function main() {
   console.log('== test_supervisor');
+
+  // Verify strict opt-in default & security guards of FreeTunnelManager
+  ok(configLib.DEFAULTS.geminiWeb.freeTunnel.enabled === false, 'freeTunnel is strictly opt-in (disabled by default)');
+  ok(
+    convertTelegramSocksLink('tg://socks?server=198.51.100.10&port=1080&user=alice&pass=sec') === 'socks5://alice:sec@198.51.100.10:1080',
+    'convertTelegramSocksLink converts tg://socks to socks5:// URL'
+  );
+  assert.throws(() => convertTelegramSocksLink('tg://proxy?server=1.2.3.4&port=443&secret=ee00'), /MTProto/i);
+  ok(true, 'convertTelegramSocksLink rejects Telegram-only MTProto tg://proxy links with helpful message');
+
+  const validVless = parseVlessUri('vless://ccb8ff48-3934-4250-b4ec-bb76b95d154f@198.51.100.42:443?security=reality&encryption=none&pbk=NaCZ-sS4poEbFwKmD7ePAVyc5OhHxsD9nkAStjXi2wY&fp=chrome&type=tcp&flow=xtls-rprx-vision&sni=www.microsoft.com&sid=a1b2#NL-Reality');
+  ok(validVless && validVless.security === 'reality' && validVless.port === 443, 'parseVlessUri parses valid VLESS Reality URI');
+  ok(parseVlessUri('vless://ccb8ff48-3934-4250-b4ec-bb76b95d154f@127.0.0.1:443?security=reality&pbk=NaCZ-sS4poEbFwKmD7ePAVyc5OhHxsD9nkAStjXi2wY&sni=example.com') === null, 'parseVlessUri blocks loopback SSRF addresses');
+  ok(parseVlessUri('vless://ccb8ff48-3934-4250-b4ec-bb76b95d154f@198.51.100.42:443?security=reality&pbk=NaCZ-sS4poEbFwKmD7ePAVyc5OhHxsD9nkAStjXi2wY&sni=example.com#RU-Moscow') === null, 'parseVlessUri skips Gemini-blocked RU region nodes');
+  ok(parseVlessUri('vless://ccb8ff48-3934-4250-b4ec-bb76b95d154f@104.20.5.134:443?security=tls&type=ws&sni=worker.example.com#Anycast-IP%20%7C%20%F0%9F%87%A8%F0%9F%87%A6%20%F0%9F%87%A9%F0%9F%87%AA%20%F0%9F%87%B7%F0%9F%87%BA') !== null, 'parseVlessUri keeps multi-country Anycast-IP CDN nodes');
+  const b64Sub = Buffer.from('vless://ccb8ff48-3934-4250-b4ec-bb76b95d154f@198.51.100.42:443?security=tls&sni=example.com#DE\ntrojan://secretpass@198.51.100.43:443?sni=example.com#FI\nhy2://authpass@198.51.100.44:443?sni=example.com#NL\n', 'utf8').toString('base64');
+  ok(extractVlessLinesFromText(b64Sub).length === 1 && extractProxyLinesFromText(b64Sub).length === 3, 'extractProxyLinesFromText decodes Base64 multi-protocol subscriptions');
+
+  const validTlsVless = parseVlessUri('vless://ccb8ff48-3934-4250-b4ec-bb76b95d154f@198.51.100.45:443?security=tls&type=ws&path=/ws&sni=cdn.example.com#US');
+  const validTrojan = parseTrojanUri('trojan://secretpass@198.51.100.46:443?type=tcp&sni=trojan.example.com#FI');
+  const validHy2 = parseHy2Uri('hy2://authpass@198.51.100.47:443?sni=hy2.example.com&obfs=salamander&obfs-password=obfspw#NL');
+  ok(validTrojan && validTrojan.proto === 'trojan' && validHy2 && validHy2.proto === 'hy2' && validHy2.obfs === 'salamander', 'parseTrojanUri & parseHy2Uri parse valid non-insecure URIs');
+  ok(parseTrojanUri('trojan://pw@127.0.0.1:443?sni=example.com') === null && parseHy2Uri('hy2://pw@198.51.100.47:443?sni=example.com&insecure=1') === null, 'parseTrojanUri & parseHy2Uri enforce SSRF and TLS verification guards');
+
+  const realityOut = buildXrayOutbound(validVless, 'out-r');
+  const tlsFragOut = buildXrayOutbound(validTlsVless, 'out-t', { useFragment: true });
+  const trojanFragOut = buildXrayOutbound(validTrojan, 'out-tr', { useFragment: true });
+  const hy2Out = buildXrayOutbound(validHy2, 'out-h', { useFragment: true });
+  const fragOut = buildFragmentOutbound('frag');
+  ok(
+    tlsFragOut.streamSettings.tlsSettings
+    && !('allowInsecure' in tlsFragOut.streamSettings.tlsSettings)
+    && !('allowInsecure' in trojanFragOut.streamSettings.tlsSettings)
+    && !('allowInsecure' in hy2Out.streamSettings.tlsSettings),
+    'buildXrayOutbound omits removed Xray v26 allowInsecure property'
+  );
+  ok(
+    tlsFragOut.streamSettings.sockopt?.dialerProxy === 'frag'
+    && trojanFragOut.streamSettings.sockopt?.dialerProxy === 'frag'
+    && !realityOut.streamSettings.sockopt
+    && !hy2Out.streamSettings.sockopt
+    && fragOut.settings?.fragment?.packets === 'tlshello',
+    'buildXrayOutbound attaches tlshello fragment dialerProxy only to TLS TCP/WS/gRPC transports'
+  );
 
   // Verify Windows LocalAppData default resolution & read-only legacy state migration
   const winDefault = resolveDataDir({
@@ -153,11 +208,13 @@ async function main() {
     const st0 = await request(`${base}/_supervisor/status`, { headers });
     ok(st0.status === 200 && st0.json?.state === 'stopped' && st0.json?.running === false, 'initial server state is stopped');
 
-    const offlineRoutes = ['/_status', '/_config', '/_keys', '/_installs', '/_usage', '/_limits', '/_backups', '/v1/models'];
+    const offlineRoutes = ['/_status', '/_config', '/_keys', '/_installs', '/_usage', '/_limits', '/_backups', '/_web/free-tunnel/status', '/v1/models'];
     for (const p of offlineRoutes) {
       const r = await request(`${base}${p}`, { headers });
       ok(r.status === 200, `offline ${p} returns 200 while gateway stopped`);
     }
+    const ftOff = await request(`${base}/_web/free-tunnel/status`, { headers });
+    ok(ftOff.json?.enabled === false && ftOff.json?.running === false, '/_web/free-tunnel/status is disabled and stopped by default');
     const statusOff = await request(`${base}/_status`, { headers });
     ok(
       statusOff.json?.supervised === true

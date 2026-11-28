@@ -127,11 +127,12 @@ const b2 = new GeminiWebBridge({ cookie: '{"cookie": "SAPISID=json_cookie; x=1"}
 assert.strictEqual(b2.getLoadedCookie().sapisid, 'json_cookie');
 
 // 9a. Пустой cookie не должен затенять cookie_file (так сохраняет GUI)
-const tmpFiles = [];
+const tmpCookieDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-wb-cookies-'));
+const prevAgDataDir = process.env.AG_DATA_DIR;
+process.env.AG_DATA_DIR = tmpCookieDir;
 function writeTmpCookieFile(name, content) {
-  const p = path.join(__dirname, '..', name);
+  const p = path.join(tmpCookieDir, name);
   fs.writeFileSync(p, content);
-  tmpFiles.push(p);
   return p;
 }
 try {
@@ -145,7 +146,7 @@ try {
   assert.strictEqual(b4.summary().cookieSet, true);
 
   // Абсолютный путь в cookie (как сохраняет GUI для полного пути)
-  const abs = path.join(__dirname, '..', 'test_cookie_file_rel.txt');
+  const abs = path.join(tmpCookieDir, 'test_cookie_file_rel.txt');
   assert.strictEqual(new GeminiWebBridge({ cookie: abs }).getLoadedCookie().sapisid, 'file_sapisid');
 
   // Netscape-экспорт (cookies.txt из расширений браузера)
@@ -174,9 +175,9 @@ try {
   assert.deepStrictEqual(b7.getLoadedCookie(), { cookieStr: '', sapisid: null });
   assert.strictEqual(b7.summary().cookieSet, false);
 } finally {
-  for (const f of tmpFiles) {
-    try { fs.unlinkSync(f); } catch {}
-  }
+  if (prevAgDataDir === undefined) delete process.env.AG_DATA_DIR;
+  else process.env.AG_DATA_DIR = prevAgDataDir;
+  try { removeTree(tmpCookieDir); } catch {}
 }
 
 // 10. Disable bridge

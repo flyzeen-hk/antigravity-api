@@ -286,7 +286,11 @@ async function main() {
   const mockOAuth = await startMockOAuth();
   const mockUp = await startMockUpstream();
 
-  // временный auth.json и usage.json для теста
+  // Изолированный AG_DATA_DIR и временные auth.json/usage.json в %TEMP%, чтобы тесты
+  // не трогали реальный конфиг и не писали временные файлы в OneDrive/Documents.
+  const testDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-test-data-'));
+  process.env.AG_DATA_DIR = testDataDir;
+
   const authFile = path.join(os.tmpdir(), 'ag-test-auth-' + Date.now() + '.json');
   fs.writeFileSync(authFile, JSON.stringify({ type: 'antigravity', refresh_token: 'test-refresh-token', access_token: '', access_expires_at: 0 }));
   process.env.AG_AUTH_FILE = authFile;
@@ -926,7 +930,7 @@ async function main() {
   });
 
   await ok('web-bridge: cookie_file загружается при пустом cookie (как сохраняет GUI)', async () => {
-    const file = path.join(__dirname, '..', 'test_cookie_file_runtime.txt');
+    const file = path.join(testDataDir, 'test_cookie_file_runtime.txt');
     fs.writeFileSync(file, 'SAPISID=file-cookie-sapisid; SID=s;');
     try {
       const r = await ADM('/_config', 'POST', {
@@ -1452,6 +1456,7 @@ async function main() {
   mockUp.server.close();
   try { fs.unlinkSync(authFile); } catch {}
   try { fs.unlinkSync(usageFile); } catch {}
+  try { removeTree(testDataDir); } catch {}
   process.exit(failed ? 1 : 0);
 }
 

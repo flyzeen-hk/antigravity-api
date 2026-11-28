@@ -35,6 +35,7 @@ const shortcuts = require('./shortcuts');
 const updater = require('./update');
 const { resolvePublicAsset, normalizeIconTheme } = require('../lib/theme_icons');
 const { resolveDataDir, migrateLegacyStateFiles } = require('../lib/data_dir');
+const { FreeTunnelManager, convertTelegramSocksLink } = require('../lib/free_tunnel');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DATA_DIR = resolveDataDir({ rootDir: ROOT_DIR });
@@ -248,6 +249,10 @@ function isSameOriginAsHost(req) {
 
 async function startSupervisor({ autoStart = null } = {}) {
   const bootCfg = ensureDataInitialized();
+  const freeTunnel = new FreeTunnelManager(DATA_DIR);
+  if (bootCfg.geminiWeb && bootCfg.geminiWeb.freeTunnel && bootCfg.geminiWeb.freeTunnel.enabled === true) {
+    freeTunnel.start({ customSource: bootCfg.geminiWeb.freeTunnel.customSource || '' }).catch(() => {});
+  }
   const sessions = new Map(); // sid -> expiresAtMs
   const authFails = new Map(); // ip -> { count, firstAt, blockedUntil }
   const AUTH_FAIL = { maxFailures: 20, windowMs: 60_000, blockMs: 300_000 };
@@ -742,32 +747,87 @@ async function startSupervisor({ autoStart = null } = {}) {
       }
     }
 
-    if (pathname === '/_web/browser/open' && req.method === 'POST') {
-      const body = await readJsonBody(req);
+    const resolveOfflineWebProxy = (explicitProxy, targetAcc) => {
+      if (explicitProxy !== undefined && String(explicitProxy).trim() !== '') {
+        return convertTelegramSocksLink(explicitProxy);
+      }
       const activeAcc = (cfg.geminiWeb.accounts || []).find((a) => a.name === cfg.geminiWeb.activeAccount);
-      const rawProxy = String(
-        body.proxy
-        || (body.accountName ? ((cfg.geminiWeb.accounts || []).find((a) => a.name === body.accountName)?.proxy || '') : '')
+      const ftEnabled = !!(cfg.geminiWeb && cfg.geminiWeb.freeTunnel && cfg.geminiWeb.freeTunnel.enabled);
+      const ftProxy = ftEnabled ? freeTunnel.getActiveProxyUrlSync() : '';
+      return String(
+        (targetAcc && targetAcc.proxy)
         || (activeAcc && activeAcc.proxy)
         || cfg.geminiWeb.proxy
+        || ftProxy
         || cfg.network.proxy
         || ''
       ).trim();
-      return sendJson(res, 200, cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy }));
+    };
+
+    if (pathname === '/_web/free-tunnel/status' && req.method === 'GET') {
+      const ftCfg = (cfg.geminiWeb && cfg.geminiWeb.freeTunnel) || { enabled: false, customSource: '' };
+      const st = await freeTunnel.getStatus();
+      return sendJson(res, 200, {
+        ok: true,
+        enabled: ftCfg.enabled === true,
+        customSource: ftCfg.customSource || '',
+        ...st,
+      });
+    }
+
+    if (pathname === '/_web/free-tunnel' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      const action = String(body.action || 'start').toLowerCase();
+      const customSource = body.customSource !== undefined
+        ? String(body.customSource || '').trim()
+        : ((cfg.geminiWeb && cfg.geminiWeb.freeTunnel && cfg.geminiWeb.freeTunnel.customSource) || '');
+
+      if (action === 'stop') {
+        const patch = configLib.patchConfig(cfg, { geminiWeb: { freeTunnel: { enabled: false, customSource } } });
+        saveConfigDirect(patch.config);
+        const st = await freeTunnel.stop();
+        return sendJson(res, 200, { ok: true, enabled: false, customSource, ...st });
+      }
+      if (action !== 'start' && action !== 'rotate') {
+        return sendJson(res, 400, { error: { message: 'Unknown action' } });
+      }
+
+      const patch = configLib.patchConfig(cfg, { geminiWeb: { freeTunnel: { enabled: true, customSource } } });
+      saveConfigDirect(patch.config);
+      const runPromise = freeTunnel.start({ customSource, rotate: action === 'rotate' });
+      if (body.async === true) {
+        runPromise.catch(() => {});
+        const st = await freeTunnel.getStatus();
+        return sendJson(res, 200, { ok: true, enabled: true, customSource, ...st });
+      }
+      try {
+        const st = await runPromise;
+        return sendJson(res, 200, { ok: true, enabled: true, customSource, ...st });
+      } catch (e) {
+        return sendJson(res, 502, { error: { message: e.message, code: 'free_tunnel_failed' } });
+      }
+    }
+
+    if (pathname === '/_web/browser/open' && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      try {
+        const targetAcc = body.accountName ? (cfg.geminiWeb.accounts || []).find((a) => a.name === body.accountName) : null;
+        const rawProxy = resolveOfflineWebProxy(body.proxy, targetAcc);
+        return sendJson(res, 200, cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy }));
+      } catch (e) {
+        return sendJson(res, e.code === 'mtproto_unsupported' ? 400 : 500, { error: { message: e.message, code: e.code || 'browser_open_failed' } });
+      }
     }
 
     if (pathname === '/_web/browser/import-cookies' && req.method === 'POST') {
       const body = await readJsonBody(req);
       const targetAcc = body.accountName ? (cfg.geminiWeb.accounts || []).find((a) => a.name === body.accountName) : null;
-      const activeAcc = (cfg.geminiWeb.accounts || []).find((a) => a.name === cfg.geminiWeb.activeAccount);
-      const rawProxy = String(
-        body.proxy
-        || (targetAcc && targetAcc.proxy)
-        || (activeAcc && activeAcc.proxy)
-        || cfg.geminiWeb.proxy
-        || cfg.network.proxy
-        || ''
-      ).trim();
+      let rawProxy = '';
+      try {
+        rawProxy = resolveOfflineWebProxy(body.proxy, targetAcc);
+      } catch (e) {
+        return sendJson(res, 400, { error: { message: e.message, code: e.code || 'invalid_proxy' } });
+      }
       const resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true, proxy: rawProxy });
       let saved = false;
       if (resCdp.cookie && body.saveTo === 'single') {
@@ -791,7 +851,12 @@ async function startSupervisor({ autoStart = null } = {}) {
 
     if (pathname === '/_web/test' && req.method === 'POST') {
       const body = await readJsonBody(req);
-      const webProxy = String(body.proxy !== undefined ? body.proxy : (cfg.geminiWeb.proxy || cfg.network.proxy || '')).trim();
+      let webProxy = '';
+      try {
+        webProxy = resolveOfflineWebProxy(body.proxy, null);
+      } catch (e) {
+        return sendJson(res, 400, { error: { message: e.message, code: e.code || 'invalid_proxy' } });
+      }
       const tmpNet = new NetworkManager({ ...cfg, network: { ...cfg.network, proxy: webProxy } });
       try {
         const [geminiProbe, accountsProbe] = await Promise.all([

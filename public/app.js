@@ -21,6 +21,8 @@
     startup: null,
     backups: [],
     webAccounts: { activeAccount: '', accounts: [] },
+    freeTunnel: null,
+    freeTunnelPollTimer: null,
     models: [],
     catalogSnapshot: null,
     modelsServerStopped: false,
@@ -329,7 +331,7 @@
     state.loadPromise = (async () => {
       await refreshSupervisorStatus();
 
-      const [statusR, configR, keysR, usageR, logsR, installsR, startupR, backupsR, accountsR] = await Promise.allSettled([
+      const [statusR, configR, keysR, usageR, logsR, installsR, startupR, backupsR, accountsR, ftR] = await Promise.allSettled([
         api('GET', '/_status'),
         api('GET', '/_config'),
         api('GET', '/_keys'),
@@ -339,6 +341,7 @@
         api('GET', '/_startup'),
         api('GET', '/_backups'),
         api('GET', '/_web/accounts'),
+        api('GET', '/_web/free-tunnel/status'),
       ]);
 
       if (statusR.status === 'fulfilled') {
@@ -369,6 +372,7 @@
       if (startupR.status === 'fulfilled') state.startup = startupR.value;
       if (backupsR.status === 'fulfilled') state.backups = Array.isArray(backupsR.value.backups) ? backupsR.value.backups : [];
       if (accountsR.status === 'fulfilled') state.webAccounts = accountsR.value;
+      if (ftR.status === 'fulfilled') state.freeTunnel = ftR.value;
 
       updateServerControls();
       renderAll();
@@ -539,7 +543,7 @@
       state.dirtyTabs.add(tab);
     }
     if (state.status) {
-      $('sidebar-version').textContent = `v${state.status.version || '2.2.1'}`;
+      $('sidebar-version').textContent = `v${state.status.version || '2.3.0'}`;
       $('sidebar-listen').textContent = `${state.status.host || '127.0.0.1'}:${state.status.port || 8317}`;
       $('sidebar-node').textContent = state.status.nodeVersion || '—';
     }
@@ -1104,7 +1108,100 @@
     const useFile = !!gw.cookie_file && !gw.cookieLength;
     setWebCookieMode(useFile ? 'file' : state.webCookieMode);
     updateCookieValidationBadges();
+    renderFreeTunnel();
     renderWebAccounts();
+  }
+
+  function ensureFreeTunnelPolling(active) {
+    if (!active) {
+      if (state.freeTunnelPollTimer) {
+        clearInterval(state.freeTunnelPollTimer);
+        state.freeTunnelPollTimer = null;
+      }
+      return;
+    }
+    if (state.freeTunnelPollTimer) return;
+    state.freeTunnelPollTimer = setInterval(async () => {
+      try {
+        const prevPhase = state.freeTunnel && state.freeTunnel.phase;
+        state.freeTunnel = await api('GET', '/_web/free-tunnel/status');
+        renderFreeTunnel();
+        const busy = ['downloading_xray', 'scanning_nodes', 'starting'].includes(state.freeTunnel.phase);
+        if (!busy) {
+          ensureFreeTunnelPolling(false);
+          if (state.freeTunnel.running && prevPhase && prevPhase !== 'running') {
+            showToast(t('web.ftActive', {
+              node: state.freeTunnel.nodeLabel || 'VLESS',
+              ms: state.freeTunnel.latencyMs || 0,
+            }), 'ok');
+          } else if (state.freeTunnel.phase === 'error' && state.freeTunnel.error) {
+            showToast(state.freeTunnel.error, 'err');
+          }
+        }
+      } catch {
+        ensureFreeTunnelPolling(false);
+      }
+    }, 1000);
+  }
+
+  function renderFreeTunnel() {
+    const box = $('free-tunnel-box');
+    const toggle = $('free-tunnel-toggle');
+    const badge = $('free-tunnel-badge');
+    const desc = $('free-tunnel-desc');
+    const rotBtn = $('btn-free-tunnel-rotate');
+    const progWrap = $('free-tunnel-progress-wrap');
+    const progFill = $('free-tunnel-progress-fill');
+    const customInp = $('free-tunnel-custom-input');
+    if (!box || !toggle || !badge) return;
+
+    const ftCfg = (state.config && state.config.geminiWeb && state.config.geminiWeb.freeTunnel) || {};
+    const ft = state.freeTunnel || { enabled: !!ftCfg.enabled, running: false, phase: 'idle', customSource: ftCfg.customSource || '' };
+    const busy = ['downloading_xray', 'scanning_nodes', 'starting'].includes(ft.phase);
+
+    toggle.checked = !!ft.enabled || ft.running || busy;
+    if (customInp && document.activeElement !== customInp) {
+      customInp.value = ft.customSource || ftCfg.customSource || '';
+    }
+
+    box.classList.toggle('is-running', !!ft.running);
+    rotBtn.classList.toggle('hidden', !ft.running && !ft.enabled);
+    rotBtn.disabled = busy;
+
+    if (busy) {
+      progWrap.classList.remove('hidden');
+      if (ft.phase === 'downloading_xray') {
+        const pct = Number(ft.downloadPercent) || 0;
+        badge.className = 'badge badge-warn';
+        badge.textContent = t('web.ftDownloading', { pct });
+        progFill.classList.remove('indeterminate');
+        progFill.style.width = `${Math.max(4, pct)}%`;
+      } else {
+        badge.className = 'badge badge-warn';
+        badge.textContent = t('web.ftScanning');
+        progFill.classList.add('indeterminate');
+      }
+      desc.textContent = t('web.freeTunnelDesc');
+      ensureFreeTunnelPolling(true);
+    } else if (ft.running) {
+      progWrap.classList.add('hidden');
+      progFill.classList.remove('indeterminate');
+      badge.className = 'badge badge-ok';
+      badge.textContent = `✓ ${t('web.ftActive', { node: ft.nodeLabel || 'VLESS', ms: ft.latencyMs || 0 })}`;
+      desc.textContent = t('web.ftActiveDesc', { proxy: ft.proxyUrl || 'socks5://127.0.0.1' });
+    } else if (ft.phase === 'error' && ft.error) {
+      progWrap.classList.add('hidden');
+      progFill.classList.remove('indeterminate');
+      badge.className = 'badge badge-err';
+      badge.textContent = t('web.ftError');
+      desc.textContent = ft.error;
+    } else {
+      progWrap.classList.add('hidden');
+      progFill.classList.remove('indeterminate');
+      badge.className = 'badge badge-neutral';
+      badge.textContent = t('web.freeTunnelOff');
+      desc.textContent = t('web.freeTunnelDesc');
+    }
   }
 
   function setWebCookieMode(mode) {
@@ -1807,6 +1904,67 @@
     }
 
     // Gemini Web
+    if ($('free-tunnel-toggle')) {
+      $('free-tunnel-toggle').addEventListener('change', async (e) => {
+        const enable = e.target.checked;
+        const customSource = ($('free-tunnel-custom-input') && $('free-tunnel-custom-input').value.trim()) || '';
+        try {
+          state.freeTunnel = await api('POST', '/_web/free-tunnel', {
+            action: enable ? 'start' : 'stop',
+            customSource,
+            async: true,
+          });
+          state.config = await api('GET', '/_config');
+          renderFreeTunnel();
+          if (enable) ensureFreeTunnelPolling(true);
+        } catch (err) {
+          e.target.checked = !enable;
+          showToast(err.message, 'err');
+        }
+      });
+    }
+
+    if ($('btn-free-tunnel-rotate')) {
+      $('btn-free-tunnel-rotate').addEventListener('click', async () => {
+        const customSource = ($('free-tunnel-custom-input') && $('free-tunnel-custom-input').value.trim()) || '';
+        try {
+          state.freeTunnel = await api('POST', '/_web/free-tunnel', {
+            action: 'rotate',
+            customSource,
+            async: true,
+          });
+          renderFreeTunnel();
+          ensureFreeTunnelPolling(true);
+        } catch (err) {
+          showToast(err.message, 'err');
+        }
+      });
+    }
+
+    if ($('btn-free-tunnel-apply-custom')) {
+      $('btn-free-tunnel-apply-custom').addEventListener('click', async () => {
+        const customSource = $('free-tunnel-custom-input').value.trim();
+        const isEnabled = $('free-tunnel-toggle').checked;
+        try {
+          if (isEnabled) {
+            state.freeTunnel = await api('POST', '/_web/free-tunnel', {
+              action: 'rotate',
+              customSource,
+              async: true,
+            });
+            renderFreeTunnel();
+            ensureFreeTunnelPolling(true);
+          } else {
+            await api('POST', '/_config', { geminiWeb: { freeTunnel: { enabled: false, customSource } } });
+            state.config = await api('GET', '/_config');
+            showToast(t('actions.save') + ': OK', 'ok');
+          }
+        } catch (err) {
+          showToast(err.message, 'err');
+        }
+      });
+    }
+
     for (const b of $('web-cookie-mode-switch').querySelectorAll('.seg-btn')) {
       b.addEventListener('click', () => setWebCookieMode(b.dataset.mode));
     }
@@ -1890,12 +2048,17 @@
     });
 
     $('btn-web-save').addEventListener('click', async () => {
+      const manualProxyVal = $('web-proxy-input').value.trim();
+      if (/^(?:tg:\/\/proxy|https?:\/\/t\.me\/proxy)\b/i.test(manualProxyVal)) {
+        showToast('MTProto-прокси (tg://proxy) подходят только для Telegram. Включите «Бесплатный авто-прокси для Gemini» выше или укажите SOCKS5.', 'err');
+        return;
+      }
       const geminiWeb = {
         enabled: $('web-enabled-chk').checked,
         temporaryChats: $('web-tempchats-chk').checked,
         autoRotateOn429: $('web-autorotate-chk').checked,
         xsrf: $('web-xsrf-chk').checked,
-        proxy: $('web-proxy-input').value.trim(),
+        proxy: manualProxyVal,
         historyMaxChars: Number($('web-historymax-input').value) || 60000,
         bl: $('web-bl-input').value.trim(),
         thinkMode: $('web-thinkmode-select').value || null,
