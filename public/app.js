@@ -587,7 +587,7 @@
     }
 
     const gw = s.geminiWeb || {};
-    const webOk = !!(gw.enabled && (gw.hasCookie || gw.cookieConfigured || gw.accountsCount > 0 || (state.config && state.config.geminiWeb && state.config.geminiWeb.cookieSet)));
+    const webOk = !!(gw.enabled && (gw.cookieSet || gw.hasCookie || gw.cookieConfigured || (Array.isArray(gw.accounts) && gw.accounts.some((a) => a && a.hasCookie)) || gw.accountsCount > 0 || (state.config && state.config.geminiWeb && state.config.geminiWeb.cookieSet)));
     $('kpi-web-status').innerHTML = webOk
       ? `<span class="badge badge-ok">${esc(t('overview.webReady'))}</span>`
       : `<span class="badge badge-neutral">${esc(t('overview.webNotConfigured'))}</span>`;
@@ -892,7 +892,10 @@
     const tip = h.error ? ` title="${esc(h.error)}"` : '';
     if (h.status === 'working') return `<span class="badge badge-ok"${tip}>✓ ${esc(t('models.statusWorking'))}${esc(msStr)}</span>`;
     if (h.status === 'not_found') return `<span class="badge badge-err"${tip}>✗ ${esc(t('models.statusNotFound'))}</span>`;
-    if (h.status === 'forbidden') return `<span class="badge badge-warn"${tip}>🔒 ${esc(t('models.statusForbidden'))}</span>`;
+    if (h.status === 'forbidden') {
+      const label = h.httpStatus === 401 ? t('models.statusAuthRequired') : t('models.statusForbidden');
+      return `<span class="badge badge-warn"${tip}>🔒 ${esc(label)}</span>`;
+    }
     if (h.status === 'rate_limited') return `<span class="badge badge-warn"${tip}>⏳ ${esc(t('models.statusRateLimited'))}</span>`;
     if (h.status === 'region_blocked') return `<span class="badge badge-err"${tip}>🌐 ${esc(t('models.statusRegionBlocked'))}</span>`;
     return `<span class="badge badge-err"${tip}>✗ ${esc(t('models.statusError'))}${h.httpStatus ? ` (${h.httpStatus})` : ''}</span>`;

@@ -3069,38 +3069,76 @@ function start(config) {
         if (!body) return;
         await waitNetworkReady();
 
+        let webBatchPromise = null;
+        const probeWebModel = async (rawId) => {
+          const started = Date.now();
+          if (!webBridge.enabled) {
+            return { status: 'error', httpStatus: 503, ms: 0, error: 'Gemini Web мост выключен' };
+          }
+          const sum = webBridge.summary ? webBridge.summary() : {};
+          const hasWebCreds = !!(
+            sum.cookieSet
+            || sum.hasCookie
+            || sum.cookieConfigured
+            || (Array.isArray(sum.accounts) && sum.accounts.some((a) => a && a.hasCookie))
+            || (sum.accountsCount > 0)
+          );
+          if (!hasWebCreds) {
+            return { status: 'forbidden', httpStatus: 401, ms: 0, error: 'Не заданы cookie для Gemini Web' };
+          }
+          const ac = new AbortController();
+          const timer = setTimeout(() => { try { ac.abort(); } catch {} }, 35000);
+          if (timer.unref) timer.unref();
+          try {
+            const meta = webBridge.getModelMeta(rawId);
+            const reqBody = webBridge.buildPayload('Reply with OK.', meta.modelId, meta.thinkMode, 'en');
+            const upRes = await webBridge.sendStreamRequestResilient(reqBody, meta, 'en', { signal: ac.signal });
+            let gotDelta = false;
+            try {
+              for await (const delta of webBridge.streamResponse(upRes)) {
+                if (String(delta || '').trim()) {
+                  gotDelta = true;
+                  break;
+                }
+              }
+            } finally {
+              try { ac.abort(); } catch {}
+              try { if (upRes && upRes.body && typeof upRes.body.destroy === 'function') upRes.body.destroy(); } catch {}
+            }
+            return {
+              status: gotDelta ? 'working' : 'error',
+              httpStatus: gotDelta ? 200 : 502,
+              ms: Date.now() - started,
+              error: gotDelta ? '' : 'Пустой ответ Gemini Web',
+            };
+          } catch (e) {
+            const msg = String(e.message || e);
+            let st = 'error';
+            if (e.status === 429) st = 'rate_limited';
+            else if (e.code === 'region_not_supported' || e.status === 451 || /region|location|country|1060/i.test(msg)) st = 'region_blocked';
+            else if (e.status === 401 || e.status === 403 || e.code === 'auth_required') st = 'forbidden';
+            return {
+              status: st,
+              httpStatus: e.status || (st === 'region_blocked' ? 400 : 502),
+              ms: Date.now() - started,
+              error: redactSecrets(msg),
+            };
+          } finally {
+            clearTimeout(timer);
+          }
+        };
+
         const probeOne = async (fullId) => {
           const started = Date.now();
           const isWeb = /^web\//i.test(fullId);
           const rawId = fullId.replace(/^(?:cloud|web)\//i, '');
           if (isWeb) {
-            if (!webBridge.enabled) {
-              return catalog.recordHealth(fullId, { status: 'error', httpStatus: 503, ms: 0, error: 'Gemini Web мост выключен' });
-            }
-            const sum = webBridge.summary ? webBridge.summary() : {};
-            if (!sum.hasCookie && !sum.cookieConfigured && !(sum.accountsCount > 0)) {
-              return catalog.recordHealth(fullId, { status: 'forbidden', httpStatus: 401, ms: 0, error: 'Не заданы cookie для Gemini Web' });
-            }
             if (!body.model) {
-              return catalog.recordHealth(fullId, { status: 'working', httpStatus: 200, ms: Date.now() - started, error: '' });
+              if (!webBatchPromise) webBatchPromise = probeWebModel(rawId);
+              const shared = await webBatchPromise;
+              return catalog.recordHealth(fullId, shared);
             }
-            try {
-              const r = await webBridge.generateContent(rawId, { contents: [{ role: 'user', parts: [{ text: 'ping' }] }] });
-              const okReply = !!(r && (r.text || (r.candidates && r.candidates.length)));
-              return catalog.recordHealth(fullId, {
-                status: okReply ? 'working' : 'error',
-                httpStatus: okReply ? 200 : 502,
-                ms: Date.now() - started,
-                error: okReply ? '' : 'Пустой ответ Gemini Web',
-              });
-            } catch (e) {
-              return catalog.recordHealth(fullId, {
-                status: e.status === 429 ? 'rate_limited' : 'error',
-                httpStatus: e.status || 502,
-                ms: Date.now() - started,
-                error: redactSecrets(e.message || String(e)),
-              });
-            }
+            return catalog.recordHealth(fullId, await probeWebModel(rawId));
           }
 
           if (CLOUD_DISABLED) {

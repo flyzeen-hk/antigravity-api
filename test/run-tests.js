@@ -1015,6 +1015,25 @@ async function main() {
         const inner = JSON.parse(outer[1]);
         assert.strictEqual(inner[79], 8, 'web payload must select mode=8 (Argon)');
       }
+
+      // Проверка /_models/check для web/gemini-4 (раньше падала из-за sum.hasCookie & несуществующего generateContent)
+      await ADM('/_config', 'POST', { geminiWeb: { enabled: true, cookie: '', cookie_file: '' } });
+      const chkNoCookie = await ADM('/_models/check', 'POST', { model: 'web/gemini-4' });
+      assert.strictEqual(chkNoCookie.status, 200, chkNoCookie.text);
+      assert.strictEqual(JSON.parse(chkNoCookie.text).results['web/gemini-4'].httpStatus, 401);
+
+      await ADM('/_config', 'POST', { geminiWeb: { enabled: true, cookie: 'SAPISID=test_sapisid; SID=s;' } });
+      const chkOne = await ADM('/_models/check', 'POST', { model: 'web/gemini-4' });
+      assert.strictEqual(chkOne.status, 200, chkOne.text);
+      const oneRes = JSON.parse(chkOne.text).results['web/gemini-4'];
+      assert.strictEqual(oneRes.status, 'working', JSON.stringify(oneRes));
+      assert.strictEqual(oneRes.httpStatus, 200);
+
+      const chkScopeWeb = await ADM('/_models/check', 'POST', { scope: 'web' });
+      assert.strictEqual(chkScopeWeb.status, 200, chkScopeWeb.text);
+      assert.strictEqual(JSON.parse(chkScopeWeb.text).results['web/gemini-4']?.status, 'working');
+
+      await ADM('/_config', 'POST', { geminiWeb: { cookie: '', cookie_file: '' } });
     } finally {
       GeminiWebBridge.prototype.sendStreamRequestResilient = orig;
     }
