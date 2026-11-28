@@ -24,10 +24,12 @@ const { readJsonFile } = require('../lib/safe_files');
 const { findBrowserExecutable } = require('../lib/cdp_cookies');
 const { openExternalUrl } = require('../lib/auth');
 const { normalizeIconTheme } = require('../lib/theme_icons');
+const { resolveDataDir, migrateLegacyStateFiles } = require('../lib/data_dir');
 const { clearAppFaviconCache } = require('./shortcuts');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT_DIR;
+const DATA_DIR = resolveDataDir({ rootDir: ROOT_DIR });
+try { migrateLegacyStateFiles({ rootDir: ROOT_DIR, dataDir: DATA_DIR }); } catch {}
 const RESTART_EXIT_CODE = 75;
 const LOG_FILE = path.join(os.tmpdir(), 'antigravity-api.log');
 const SUP_STATE_FILE = path.join(DATA_DIR, '.ui-supervisor.json');
@@ -112,9 +114,10 @@ function openUiWindow(url, { preferBrowser = false } = {}) {
       const appProfile = path.join(os.tmpdir(), 'antigravity-api-ui-profile');
       try { fs.mkdirSync(appProfile, { recursive: true }); } catch {}
       const desiredTheme = normalizeIconTheme(null, { dataDir: DATA_DIR });
+      const desiredMarker = `v2:${desiredTheme}`;
       let cachedTheme = '';
       try { cachedTheme = fs.readFileSync(path.join(appProfile, '.ag-theme'), 'utf8').trim(); } catch {}
-      if (cachedTheme !== desiredTheme) {
+      if (cachedTheme !== desiredMarker) {
         clearAppFaviconCache(desiredTheme);
       }
       // Dedicated --user-data-dir keeps Chromium/Edge in single-profile app mode so

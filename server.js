@@ -48,11 +48,12 @@ const cdpCookies = require('./lib/cdp_cookies');
 const shortcuts = require('./scripts/shortcuts');
 const updater = require('./scripts/update');
 const { resolvePublicAsset, normalizeIconTheme } = require('./lib/theme_icons');
+const { resolveDataDir, migrateLegacyStateFiles } = require('./lib/data_dir');
 
 const ROOT = __dirname; // код
-// Данные (config.json, apikey.txt, auth.json, usage.json, backups/) можно
-// вынести из папки с кодом: нужно для Docker, где /app только для чтения.
-const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT;
+// На Windows по умолчанию мутабельные файлы живут в %LOCALAPPDATA%\AntigravityAPI,
+// чтобы Controlled Folder Access (защита папки «Документы») никогда не блокировал node.exe.
+const DATA_DIR = resolveDataDir({ rootDir: ROOT });
 
 // AG_NO_CLOUD=1 — режим «только веб-модели»: контейнеру без auth.json не нужен
 // OAuth-токен Antigravity. cloud/* отвечают понятной ошибкой, /v1/models
@@ -139,8 +140,11 @@ function envListen(config) {
 }
 
 // config.json — источник истины для ключа; apikey.txt — его копия для людей и панели.
-function loadConfig(root = ROOT) {
-  // В Docker данные живут в отдельном томе — его может ещё не быть.
+function loadConfig(root = DATA_DIR) {
+  // Автомиграция конфигов из старой папки проекта в %LOCALAPPDATA%\AntigravityAPI (только чтение из ROOT).
+  if (root === DATA_DIR) {
+    try { migrateLegacyStateFiles({ rootDir: ROOT, dataDir: DATA_DIR }); } catch {}
+  }
   try { fs.mkdirSync(root, { recursive: true }); } catch {}
   const file = path.join(root, 'config.json');
   const keyFile = path.join(root, 'apikey.txt');
@@ -2311,6 +2315,7 @@ function start(config) {
       host: listen.host,
       platform: process.platform,
       nodeVersion: process.version,
+      dataDir: DATA_DIR,
       supervised: process.env.AG_SUPERVISED === '1',
       cloudDisabled: CLOUD_DISABLED,
       cloudAuthReady: !CLOUD_DISABLED && (typeof tokens.hasCredentials === 'function' ? tokens.hasCredentials() : true),
@@ -2815,7 +2820,7 @@ function start(config) {
           }
           const nextTheme = normalizeIconTheme(config.theme);
           if (prevTheme !== nextTheme) {
-            shortcuts.syncShortcutTheme({ rootDir: ROOT, dataDir: DATA_DIR, theme: nextTheme });
+            shortcuts.clearAppFaviconCache(nextTheme);
           }
         }
 
@@ -3078,7 +3083,13 @@ function start(config) {
 
       if (p === '/_backups' && req.method === 'GET') {
         if (!requireAdmin()) return;
-        return sendJson(res, 200, { backups: updater.listBackups({ rootDir: ROOT }) });
+        return sendJson(res, 200, { backups: updater.listBackups({ rootDir: ROOT, dataDir: DATA_DIR }) });
+      }
+
+      if (p === '/_datadir/open' && req.method === 'POST') {
+        if (!requireAdmin()) return;
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+        return sendJson(res, 200, installsLib.openFolderDirect(DATA_DIR));
       }
 
       if (p === '/_backup' && req.method === 'POST') {

@@ -9,6 +9,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 const { normalizeIconTheme, getThemeAssetPaths } = require('../lib/theme_icons');
+const { resolveDataDir } = require('../lib/data_dir');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const SHORTCUT_NAME = 'Antigravity API.lnk';
@@ -97,12 +98,12 @@ function clearAppFaviconCache(theme) {
     const appProf = path.join(os.tmpdir(), 'antigravity-api-ui-profile');
     try {
       fs.mkdirSync(appProf, { recursive: true });
-      fs.writeFileSync(path.join(appProf, '.ag-theme'), normalizeIconTheme(theme), 'utf8');
+      fs.writeFileSync(path.join(appProf, '.ag-theme'), `v2:${normalizeIconTheme(theme)}`, 'utf8');
     } catch {}
   }
 }
 
-function createShortcuts({ rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || rootDir, theme } = {}) {
+function createShortcuts({ rootDir = ROOT_DIR, dataDir = resolveDataDir({ rootDir }), theme } = {}) {
   rootDir = path.resolve(rootDir);
   const effectiveTheme = normalizeIconTheme(theme, { dataDir });
   const { ico: icoPath, png512 } = getThemeAssetPaths(rootDir, effectiveTheme);
@@ -190,7 +191,7 @@ function getAutostartInfo({ rootDir = ROOT_DIR } = {}) {
   return { supported: false, enabled: false, path: '' };
 }
 
-function setAutostart(enabled, { rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || rootDir, theme } = {}) {
+function setAutostart(enabled, { rootDir = ROOT_DIR, dataDir = resolveDataDir({ rootDir }), theme } = {}) {
   rootDir = path.resolve(rootDir);
   const effectiveTheme = normalizeIconTheme(theme, { dataDir });
   const { ico: icoPath, png512 } = getThemeAssetPaths(rootDir, effectiveTheme);

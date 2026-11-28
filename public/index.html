@@ -4,10 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Antigravity API — Control Panel</title>
-  <link id="favicon-svg" rel="icon" type="image/svg+xml" href="/icon.svg">
-  <link id="favicon-512" rel="icon" type="image/png" sizes="512x512" href="/icon-512.png">
-  <link id="favicon-192" rel="icon" type="image/png" sizes="192x192" href="/icon-192.png">
-  <link id="favicon-ico" rel="alternate icon" href="/favicon.ico">
+  <link id="favicon-32" rel="icon" type="image/png" sizes="32x32" href="/icon-dark-32.png">
+  <link id="favicon-48" rel="icon" type="image/png" sizes="48x48" href="/icon-dark-48.png">
+  <link id="favicon-64" rel="icon" type="image/png" sizes="64x64" href="/icon-dark-64.png">
+  <link id="favicon-192" rel="icon" type="image/png" sizes="192x192" href="/icon-dark-192.png">
+  <link id="favicon-512" rel="icon" type="image/png" sizes="512x512" href="/icon-dark-512.png">
+  <link id="favicon-ico" rel="shortcut icon" type="image/x-icon" href="/favicon-dark.ico">
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="stylesheet" href="/styles.css">
 </head>
@@ -76,7 +78,7 @@
           </div>
           <div class="brand-text">
             <strong>Antigravity API</strong>
-            <span id="sidebar-version" class="badge badge-neutral">v2.1.0</span>
+            <span id="sidebar-version" class="badge badge-neutral">v2.2.0</span>
           </div>
         </div>
         <button id="sidebar-collapse-btn" class="btn btn-ghost btn-icon desktop-only" type="button" title="Свернуть/развернуть меню">
@@ -203,22 +205,22 @@
           </div>
 
           <div class="kpi-grid">
-            <div class="kpi-card">
+            <div class="kpi-card kpi-blue">
               <div class="kpi-label" data-i18n="overview.kpiRequests">Запросы</div>
               <div id="kpi-requests" class="kpi-value">0</div>
               <div id="kpi-requests-sub" class="kpi-sub muted">—</div>
             </div>
-            <div class="kpi-card">
+            <div class="kpi-card kpi-amber">
               <div class="kpi-label" data-i18n="overview.kpiErrors">Ошибки / Блокировки</div>
               <div id="kpi-errors" class="kpi-value">0 / 0</div>
               <div id="kpi-errors-sub" class="kpi-sub muted">—</div>
             </div>
-            <div class="kpi-card">
+            <div class="kpi-card kpi-green">
               <div class="kpi-label" data-i18n="overview.kpiCloud">Cloud Auth (Antigravity)</div>
               <div id="kpi-cloud-status" class="kpi-value kpi-sm">—</div>
               <div id="kpi-cloud-sub" class="kpi-sub muted">—</div>
             </div>
-            <div class="kpi-card">
+            <div class="kpi-card kpi-coral">
               <div class="kpi-label" data-i18n="overview.kpiWeb">Gemini Web мост</div>
               <div id="kpi-web-status" class="kpi-value kpi-sm">—</div>
               <div id="kpi-web-sub" class="kpi-sub muted">—</div>
@@ -603,24 +605,17 @@
               </div>
 
               <hr class="sep">
-              <h3 data-i18n="conn.keysTitle">Ключи доступа</h3>
+              <h3 data-i18n="conn.keysTitle">Клиентский ключ API</h3>
               <div class="stack-sm mt-md">
                 <label class="field">
-                  <span data-i18n="conn.apiKeyLabel">Клиентский API-ключ (apikey.txt — для моделей /v1)</span>
+                  <span data-i18n="conn.apiKeyLabel">API-ключ для моделей /v1 (apikey.txt)</span>
                   <div class="input-row">
                     <input id="key-api-input" type="password" readonly>
                     <button type="button" class="btn btn-ghost btn-sm toggle-secret-btn" data-secret-target="key-api-input" data-i18n="actions.show">Показать</button>
                     <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="key-api-input" data-i18n="actions.copy">Копировать</button>
                   </div>
                 </label>
-                <label class="field">
-                  <span data-i18n="conn.adminKeyLabel">Ключ администратора (admin.key — только для этой панели)</span>
-                  <div class="input-row">
-                    <input id="key-admin-input" type="password" readonly>
-                    <button type="button" class="btn btn-ghost btn-sm toggle-secret-btn" data-secret-target="key-admin-input" data-i18n="actions.show">Показать</button>
-                    <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="key-admin-input" data-i18n="actions.copy">Копировать</button>
-                  </div>
-                </label>
+                <p class="hint" data-i18n="conn.apiKeyHint">Указывайте этот ключ во всех внешних AI-клиентах (Cursor, Cline, Claude Code, OpenAI / Anthropic SDK).</p>
               </div>
             </div>
 
@@ -830,6 +825,38 @@
                   <div id="agent-diskonly-badges" class="badge-row mt-xs"></div>
                 </div>
               </div>
+            </div>
+          </div>
+
+          <!-- Data Storage & Admin Key -->
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <h3 data-i18n="settings.storageTitle">Папка данных и безопасность панели</h3>
+                <p class="muted" data-i18n="settings.storageSub">Конфигурация, ключи и логи хранятся в системной папке профиля вне защищённых библиотек Windows Defender</p>
+              </div>
+              <button id="btn-open-datadir" type="button" class="btn btn-secondary btn-sm" data-i18n="settings.openDataDir">Открыть папку данных</button>
+            </div>
+            <div class="stack-sm">
+              <label class="field">
+                <span data-i18n="settings.dataDirLabel">Активный каталог данных (DATA_DIR)</span>
+                <div class="input-row">
+                  <input id="settings-datadir-path" type="text" readonly>
+                  <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="settings-datadir-path" data-i18n="actions.copy">Копировать</button>
+                </div>
+              </label>
+
+              <details class="adv-details">
+                <summary data-i18n="settings.adminKeySummary">Ключ администратора панели (admin.key — только для внешнего браузера / Docker)</summary>
+                <div class="adv-details-body stack-sm">
+                  <p class="hint" data-i18n="settings.adminKeyExplain">При запуске через ярлык или run.bat вход происходит автоматически. Ключ admin.key разделяет права: он защищает настройки сервера от обычных AI-клиентов и нужен только при открытии панели вручную в обычном браузере или в Docker.</p>
+                  <div class="input-row">
+                    <input id="key-admin-input" type="password" readonly>
+                    <button type="button" class="btn btn-ghost btn-sm toggle-secret-btn" data-secret-target="key-admin-input" data-i18n="actions.show">Показать</button>
+                    <button type="button" class="btn btn-ghost btn-sm copy-btn" data-copy-target="key-admin-input" data-i18n="actions.copy">Копировать</button>
+                  </div>
+                </div>
+              </details>
             </div>
           </div>
 

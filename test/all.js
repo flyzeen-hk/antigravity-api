@@ -6,6 +6,7 @@
 
 const { spawnSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
@@ -31,9 +32,9 @@ const NODE_TESTS = [
   ['UI-супервизор и жизненный цикл шлюза', 'test/test_supervisor.js'],
 ];
 
-function run(label, args) {
+function run(label, args, extraEnv) {
   process.stdout.write(`\n=== ${label}\n`);
-  const r = spawnSync(args[0], args.slice(1), { cwd: ROOT, stdio: 'inherit', env: process.env });
+  const r = spawnSync(args[0], args.slice(1), { cwd: ROOT, stdio: 'inherit', env: { ...process.env, ...extraEnv } });
   if (r.error) {
     console.error(`  FAIL: не удалось запустить ${args.join(' ')}: ${r.error.message}`);
     return false;
@@ -45,9 +46,16 @@ function run(label, args) {
 function main() {
   const started = Date.now();
   const failed = [];
-  for (const [label, file] of NODE_TESTS) {
-    if (!fs.existsSync(path.join(ROOT, file))) { failed.push(label + ' (файл не найден)'); continue; }
-    if (!run(label, [process.execPath, file])) failed.push(label);
+  const suiteDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-suite-data-'));
+  try {
+    for (const [label, file] of NODE_TESTS) {
+      if (!fs.existsSync(path.join(ROOT, file))) { failed.push(label + ' (файл не найден)'); continue; }
+      if (!run(label, [process.execPath, file], { AG_DATA_DIR: suiteDataDir, AG_NO_SHORTCUT_SYNC: '1' })) {
+        failed.push(label);
+      }
+    }
+  } finally {
+    try { fs.rmSync(suiteDataDir, { recursive: true, force: true }); } catch {}
   }
 
   const secs = ((Date.now() - started) / 1000).toFixed(1);

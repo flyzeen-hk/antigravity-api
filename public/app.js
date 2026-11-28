@@ -119,13 +119,11 @@
     for (const img of document.querySelectorAll('.brand-icon-img')) {
       img.setAttribute('src', `/icon-${tName}.svg`);
     }
-    const favSvg = $('favicon-svg');
-    const fav512 = $('favicon-512');
-    const fav192 = $('favicon-192');
+    for (const sz of [32, 48, 64, 192, 512]) {
+      const el = $(`favicon-${sz}`);
+      if (el) el.setAttribute('href', `/icon-${tName}-${sz}.png`);
+    }
     const favIco = $('favicon-ico');
-    if (favSvg) favSvg.setAttribute('href', `/icon-${tName}.svg`);
-    if (fav512) fav512.setAttribute('href', `/icon-${tName}-512.png`);
-    if (fav192) fav192.setAttribute('href', `/icon-${tName}-192.png`);
     if (favIco) favIco.setAttribute('href', `/favicon-${tName}.ico`);
   }
 
@@ -541,7 +539,7 @@
       state.dirtyTabs.add(tab);
     }
     if (state.status) {
-      $('sidebar-version').textContent = `v${state.status.version || '2.1.0'}`;
+      $('sidebar-version').textContent = `v${state.status.version || '2.2.0'}`;
       $('sidebar-listen').textContent = `${state.status.host || '127.0.0.1'}:${state.status.port || 8317}`;
       $('sidebar-node').textContent = state.status.nodeVersion || '—';
     }
@@ -1389,7 +1387,7 @@
     $('ep-gemini').value = `${origin}/v1beta`;
 
     $('key-api-input').value = state.keys.apiKey || '';
-    $('key-admin-input').value = state.keys.adminKey || '';
+    if ($('key-admin-input')) $('key-admin-input').value = state.keys.adminKey || '';
 
     const cfg = state.config || state.status || {};
     $('conn-host-input').value = cfg.host || '127.0.0.1';
@@ -1479,6 +1477,13 @@
       `allowAbsolutePaths=${!!ag.allowAbsolutePaths}`,
       `auditFile=${ag.auditFile || '(default)'}`,
     ].map((txt) => `<span class="badge badge-neutral"><code>${esc(txt)}</code></span>`).join('');
+
+    if ($('settings-datadir-path')) {
+      $('settings-datadir-path').value = (state.status && state.status.dataDir) || '';
+    }
+    if ($('key-admin-input')) {
+      $('key-admin-input').value = state.keys.adminKey || '';
+    }
   }
 
   function showSettingsFeedback(res) {
@@ -2062,6 +2067,21 @@
     });
 
     // Settings
+    if ($('btn-open-datadir')) {
+      $('btn-open-datadir').addEventListener('click', async () => {
+        try {
+          const res = await api('POST', '/_datadir/open', {});
+          if (res && res.opened === false) {
+            showToast(res.reason || 'Folder open unavailable', 'warn');
+          } else {
+            showToast(t('toast.dataDirOpened'), 'ok');
+          }
+        } catch (e) {
+          showToast(e.message, 'err');
+        }
+      });
+    }
+
     $('btn-clear-proxy').addEventListener('click', () => {
       $('set-net-proxy').value = '';
       showToast('Proxy cleared (click Save to apply)', 'info');

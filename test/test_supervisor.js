@@ -6,6 +6,7 @@ const http = require('http');
 const net = require('net');
 const os = require('os');
 const path = require('path');
+const { resolveDataDir, migrateLegacyStateFiles } = require('../lib/data_dir');
 
 let passed = 0;
 function ok(cond, name) {
@@ -60,6 +61,34 @@ function request(urlStr, opts = {}) {
 
 async function main() {
   console.log('== test_supervisor');
+
+  // Verify Windows LocalAppData default resolution & read-only legacy state migration
+  const winDefault = resolveDataDir({
+    rootDir: 'C:\\Protected\\Documents\\antigravity-api',
+    env: { LOCALAPPDATA: 'C:\\Users\\Demo\\AppData\\Local' },
+    platform: 'win32',
+  });
+  ok(winDefault === path.win32.join('C:\\Users\\Demo\\AppData\\Local', 'AntigravityAPI'), 'win32 default DATA_DIR uses %LOCALAPPDATA%\\AntigravityAPI');
+  const explicitOverride = resolveDataDir({
+    rootDir: 'C:\\Protected\\Documents\\antigravity-api',
+    env: { AG_DATA_DIR: 'C:\\CustomData', LOCALAPPDATA: 'C:\\Users\\Demo\\AppData\\Local' },
+    platform: 'win32',
+  });
+  ok(explicitOverride === path.resolve('C:\\CustomData'), 'AG_DATA_DIR overrides platform default');
+
+  const legacyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-leg-src-'));
+  const legacyDest = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-leg-dst-'));
+  try {
+    fs.writeFileSync(path.join(legacyRoot, 'apikey.txt'), 'agk_legacy_demo_key_1234567890\n');
+    fs.writeFileSync(path.join(legacyRoot, 'config.json'), '{"port":8317}');
+    const mig = migrateLegacyStateFiles({ rootDir: legacyRoot, dataDir: legacyDest, env: {} });
+    ok(mig.migrated.includes('apikey.txt') && mig.migrated.includes('config.json'), 'migrateLegacyStateFiles copies legacy state files to new DATA_DIR');
+    ok(fs.existsSync(path.join(legacyRoot, 'apikey.txt')) && fs.existsSync(path.join(legacyDest, 'apikey.txt')), 'legacy migration preserves source files untouched');
+  } finally {
+    try { fs.rmSync(legacyRoot, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(legacyDest, { recursive: true, force: true }); } catch {}
+  }
+
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-sup-test-'));
   const gatewayPort = await getFreePort();
   process.env.AG_DATA_DIR = tmpDir;
@@ -130,7 +159,12 @@ async function main() {
       ok(r.status === 200, `offline ${p} returns 200 while gateway stopped`);
     }
     const statusOff = await request(`${base}/_status`, { headers });
-    ok(statusOff.json?.supervised === true && statusOff.json?.serverRunning === false, '/_status reports supervised=true serverRunning=false offline');
+    ok(
+      statusOff.json?.supervised === true
+      && statusOff.json?.serverRunning === false
+      && statusOff.json?.dataDir === path.resolve(tmpDir),
+      '/_status reports supervised=true serverRunning=false and active dataDir offline'
+    );
 
     const crossPortSup = await request(`${base}/_keys`, {
       headers: { cookie: sessionCookie, origin: 'http://127.0.0.1:3000' },
@@ -141,19 +175,27 @@ async function main() {
     const lightSvg = await request(`${base}/icon-light.svg`);
     const darkIco = await request(`${base}/favicon-dark.ico`);
     const lightIco = await request(`${base}/favicon-light.ico`);
+    const darkPng48 = await request(`${base}/icon-dark-48.png`);
+    const lightPng48 = await request(`${base}/icon-light-48.png`);
     ok(darkSvg.status === 200 && lightSvg.status === 200 && darkSvg.text !== lightSvg.text, '/icon-dark.svg and /icon-light.svg serve distinct theme SVGs');
     ok(darkIco.status === 200 && lightIco.status === 200 && !darkIco.buf.equals(lightIco.buf), '/favicon-dark.ico and /favicon-light.ico serve distinct ICOs');
+    ok(
+      darkPng48.status === 200 && lightPng48.status === 200
+      && darkPng48.buf[0] === 0x89 && darkPng48.buf[1] === 0x50
+      && !darkPng48.buf.equals(lightPng48.buf),
+      '/icon-dark-48.png and /icon-light-48.png serve crisp theme PNGs'
+    );
 
     const initIcon = await request(`${base}/icon.svg`);
     const initManifest = await request(`${base}/manifest.webmanifest`);
-    ok(initIcon.text === darkSvg.text && initManifest.json?.background_color === '#0b0f17', 'default dark theme serves #8 dark icon & manifest');
+    ok(initIcon.text === darkSvg.text && initManifest.json?.background_color === '#070b14', 'default dark theme serves #8 dark icon & manifest');
 
     const setLightRes = await request(`${base}/_config`, { method: 'POST', headers, body: { theme: 'light' } });
     ok(setLightRes.status === 200 && setLightRes.json?.ok === true, 'POST /_config switches theme to light');
     const lightActiveSvg = await request(`${base}/icon.svg`);
     const lightActiveIco = await request(`${base}/favicon.ico`);
     const lightManifest = await request(`${base}/manifest.webmanifest`);
-    ok(lightActiveSvg.text === lightSvg.text && lightActiveIco.buf.equals(lightIco.buf) && lightManifest.json?.background_color === '#f1f5f9', 'light theme dynamically serves #7 light icon, favicon & manifest');
+    ok(lightActiveSvg.text === lightSvg.text && lightActiveIco.buf.equals(lightIco.buf) && lightManifest.json?.background_color === '#eef3fb', 'light theme dynamically serves #7 light icon, favicon & manifest');
 
     const setDarkRes = await request(`${base}/_config`, { method: 'POST', headers, body: { theme: 'dark' } });
     ok(setDarkRes.status === 200 && (await request(`${base}/icon.svg`)).text === darkSvg.text, 'switching back to dark restores #8 dark icon');
@@ -202,7 +244,13 @@ async function main() {
     ok(cliKey === genApiKey && cliKeyFlag === genApiKey && cliAdmin === genAdminKey, 'server.js CLI key / --print-key / admin-key return initialized keys');
 
     const statusRun = await request(`${base}/_status`, { headers });
-    ok(statusRun.status === 200 && statusRun.json?.port === gatewayPort && statusRun.json?.serverRunning !== false, 'proxied /_status responds from live gateway');
+    ok(
+      statusRun.status === 200
+      && statusRun.json?.port === gatewayPort
+      && statusRun.json?.serverRunning !== false
+      && statusRun.json?.dataDir === path.resolve(tmpDir),
+      'proxied /_status responds from live gateway with dataDir'
+    );
 
     const chatProxied = await request(`${base}/api/diagnostics/chat`, {
       method: 'POST',

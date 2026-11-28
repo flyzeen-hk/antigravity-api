@@ -1,6 +1,8 @@
 'use strict';
 
 (function (global) {
+  let gradSeq = 0;
+
   function esc(str) {
     return String(str ?? '')
       .replace(/&/g, '&amp;')
@@ -30,19 +32,20 @@
     return `${m}m`;
   }
 
-  function gaugeColor(pct) {
-    if (pct === null || pct === undefined) return 'var(--text-muted)';
-    if (pct <= 15) return 'var(--red)';
-    if (pct <= 40) return 'var(--amber)';
-    return 'var(--green)';
+  function gaugeStops(pct) {
+    if (pct === null || pct === undefined) return ['#64748b', '#94a3b8'];
+    if (pct <= 15) return ['#ea4335', '#fb7185'];
+    if (pct <= 40) return ['#f59e0b', '#fbbc05'];
+    return ['#3182ff', '#34a853'];
   }
 
   function buildArcSvg(pct) {
-    const r = 34;
+    const gid = `ag-g-${++gradSeq}`;
+    const r = 36;
     const c = 2 * Math.PI * r;
     const clamped = pct === null || pct === undefined ? 0 : Math.max(0, Math.min(100, Number(pct)));
     const dash = (clamped / 100) * c;
-    const color = gaugeColor(pct);
+    const [c1, c2] = gaugeStops(pct);
     let label = '—';
     if (pct !== null && pct !== undefined) {
       if (clamped > 99 && clamped < 100) label = `${clamped.toFixed(1)}%`;
@@ -50,12 +53,18 @@
       else label = `${Math.floor(clamped + 1e-6)}%`;
     }
     return `
-      <svg width="86" height="86" viewBox="0 0 86 86" aria-hidden="true">
-        <circle cx="43" cy="43" r="${r}" fill="none" stroke="var(--border)" stroke-width="7"></circle>
-        <circle class="gauge-arc" cx="43" cy="43" r="${r}" fill="none" stroke="${color}" stroke-width="7"
+      <svg width="92" height="92" viewBox="0 0 92 92" aria-hidden="true">
+        <defs>
+          <linearGradient id="${gid}" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="${c1}"></stop>
+            <stop offset="100%" stop-color="${c2}"></stop>
+          </linearGradient>
+        </defs>
+        <circle cx="46" cy="46" r="${r}" fill="none" stroke="var(--border)" stroke-width="7.5"></circle>
+        <circle class="gauge-arc" cx="46" cy="46" r="${r}" fill="none" stroke="url(#${gid})" stroke-width="7.5"
           stroke-linecap="round" stroke-dasharray="${dash.toFixed(1)} ${c.toFixed(1)}"
-          transform="rotate(-90 43 43)"></circle>
-        <text x="43" y="47" text-anchor="middle" fill="var(--text)" font-size="14" font-weight="700" font-family="var(--font-sans)">${esc(label)}</text>
+          transform="rotate(-90 46 46)"></circle>
+        <text x="46" y="50" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="750" font-family="var(--font-sans)">${esc(label)}</text>
       </svg>`;
   }
 
@@ -164,27 +173,31 @@
     const totalTok = rows.reduce((s, r) => s + (Number(r.tokens) || 0), 0);
 
     const W = 540;
-    const H = 175;
-    const padL = 42;
+    const H = 180;
+    const padL = 44;
     const padR = 12;
     const padT = 14;
     const padB = 26;
     const innerW = W - padL - padR;
     const innerH = H - padT - padB;
     const step = innerW / rows.length;
-    const barW = Math.max(4, Math.min(26, step * 0.68));
+    const barW = Math.max(5, Math.min(28, step * 0.66));
+    const barGradId = `ag-bar-${++gradSeq}`;
+    const [topColor, botColor] = metric === 'tokens'
+      ? ['#34d399', '#0ea5e9']
+      : ['#60a5fa', '#2563eb'];
 
     const grid = [0, 0.5, 1].map((frac) => {
       const y = padT + innerH * (1 - frac);
       const val = fmtCompact(maxVal * frac);
       return `
         <line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-dasharray="3 3"></line>
-        <text x="${padL - 6}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--font-mono)">${esc(val)}</text>`;
+        <text x="${padL - 7}" y="${(y + 4).toFixed(1)}" text-anchor="end" fill="var(--text-muted)" font-size="10.5" font-family="var(--font-mono)">${esc(val)}</text>`;
     }).join('');
 
     const bars = rows.map((r, i) => {
       const val = Number(r[metric]) || 0;
-      const barH = Math.max(val > 0 ? 2 : 0, (val / maxVal) * innerH);
+      const barH = Math.max(val > 0 ? 3 : 0, (val / maxVal) * innerH);
       const x = padL + i * step + (step - barW) / 2;
       const y = padT + innerH - barH;
       const showLabel = i === 0 || i === rows.length - 1 || i === Math.floor(rows.length / 2);
@@ -193,17 +206,23 @@
         <g class="usage-bar-group" data-date="${esc(r.date)}" data-req="${Number(r.requests) || 0}" data-tok="${Number(r.tokens) || 0}">
           <rect x="${x.toFixed(1)}" y="${padT}" width="${barW.toFixed(1)}" height="${innerH}" fill="transparent"></rect>
           <rect class="usage-bar-rect" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${barH.toFixed(1)}"
-            rx="3" fill="${metric === 'tokens' ? 'var(--cyan)' : 'var(--accent)'}" opacity="0.86"></rect>
+            rx="4" fill="url(#${barGradId})" opacity="0.92"></rect>
           ${showLabel ? `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 7}" text-anchor="middle" fill="var(--text-muted)" font-size="10" font-family="var(--font-mono)">${esc(dateShort)}</text>` : ''}
         </g>`;
     }).join('');
 
     container.innerHTML = `
       <div class="row-between mb-sm">
-        <span class="badge badge-neutral">${esc(t('overview.metricRequests'))}: ${esc(fmtCompact(totalReq))}</span>
-        <span class="badge badge-neutral">${esc(t('overview.metricTokens'))}: ${esc(fmtCompact(totalTok))}</span>
+        <span class="badge badge-accent">${esc(t('overview.metricRequests'))}: ${esc(fmtCompact(totalReq))}</span>
+        <span class="badge badge-ok">${esc(t('overview.metricTokens'))}: ${esc(fmtCompact(totalTok))}</span>
       </div>
       <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto;display:block;overflow:visible">
+        <defs>
+          <linearGradient id="${barGradId}" x1="0%" y1="0%" x2="0%" y2="100%">
+            <stop offset="0%" stop-color="${topColor}"></stop>
+            <stop offset="100%" stop-color="${botColor}"></stop>
+          </linearGradient>
+        </defs>
         ${grid}
         ${bars}
       </svg>
@@ -229,7 +248,7 @@
     svg.addEventListener('mouseleave', () => tip.classList.add('hidden'));
   }
 
-  function renderLiveTelemetry(container, logs, t) {
+  function renderLiveTelemetry(container, logs) {
     if (!container) return;
     const recent = (Array.isArray(logs) ? logs.slice(0, 40) : []).reverse();
     const latencies = recent.map((l) => Number(l.ms)).filter((v) => Number.isFinite(v) && v >= 0);
@@ -254,14 +273,24 @@
       const ceil = Math.max(10, maxMs);
       const w = 220;
       const h = 34;
-      const pts = latencies.map((v, i) => {
+      const sparkGradId = `ag-sp-${++gradSeq}`;
+      const coords = latencies.map((v, i) => {
         const x = (i / (latencies.length - 1)) * w;
-        const y = h - 3 - (v / ceil) * (h - 6);
-        return `${x.toFixed(1)},${y.toFixed(1)}`;
-      }).join(' ');
+        const y = h - 4 - (v / ceil) * (h - 8);
+        return [x, y];
+      });
+      const pts = coords.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
+      const areaPts = `0,${h} ${pts} ${w},${h}`;
       sparkSvg = `
         <svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="display:block">
-          <polyline fill="none" stroke="var(--cyan)" stroke-width="2" stroke-linejoin="round" points="${pts}"></polyline>
+          <defs>
+            <linearGradient id="${sparkGradId}" x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stop-color="#3182ff" stop-opacity="0.32"></stop>
+              <stop offset="100%" stop-color="#3182ff" stop-opacity="0.0"></stop>
+            </linearGradient>
+          </defs>
+          <polygon fill="url(#${sparkGradId})" points="${areaPts}"></polygon>
+          <polyline fill="none" stroke="#38bdf8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${pts}"></polyline>
         </svg>`;
     } else if (latencies.length === 1) {
       avgMs = Math.round(latencies[0]);
@@ -273,10 +302,10 @@
         <span class="badge badge-ok">2xx: ${okCount}</span>
         <span class="badge badge-warn">4xx: ${warnCount}</span>
         <span class="badge badge-err">5xx: ${errCount}</span>
-        <div style="width:120px;height:8px;background:var(--bg-input);border-radius:99px;overflow:hidden;display:flex;border:1px solid var(--border)">
-          <div style="width:${(okCount / total) * 100}%;background:var(--green);transition:width 0.3s ease"></div>
-          <div style="width:${(warnCount / total) * 100}%;background:var(--amber);transition:width 0.3s ease"></div>
-          <div style="width:${(errCount / total) * 100}%;background:var(--red);transition:width 0.3s ease"></div>
+        <div style="width:128px;height:8px;background:var(--bg-input);border-radius:99px;overflow:hidden;display:flex;border:1px solid var(--border)">
+          <div style="width:${(okCount / total) * 100}%;background:var(--green-solid);transition:width 0.3s ease"></div>
+          <div style="width:${(warnCount / total) * 100}%;background:var(--ag-yellow);transition:width 0.3s ease"></div>
+          <div style="width:${(errCount / total) * 100}%;background:var(--ag-red);transition:width 0.3s ease"></div>
         </div>
       </div>
       <div class="badge-row">

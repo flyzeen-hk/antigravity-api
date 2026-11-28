@@ -15,6 +15,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const { backupFile, writeFileAtomic } = require('../lib/safe_files');
+const { resolveDataDir } = require('../lib/data_dir');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const STATE_FILES = [
@@ -63,10 +64,10 @@ function runGit(cwd, args) {
   }).trim();
 }
 
-function createBackup({ rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || ROOT_DIR, reason = 'manual' } = {}) {
+function createBackup({ rootDir = ROOT_DIR, dataDir = resolveDataDir({ rootDir }), reason = 'manual' } = {}) {
   const safeReason = String(reason || 'manual').replace(/[^a-zA-Z0-9_-]/g, '');
   const id = `${safeReason}-${stamp()}`;
-  const bkpRoot = path.join(rootDir, '_backups');
+  const bkpRoot = path.join(path.resolve(dataDir), '_backups');
   let dest = path.join(bkpRoot, id);
   for (let i = 1; fs.existsSync(dest); i++) {
     dest = path.join(bkpRoot, `${id}-${i}`);
@@ -134,41 +135,54 @@ function countFilesShallow(dir, depth = 0) {
   return total;
 }
 
-function listBackups({ rootDir = ROOT_DIR } = {}) {
-  const bkpRoot = path.join(rootDir, '_backups');
-  if (!fs.existsSync(bkpRoot)) return [];
-  const entries = fs.readdirSync(bkpRoot).sort().reverse();
+function listBackups({ rootDir = ROOT_DIR, dataDir = resolveDataDir({ rootDir }) } = {}) {
+  const roots = [...new Set([
+    path.join(path.resolve(dataDir), '_backups'),
+    path.join(path.resolve(rootDir), '_backups'),
+  ])];
+  const seen = new Set();
   const out = [];
-  for (const name of entries) {
-    const full = path.join(bkpRoot, name);
-    let st;
-    try { st = fs.statSync(full); } catch { continue; }
-    if (!st.isDirectory()) continue;
-    let manifest = null;
-    try {
-      manifest = JSON.parse(fs.readFileSync(path.join(full, 'manifest.json'), 'utf8'));
-    } catch {}
-    const manifestFilesCount = manifest && manifest.files ? Object.keys(manifest.files).length : 0;
-    const fileCount = manifestFilesCount || countFilesShallow(full);
-    out.push({
-      id: name,
-      path: full,
-      createdAt: (manifest && manifest.createdAt) || st.mtime.toISOString(),
-      reason: (manifest && manifest.reason) || (name.split('-')[0] || 'snapshot'),
-      version: (manifest && manifest.version) || '',
-      gitCommit: (manifest && manifest.gitCommit) || '',
-      hasBundle: !!(manifest && manifest.hasBundle) || fs.existsSync(path.join(full, 'repo.bundle')),
-      fileCount,
-    });
+  for (const bkpRoot of roots) {
+    if (!fs.existsSync(bkpRoot)) continue;
+    const entries = fs.readdirSync(bkpRoot).sort().reverse();
+    for (const name of entries) {
+      if (seen.has(name)) continue;
+      const full = path.join(bkpRoot, name);
+      let st;
+      try { st = fs.statSync(full); } catch { continue; }
+      if (!st.isDirectory()) continue;
+      seen.add(name);
+      let manifest = null;
+      try {
+        manifest = JSON.parse(fs.readFileSync(path.join(full, 'manifest.json'), 'utf8'));
+      } catch {}
+      const manifestFilesCount = manifest && manifest.files ? Object.keys(manifest.files).length : 0;
+      const fileCount = manifestFilesCount || countFilesShallow(full);
+      out.push({
+        id: name,
+        path: full,
+        createdAt: (manifest && manifest.createdAt) || st.mtime.toISOString(),
+        reason: (manifest && manifest.reason) || (name.split('-')[0] || 'snapshot'),
+        version: (manifest && manifest.version) || '',
+        gitCommit: (manifest && manifest.gitCommit) || '',
+        hasBundle: !!(manifest && manifest.hasBundle) || fs.existsSync(path.join(full, 'repo.bundle')),
+        fileCount,
+      });
+    }
   }
+  out.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   return out;
 }
 
-function rollbackBackup(id, { rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || ROOT_DIR } = {}) {
+function rollbackBackup(id, { rootDir = ROOT_DIR, dataDir = resolveDataDir({ rootDir }) } = {}) {
   const cleanId = path.basename(String(id || '').trim());
   if (!cleanId) throw new Error('Backup ID is required.');
-  const srcDir = path.join(rootDir, '_backups', cleanId);
-  if (!fs.existsSync(srcDir)) throw new Error(`Backup not found: ${cleanId}`);
+  const candidates = [
+    path.join(path.resolve(dataDir), '_backups', cleanId),
+    path.join(path.resolve(rootDir), '_backups', cleanId),
+  ];
+  const srcDir = candidates.find((c) => fs.existsSync(c));
+  if (!srcDir) throw new Error(`Backup not found: ${cleanId}`);
 
   const preRestore = createBackup({ rootDir, dataDir, reason: 'pre-rollback' });
   const stateDir = path.join(srcDir, 'state');
@@ -186,7 +200,7 @@ function rollbackBackup(id, { rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_
   return { ok: true, id: cleanId, preRestore: preRestore.manifest.id, restored };
 }
 
-function applyUpdate({ rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || ROOT_DIR } = {}) {
+function applyUpdate({ rootDir = ROOT_DIR, dataDir = resolveDataDir({ rootDir }) } = {}) {
   console.log('[1/4] Creating full backup before update...');
   const bkp = createBackup({ rootDir, dataDir, reason: 'update' });
   console.log(`  Backup saved: ${bkp.dir}`);

@@ -34,9 +34,10 @@ const cdpCookies = require('../lib/cdp_cookies');
 const shortcuts = require('./shortcuts');
 const updater = require('./update');
 const { resolvePublicAsset, normalizeIconTheme } = require('../lib/theme_icons');
+const { resolveDataDir, migrateLegacyStateFiles } = require('../lib/data_dir');
 
 const ROOT_DIR = path.resolve(__dirname, '..');
-const DATA_DIR = process.env.AG_DATA_DIR ? path.resolve(process.env.AG_DATA_DIR) : ROOT_DIR;
+const DATA_DIR = resolveDataDir({ rootDir: ROOT_DIR });
 const LOG_FILE = path.join(os.tmpdir(), 'antigravity-api.log');
 const STATE_FILE = path.join(DATA_DIR, '.ui-supervisor.json');
 const RESTART_EXIT_CODE = 75;
@@ -63,6 +64,7 @@ function readKeyFromFile(filePath) {
 }
 
 function ensureDataInitialized() {
+  try { migrateLegacyStateFiles({ rootDir: ROOT_DIR, dataDir: DATA_DIR }); } catch {}
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const cfgPath = path.join(DATA_DIR, 'config.json');
   const apiKeyPath = path.join(DATA_DIR, 'apikey.txt');
@@ -603,6 +605,7 @@ async function startSupervisor({ autoStart = null } = {}) {
         host: activeHost,
         platform: process.platform,
         nodeVersion: process.version,
+        dataDir: DATA_DIR,
         supervised: true,
         serverRunning: false,
         cloudDisabled: /^(1|true|yes)$/i.test(String(process.env.AG_NO_CLOUD || '').trim()),
@@ -672,7 +675,7 @@ async function startSupervisor({ autoStart = null } = {}) {
         saveConfigDirect(patch.config);
         const nextTheme = normalizeIconTheme(patch.config.theme);
         if (prevTheme !== nextTheme) {
-          shortcuts.syncShortcutTheme({ rootDir: ROOT_DIR, dataDir: DATA_DIR, theme: nextTheme });
+          shortcuts.clearAppFaviconCache(nextTheme);
         }
         activePort = portOf(patch.config);
         activeHost = connectHostOf(patch.config);
@@ -839,7 +842,11 @@ async function startSupervisor({ autoStart = null } = {}) {
     }
 
     if (pathname === '/_backups' && req.method === 'GET') {
-      return sendJson(res, 200, { backups: updater.listBackups({ rootDir: ROOT_DIR }) });
+      return sendJson(res, 200, { backups: updater.listBackups({ rootDir: ROOT_DIR, dataDir: DATA_DIR }) });
+    }
+    if (pathname === '/_datadir/open' && req.method === 'POST') {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      return sendJson(res, 200, installsLib.openFolderDirect(DATA_DIR));
     }
     if (pathname === '/_backup' && req.method === 'POST') {
       const result = updater.createBackup({ rootDir: ROOT_DIR, dataDir: DATA_DIR, reason: 'panel' });

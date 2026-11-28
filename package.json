@@ -1,6 +1,6 @@
 {
   "name": "antigravity-api",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Local OpenAI/Anthropic/Gemini API gateway with offline Web Control Panel, live quota visualizations, Google OAuth, CDP cookie import, and server-side agent file tools.",
   "main": "server.js",
   "scripts": {
