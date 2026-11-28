@@ -14,6 +14,11 @@ cookie*.txt
 ui_language.txt
 install_paths.json
 known_models.json
+web_models.json
+free_tunnel_state.json
+free_tunnel_cache.json
+GeminiBrowser/
+bin/
 
 # Rolling and pre-update/consolidation backups (contain the same secrets)
 backups/

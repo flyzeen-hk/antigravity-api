@@ -24,6 +24,11 @@ config.json
 usage.json
 install_paths.json
 known_models.json
+web_models.json
+free_tunnel_state.json
+free_tunnel_cache.json
+GeminiBrowser
+bin
 ui_language.txt
 data
 # Agent runtime artifacts

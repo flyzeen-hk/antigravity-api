@@ -5,8 +5,15 @@ const fs = require('fs');
 const http = require('http');
 const os = require('os');
 const path = require('path');
+const { EventEmitter } = require('events');
 const { buildOpenExternalCommand, startInteractiveOAuth, getOAuthStatus } = require('../lib/auth');
-const { normalizeBrowserProxy } = require('../lib/cdp_cookies');
+const {
+  normalizeBrowserProxy,
+  parseUserDataDirFromCommandLine,
+  parseProxyFromCommandLine,
+  classifyProfileProcesses,
+  openGeminiLoginWindow,
+} = require('../lib/cdp_cookies');
 const { detectAutoPaths } = require('../lib/installs');
 
 let passed = 0;
@@ -87,6 +94,79 @@ async function main() {
       && !denyResEn.html.includes('Вход отменён'),
       'OAuth callback renders localized English HTML when lang=en'
     );
+
+    // cdp_cookies: headless / remote-debugging / proxy mismatch process detection & restart guard
+    const fakeProfile = path.join(tmpDir, 'GeminiBrowser');
+    const otherProfile = path.join(tmpDir, 'OtherBrowser');
+    ok(
+      parseUserDataDirFromCommandLine(`"brave.exe" --user-data-dir="${fakeProfile}" --headless=new`) === fakeProfile,
+      'parseUserDataDirFromCommandLine extracts quoted profile path'
+    );
+    ok(
+      parseProxyFromCommandLine(`"brave.exe" --proxy-server=socks5://127.0.0.1:18480`) === 'socks5://127.0.0.1:18480',
+      'parseProxyFromCommandLine normalizes proxy flag'
+    );
+
+    const headlessState = classifyProfileProcesses([
+      { pid: 101, commandLine: `brave.exe --user-data-dir=${fakeProfile} --proxy-server=socks5://127.0.0.1:18480 --headless=new --remote-debugging-port=0 https://gemini.google.com/app` },
+      { pid: 102, commandLine: `brave.exe --user-data-dir="${otherProfile}" --new-window` },
+    ], 'socks5://127.0.0.1:18480', { profileDir: fakeProfile });
+    ok(headlessState.matching.length === 1 && headlessState.hasHeadless && headlessState.shouldRestartForVisibleWindow, 'headless GeminiBrowser process triggers clean restart before opening visible window');
+
+    const mismatchState = classifyProfileProcesses([
+      { pid: 103, commandLine: `brave.exe --user-data-dir="${fakeProfile}" --new-window` },
+    ], 'socks5://127.0.0.1:18480', { profileDir: fakeProfile });
+    ok(mismatchState.proxyMismatch && mismatchState.shouldRestartForVisibleWindow, 'proxy change triggers restart of existing GeminiBrowser window');
+
+    const okVisibleState = classifyProfileProcesses([
+      { pid: 104, commandLine: `brave.exe --user-data-dir="${fakeProfile}" --proxy-server=socks5://127.0.0.1:18480 --new-window` },
+    ], 'socks5://127.0.0.1:18480', { profileDir: fakeProfile });
+    ok(!okVisibleState.shouldRestartForVisibleWindow, 'visible GeminiBrowser window with matching proxy is preserved');
+
+    let closedCalled = 0;
+    let launchedArgs = null;
+    const reopened = await openGeminiLoginWindow('https://gemini.google.com/app', {
+      proxy: 'socks5://127.0.0.1:18480',
+      waitSpawnMs: 30,
+      _deps: {
+        findBrowserExecutable: () => 'C:\\Fake\\brave.exe',
+        getProfileDir: () => fakeProfile,
+        readDevToolsPort: () => null,
+        removeDevToolsActivePort: () => {},
+        listProfileBrowserProcesses: async () => [
+          { pid: 201, commandLine: `brave.exe --user-data-dir="${fakeProfile}" --headless=new` },
+        ],
+        closeProfileBrowser: async () => { closedCalled++; },
+        launchBrowser: (exe, dir, opts) => {
+          launchedArgs = { exe, dir, opts };
+          return new EventEmitter();
+        },
+      },
+    });
+    ok(closedCalled === 1 && reopened.restarted === true && launchedArgs && launchedArgs.opts.proxy === 'socks5://127.0.0.1:18480', 'openGeminiLoginWindow closes stale headless instance before opening visible window');
+
+    let spawnFailErr = null;
+    try {
+      await openGeminiLoginWindow('https://gemini.google.com/app', {
+        waitSpawnMs: 200,
+        _deps: {
+          findBrowserExecutable: () => 'C:\\Fake\\brave.exe',
+          getProfileDir: () => path.join(tmpDir, 'MissingLock'),
+          readDevToolsPort: () => null,
+          removeDevToolsActivePort: () => {},
+          listProfileBrowserProcesses: async () => [],
+          closeProfileBrowser: async () => {},
+          launchBrowser: () => {
+            const ee = new EventEmitter();
+            process.nextTick(() => ee.emit('exit', 1));
+            return ee;
+          },
+        },
+      });
+    } catch (e) {
+      spawnFailErr = e;
+    }
+    ok(spawnFailErr && spawnFailErr.code === 'browser_launch_failed', 'openGeminiLoginWindow surfaces immediate non-zero browser launch failure');
 
     console.log(`\nALL PASSED (${passed} checks)`);
   } finally {

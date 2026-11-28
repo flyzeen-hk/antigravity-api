@@ -546,6 +546,7 @@ function start(config) {
 
   const webBridge = new GeminiWebBridge({
     ...(buildEffectiveRuntimeConfig().geminiWeb || {}), network,
+    catalogCacheFile: path.join(DATA_DIR, 'web_models.json'),
     onCookieRotated: persistRotatedCookie,
     onAccountSwitch: persistActiveAccount,
   });
@@ -557,8 +558,13 @@ function start(config) {
   // Строго opt-in: запускаем авто-туннель только если пользователь сам включил его ранее.
   if (config.geminiWeb && config.geminiWeb.freeTunnel && config.geminiWeb.freeTunnel.enabled === true) {
     freeTunnel.start({ customSource: config.geminiWeb.freeTunnel.customSource || '' })
-      .then(() => syncRuntimeTunnelToBridge())
+      .then(() => {
+        syncRuntimeTunnelToBridge();
+        webBridge.refreshModels().catch(() => {});
+      })
       .catch(() => {});
+  } else if (webBridge.enabled && (webBridge.getLoadedCookie().cookieStr || network.summary().proxy)) {
+    webBridge.refreshModels().catch(() => {});
   }
   webBridge.ensureBlFresh(true).catch(() => {});
   const netSummary = network.summary();
@@ -1224,7 +1230,7 @@ function start(config) {
     }
 
     const mapped = anthropic.mapModel(modelName);
-    let parsed = providers.parseModel(mapped);
+    let parsed = parseRequestModel(mapped);
     if (!parsed.ok) parsed = (await resolveFlatModel(mapped)) || parsed;
     if (!parsed.ok) {
       return anthropicError(res, 404, 'not_found_error', `model: неизвестная модель "${modelName}". Список: GET /v1/models`);
@@ -1351,6 +1357,13 @@ function start(config) {
   // ---- OpenAI: /v1/chat/completions ----
 
   // Модели жёстко неймспейснуты: cloud/<id> | web/<alias>.
+  function parseRequestModel(raw) {
+    return providers.parseModel(raw, {
+      isWebAlias: (id) => webBridge.isWebModelName(id),
+      webAliases: () => webBridge.getModelIds(),
+    });
+  }
+
   function sendNamespaceError(res, parsed) {
     return sendJson(res, 400, {
       error: {
@@ -1368,7 +1381,7 @@ function start(config) {
   async function resolveFlatModel(raw) {
     const name = String(raw || '').trim();
     if (!name) return null;
-    const direct = providers.parseModel(name);
+    const direct = parseRequestModel(name);
     if (direct.ok || direct.code !== 'model_namespace_required') return null;
     let base = name;
     let agent = false;
@@ -1379,11 +1392,11 @@ function start(config) {
     try {
       const models = await catalog.list(() => tokens.getAccessToken());
       if (models.has(base)) {
-        return providers.parseModel(providers.formatModel(providers.CLOUD, base, { agent }));
+        return parseRequestModel(providers.formatModel(providers.CLOUD, base, { agent }));
       }
     } catch {}
     if (webBridge.isWebModelName(base)) {
-      return providers.parseModel(providers.formatModel(providers.WEB, base, { agent }));
+      return parseRequestModel(providers.formatModel(providers.WEB, base, { agent }));
     }
     return null;
   }
@@ -1710,12 +1723,12 @@ function start(config) {
     if (rawModel === 'web' && config.geminiWeb?.defaultModel) {
       rawModel = providers.formatModel(providers.WEB, config.geminiWeb.defaultModel.replace(/^web\//i, ''));
     }
-    let parsed = providers.parseModel(rawModel);
+    let parsed = parseRequestModel(rawModel);
     if (!parsed.ok) {
       parsed = (await resolveFlatModel(rawModel)) || parsed;
     }
     if (!parsed.ok && config.defaultModel && parsed.code === 'model_namespace_required') {
-      const fb = providers.parseModel(config.defaultModel);
+      const fb = parseRequestModel(config.defaultModel);
       if (fb.ok) parsed = fb;
       else parsed = (await resolveFlatModel(config.defaultModel)) || parsed;
     }
@@ -1922,7 +1935,7 @@ function start(config) {
     applyOutputHeadroom(requestObj);
     validateGemini(requestObj);
 
-    let parsedModel = providers.parseModel(rawModel);
+    let parsedModel = parseRequestModel(rawModel);
     if (!parsedModel.ok) {
       parsedModel = (await resolveFlatModel(rawModel)) || parsedModel;
     }
@@ -2793,10 +2806,10 @@ function start(config) {
         try {
           const targetAcc = body.accountName ? (config.geminiWeb.accounts || []).find((a) => a.name === body.accountName) : null;
           const rawProxy = resolveEffectiveWebProxy(body.proxy, targetAcc);
-          const info = cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy });
+          const info = await cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy });
           return sendJson(res, 200, info);
         } catch (e) {
-          return sendJson(res, e.code === 'mtproto_unsupported' ? 400 : 500, { error: { message: e.message, code: e.code || 'browser_open_failed' } });
+          return sendJson(res, (e.code === 'mtproto_unsupported' || e.code === 'browser_not_found') ? 400 : 500, { error: { message: e.message, code: e.code || 'browser_open_failed' } });
         }
       }
 
@@ -2897,6 +2910,24 @@ function start(config) {
         }
         const parsed = await readJsonObj(req, res);
         if (!parsed) return;
+
+        try {
+          if (parsed.network && typeof parsed.network.proxy === 'string' && parsed.network.proxy.trim()) {
+            convertTelegramSocksLink(parsed.network.proxy);
+          }
+          if (parsed.geminiWeb && typeof parsed.geminiWeb.proxy === 'string' && parsed.geminiWeb.proxy.trim()) {
+            convertTelegramSocksLink(parsed.geminiWeb.proxy);
+          }
+          if (parsed.geminiWeb && Array.isArray(parsed.geminiWeb.accounts)) {
+            for (const acc of parsed.geminiWeb.accounts) {
+              if (acc && typeof acc.proxy === 'string' && acc.proxy.trim()) {
+                convertTelegramSocksLink(acc.proxy);
+              }
+            }
+          }
+        } catch (err) {
+          return sendJson(res, 400, { error: { code: err.code || 'invalid_proxy', message: err.message, type: 'invalid_request_error' } });
+        }
 
         const prevPort = config.port;
         const prevHost = config.host;
@@ -3026,6 +3057,12 @@ function start(config) {
             lastCatalogError = fetchErr;
           }
         }
+        if (webBridge.enabled && (force || webBridge.getLoadedCookie().cookieStr || network.summary().proxy)) {
+          try {
+            await waitNetworkReady();
+            await webBridge.refreshModels({ force, lang: config.language || 'ru', timeoutMs: 8000 });
+          } catch {}
+        }
         const snap = catalog.getCatalogSnapshot();
         const webModels = webBridge.enabled
           ? webBridge.getModelsList().map((m) => {
@@ -3035,7 +3072,13 @@ function start(config) {
                 rawId: m.id,
                 provider: providers.WEB,
                 displayName: m.display_name || m.displayName || m.id,
-                inLiveCatalog: true,
+                description: m.description || '',
+                inLiveCatalog: !!m.inLiveCatalog,
+                isNew: !!m.isNew,
+                legacyAlias: !!m.legacyAlias,
+                lockedByPlan: !!m.lockedByPlan,
+                planTag: m.planTag || '',
+                supportsThinking: m.supportsThinking !== false,
                 capabilities: providers.describeModel(providers.WEB, { bridgeEnabled: true }),
                 health: catalog.getHealth(fullId),
               };
@@ -3044,6 +3087,7 @@ function start(config) {
         return sendJson(res, 200, {
           ...snap,
           web: webModels,
+          webCatalogMeta: webBridge.getLiveMeta(),
           catalogError: fetchErr || lastCatalogError || null,
           cloudDisabled: CLOUD_DISABLED,
         });
@@ -3059,8 +3103,12 @@ function start(config) {
           const removed = catalog.removeCustomModel(modelId);
           return sendJson(res, 200, { ok: true, removed, snapshot: catalog.getCatalogSnapshot() });
         }
-        const added = catalog.addCustomModel(modelId, body.displayName || '');
-        return sendJson(res, 200, { ok: true, model: added, snapshot: catalog.getCatalogSnapshot() });
+        try {
+          const added = catalog.addCustomModel(modelId, body.displayName || '');
+          return sendJson(res, 200, { ok: true, model: added, snapshot: catalog.getCatalogSnapshot() });
+        } catch (err) {
+          return sendJson(res, 400, { error: { message: err.message, type: 'invalid_request_error' } });
+        }
       }
 
       if (p === '/_models/check' && req.method === 'POST') {
@@ -3069,7 +3117,7 @@ function start(config) {
         if (!body) return;
         await waitNetworkReady();
 
-        let webBatchPromise = null;
+        const webBatchMap = new Map();
         const probeWebModel = async (rawId) => {
           const started = Date.now();
           if (!webBridge.enabled) {
@@ -3091,8 +3139,12 @@ function start(config) {
           if (timer.unref) timer.unref();
           try {
             const meta = webBridge.getModelMeta(rawId);
-            const reqBody = webBridge.buildPayload('Reply with OK.', meta.modelId, meta.thinkMode, 'en');
-            const upRes = await webBridge.sendStreamRequestResilient(reqBody, meta, 'en', { signal: ac.signal });
+            const build = () => webBridge.buildPayload('Reply with OK.', meta.modelId, meta.thinkMode, 'en');
+            const initialPayload = build();
+            const upRes = await webBridge.sendStreamRequestResilient(initialPayload, meta, 'en', {
+              signal: ac.signal,
+              rebuildPayload: build,
+            });
             let gotDelta = false;
             try {
               for await (const delta of webBridge.streamResponse(upRes)) {
@@ -3103,6 +3155,7 @@ function start(config) {
               }
             } finally {
               try { ac.abort(); } catch {}
+              try { if (upRes && typeof upRes.destroy === 'function') upRes.destroy(); } catch {}
               try { if (upRes && upRes.body && typeof upRes.body.destroy === 'function') upRes.body.destroy(); } catch {}
             }
             return {
@@ -3134,8 +3187,13 @@ function start(config) {
           const rawId = fullId.replace(/^(?:cloud|web)\//i, '');
           if (isWeb) {
             if (!body.model) {
-              if (!webBatchPromise) webBatchPromise = probeWebModel(rawId);
-              const shared = await webBatchPromise;
+              let batchKey = rawId;
+              try {
+                const m = webBridge.getModelMeta(rawId);
+                batchKey = `${m.modelId}:${m.thinkMode}`;
+              } catch {}
+              if (!webBatchMap.has(batchKey)) webBatchMap.set(batchKey, probeWebModel(rawId));
+              const shared = await webBatchMap.get(batchKey);
               return catalog.recordHealth(fullId, shared);
             }
             return catalog.recordHealth(fullId, await probeWebModel(rawId));

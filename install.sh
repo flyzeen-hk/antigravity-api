@@ -9,7 +9,7 @@ cd "$ROOT"
 echo "[OK] Node.js $("$AG_NODE" -v): $AG_NODE"
 echo ""
 
-read -r -p "Extract Antigravity IDE OAuth token into auth.json if present? [Y/n]: " ex
+read -r -p "Extract Antigravity OAuth token into auth.json if present? [Y/n]: " ex
 if [[ -z "$ex" || "$ex" =~ ^[Yy]$ ]]; then
   "$AG_NODE" "$ROOT/lib/token_extract.js" || true
   echo ""

@@ -47,7 +47,11 @@
     "autoRotateOn429": false,
     "historyMaxChars": 60000,
     "xsrf": true,
-    "defaultModel": ""
+    "defaultModel": "",
+    "freeTunnel": {
+      "enabled": false,
+      "customSource": ""
+    }
   },
   "safeMode": {
     "enabled": false,

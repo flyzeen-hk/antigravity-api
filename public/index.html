@@ -337,8 +337,8 @@
               <span class="hint" data-i18n="models.addCustomHint">Позволяет проверить и использовать новую модель Google сразу, не удаляя старые.</span>
             </div>
             <div class="input-row">
-              <input id="custom-model-id" type="text" placeholder="например: gemini-4-neon-high или claude-sonnet-5-5">
-              <input id="custom-model-name" type="text" placeholder="Название (необязательно)">
+              <input id="custom-model-id" type="text" data-i18n-placeholder="models.customIdPlaceholder" placeholder="например: gemini-4-neon-high или claude-sonnet-5-5">
+              <input id="custom-model-name" type="text" data-i18n-placeholder="models.customNamePlaceholder" placeholder="Название (необязательно)">
               <button id="btn-save-custom-model" type="button" class="btn btn-primary btn-sm" data-i18n="actions.save">Сохранить</button>
             </div>
           </div>
@@ -424,7 +424,7 @@
                 <div class="field">
                   <span data-i18n="web.proxyLabel">Ручной прокси / VPN для Gemini Web (HTTP, SOCKS5 или tg://socks)</span>
                   <div class="input-row">
-                    <input id="web-proxy-input" type="text" placeholder="http://127.0.0.1:10808, socks5://... или tg://socks?...">
+                    <input id="web-proxy-input" type="text" data-i18n-placeholder="web.proxyPlaceholder" placeholder="http://127.0.0.1:10808, socks5://... или tg://socks?...">
                     <button id="btn-web-detect-proxy" type="button" class="btn btn-secondary btn-xs" data-i18n="settings.findProxies">Найти прокси</button>
                     <button id="btn-web-test-proxy" type="button" class="btn btn-ghost btn-xs" data-i18n="web.testGemini">Проверить Gemini</button>
                   </div>

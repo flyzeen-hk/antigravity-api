@@ -23,7 +23,7 @@ for /f "delims=" %%V in ('"%NODE_EXE%" -v') do set "NODE_VER=%%V"
 echo [OK] Node.js %NODE_VER%: %NODE_EXE%
 echo.
 
-set /p EXTOK="Extract Antigravity IDE OAuth token into auth.json if present? [Y/n]: "
+set /p EXTOK="Extract Antigravity OAuth token into auth.json if present? [Y/n]: "
 if /i "%EXTOK%"=="" set "EXTOK=Y"
 if /i "%EXTOK%"=="Y" (
   "%NODE_EXE%" "%ROOT%lib\token_extract.js"

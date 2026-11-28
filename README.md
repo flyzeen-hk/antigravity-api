@@ -129,7 +129,7 @@ AG_NO_CLOUD=1 docker compose up -d    # only web models, no Antigravity session
 3. Overview shows **live SSE request telemetry**, **5h & Weekly Cloud Code quota gauges with countdowns**, **Usage charts**, detected programs, and backups.
 4. Use the **Connection** tab to copy Base URLs, API key, and client snippets.
 
-Three files appear next to the program on first run and are **never committed**:
+Three files appear in the active data directory on first run (`%LOCALAPPDATA%\AntigravityAPI` on Windows to avoid Defender Controlled Folder Access blocks, or next to the program on Linux/macOS; override with `AG_DATA_DIR`) and are **never committed**:
 
 | File | Contents |
 |---|---|
@@ -334,25 +334,22 @@ Inside the cloud loop the model may call `ask_planner` to ask a Gemini Web model
 
 ## Gemini Web bridge
 
-Some Gemini variants appear on `gemini.google.com` before they reach Cloud Code. The bridge sends requests to the same StreamGenerate backend the site uses, with your own session cookie.
+Some Gemini variants appear on `gemini.google.com` before they reach Cloud Code. The bridge sends requests to the same StreamGenerate backend the site uses, with your own session cookie, and automatically discovers live models from `gemini.google.com` (`web_models.json` cache) when you click **Discover New Models** in the Models tab.
 
 | Model | Meaning |
 |---|---|
-| `web/gemini-4-argon` | flagship, default thinking depth |
-| `web/gemini-4-argon-thinking` | deepest thinking — slowest |
-| `web/gemini-4` | alias of `web/gemini-4-argon` |
-| `web/gemini-4-thinking` | alias of `web/gemini-4-argon-thinking` |
-| `web/gemini-4-pro` | same backend, described as full capability |
-| `web/gemini-4-flash` | routes to Argon; no separate "4 Flash" exists |
-
-All six route to the same `modelId` with two thinking depths, so the difference between "Argon" and "Pro" is naming, not a separate model.
+| `web/gemini-4-auto` | Auto (adaptive routing) |
+| `web/gemini-4-hydrogen` / `-thinking` | Gemini 4 Hydrogen (Fast / Extended thinking) |
+| `web/gemini-4-neon` / `-thinking` | Gemini 4 Neon (Pro / Extended thinking; may require AI Plus/Pro) |
+| `web/gemini-4-carbon` / `-thinking` | Gemini 4 Carbon (Ultra / Extended thinking) |
+| `web/gemini-4`, `web/gemini-4-argon`, `web/gemini-4-pro`, `web/gemini-4-flash`, `web/gemini-4-thinking` | Legacy compatibility aliases (kept working for older client configs) |
 
 ### Enabling
 
 Open the **Gemini Web** tab in the Control Panel:
 
-1. **1-click via dedicated browser (CDP):** optionally enter a proxy (`http://` or `socks5://`) if `gemini.google.com` requires one in your region, click **Open Gemini Browser**, sign in to Google, and click **Import Cookies (CDP)**.
-2. **Or manual paste / `cookie.txt`:** open DevTools → Network on `gemini.google.com`, copy the `Cookie` request header (must contain `SAPISID`), and paste it into the field or save it to `cookie.txt` next to the program. Changes apply immediately.
+1. **1-click via dedicated browser (CDP):** optionally enable the opt-in **Free Auto-Proxy for Gemini** (off by default; downloads SHA-256 verified Xray-core into `DATA_DIR/bin/xray`, tests public VLESS/Trojan/Hysteria2 feeds or your own `vless://`/`trojan://`/`hy2://` key, and lets you pick a country/node) or enter a manual proxy (`http://`, `socks5://`, or `tg://socks?...`), click **Open Gemini Browser**, sign in to Google, and click **Import Cookies (CDP)**.
+2. **Or manual paste / `cookie.txt`:** open DevTools → Network on `gemini.google.com`, copy the `Cookie` request header (must contain `SAPISID`), and paste it into the field or save it to `cookie.txt` in your data directory. Changes apply immediately.
 
 Without a cookie the bridge still starts and the models are listed, but requests are made anonymously and Google usually downgrades or refuses them. `GET /_config` reports `cookieSet: false` in that state.
 
@@ -439,15 +436,15 @@ Facts worth stating explicitly:
 - **System proxy**: when no explicit proxy is set, the Windows Internet Settings proxy is used automatically (Node does not read it by itself).
 - **DNS**: DNS-over-HTTPS or explicit DNS servers, used by the app's own HTTP client.
 - **Auto-detection** scans environment variables, the Windows settings and common local ports, with loopback-only handshakes.
-- **Not included on purpose**: domain fronting, TLS fragmentation, ECH spoofing. Pair the app with your own tunnel and point the proxy field at it.
+- **Opt-in Free Auto-Proxy (Gemini Web only)**: disabled by default (`geminiWeb.freeTunnel.enabled: false`). When explicitly enabled by the user, downloads SHA-256 verified `XTLS/Xray-core` locally and runs a loopback-only SOCKS5 tunnel (`127.0.0.1`) for `gemini.google.com` and cookie import without touching OS-wide network settings.
 - **Fallback host**: if `daily-cloudcode-pa.googleapis.com` fails at the network level, the request is retried once against `cloudcode-pa.googleapis.com`. HTTP statuses are never retried this way.
 
 ---
 
 ## Data and privacy
 
-- **Everything stays local.** `auth.json`, `apikey.txt`, `config.json`, `usage.json` and `cookie.txt` live next to the program and are listed in `.gitignore`.
-- **The only outbound traffic** goes to `daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` and `gemini.google.com` — or through your proxy. There is no telemetry endpoint.
+- **Everything stays local.** `auth.json`, `apikey.txt`, `admin.key`, `config.json`, `usage.json`, `web_models.json` and `cookie.txt` live in `DATA_DIR` (`%LOCALAPPDATA%\AntigravityAPI` on Windows, or next to the program on Linux/macOS) and are listed in `.gitignore`.
+- **The only outbound traffic** goes to `daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` and `gemini.google.com` — or through your proxy (plus GitHub releases/feeds only if you explicitly enable Free Auto-Proxy). There is no telemetry endpoint.
 - **Cookies are never printed or logged.** They are sent only to `gemini.google.com`. The panel redacts keys, tokens and cookie values from diagnostics and error text.
 - **Config writes are atomic** with rolling backups in `backups/`. A damaged file is restored from the newest valid backup and the bad copy is kept as `.corrupt`.
 - **The API key protects local access only.** Anyone on your machine who can read `apikey.txt` can use the gateway. Keep `host` on `127.0.0.1`.
@@ -461,7 +458,7 @@ Facts worth stating explicitly:
 |---|---|---|
 | Panel stuck on «Loading…» quotas, `Offline (fetch failed)` | Google host unreachable — DNS filtering or DPI | Set a proxy in **Network Transport**; run **Check connection** |
 | `region_not_supported` on `cloud/` | Egress IP not in a supported region | Use a proxy in a supported region; the account and cookie are not the cause |
-| `401` from Cloud Code | Session expired or the IDE account changed | Click **Extract from Antigravity IDE** in Overview or run `npm run extract-token` |
+| `401` from Cloud Code | Session expired or the account changed | Click **Extract from Antigravity** in Overview or run `npm run extract-token` |
 | Web models return empty or garbled text | Cookie expired, wrong account, or cookie not bound to this browser | Use **Open Gemini Browser** + **Import Cookies (CDP)** in Gemini Web tab; check `GET /_config` → `cookieSet` |
 | Web request redirects to a Google «sorry» page | Google verification triggered by the egress IP | Change proxy/egress; the bridge reports `web_verification_required` |
 | Answers truncated mid-file | Model reply length cap, not the gateway | Ask for chunked writing: `write_file` then `append_file` |
@@ -587,7 +584,7 @@ AG_NO_CLOUD=1 docker compose up -d    # только веб-модели, без
 2. Войдите по ключу из `admin.key` (при запуске через лаунчер вход выполняется автоматически по одноразовому nonce).
 3. На вкладке **Обзор** доступны живой поток запросов по SSE, датчики квот 5h/Weekly с таймером сброса, графики истории и менеджер бэкапов; во вкладке **Подключение** — URL, ключи и готовые сниппеты.
 
-При первом запуске рядом с программой появляются три файла, которые **никогда не коммитятся**:
+При первом запуске в каталоге данных (`%LOCALAPPDATA%\AntigravityAPI` на Windows — чтобы не срабатывал Контролируемый доступ к папкам Windows Defender, или рядом с программой на Linux/macOS; переопределяется через `AG_DATA_DIR`) появляются три файла, которые **никогда не коммитятся**:
 
 | Файл | Что внутри |
 |---|---|
@@ -706,20 +703,17 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 
 ## Веб-мост Gemini
 
-Часть моделей Gemini появляется на `gemini.google.com` раньше, чем в Cloud Code. Мост отправляет запросы в тот же бэкенд StreamGenerate, которым пользуется сайт, с вашей сессией.
+Часть моделей Gemini появляется на `gemini.google.com` раньше, чем в Cloud Code. Мост отправляет запросы в тот же бэкенд StreamGenerate, которым пользуется сайт, с вашей сессией, и умеет автоматически подтягивать актуальный список моделей с `gemini.google.com` (кэш `web_models.json`) по кнопке **Найти новые модели** во вкладке Модели.
 
 | Модель | Что это |
 |---|---|
-| `web/gemini-4-argon` | флагман, обычная глубина мышления |
-| `web/gemini-4-argon-thinking` | максимальная глубина — самый медленный |
-| `web/gemini-4` | псевдоним `web/gemini-4-argon` |
-| `web/gemini-4-thinking` | псевдоним `web/gemini-4-argon-thinking` |
-| `web/gemini-4-pro` | тот же бэкенд, описан как полная мощность |
-| `web/gemini-4-flash` | ведёт на Argon; отдельной «4 Flash» не существует |
+| `web/gemini-4-auto` | Авто (адаптивный выбор режима) |
+| `web/gemini-4-hydrogen` / `-thinking` | Gemini 4 Hydrogen (быстрая / расширенное мышление) |
+| `web/gemini-4-neon` / `-thinking` | Gemini 4 Neon (глубокий анализ; может требовать подписку AI Plus/Pro) |
+| `web/gemini-4-carbon` / `-thinking` | Gemini 4 Carbon (флагман / расширенное мышление) |
+| `web/gemini-4`, `web/gemini-4-argon`, `web/gemini-4-pro`, `web/gemini-4-flash`, `web/gemini-4-thinking` | Алиасы совместимости для старых конфигураций |
 
-Все шесть идут в один и тот же `modelId` с двумя глубинами мышления, поэтому разница между «Argon» и «Pro» — это название, а не отдельная модель.
-
-**Включение:** откройте вкладку **Gemini Web** в панели управления: можно задать прокси (`http://` или `socks5://`), нажать **Открыть Gemini в браузере**, войти в аккаунт Google и нажать **Импорт cookie (CDP)** — либо скопировать заголовок **Cookie** (с `SAPISID`) из DevTools / положить в `cookie.txt` рядом с программой. Настройки применяются сразу.
+**Включение:** откройте вкладку **Gemini Web** в панели управления: при необходимости включите опциональный **Бесплатный авто-прокси для Gemini** (по умолчанию выключен; скачивает проверенный по SHA-256 `Xray-core`, подбирает рабочие узлы VLESS/Trojan/Hysteria2 или ваш ключ `vless://`/`trojan://`/`hy2://` с выбором страны/узла) или укажите ручной прокси (`http://`, `socks5://`, `tg://socks?...`), нажмите **Открыть Gemini в браузере**, войдите в аккаунт Google и нажмите **Импорт cookie (CDP)** — либо скопируйте заголовок **Cookie** (с `SAPISID`) из DevTools / положите в `cookie.txt` в папку данных. Настройки применяются сразу.
 
 Без куки мост всё равно запускается и модели видны в списке, но запросы идут анонимно, и Google обычно их понижает или отклоняет. `GET /_config` в этом случае показывает `cookieSet: false`.
 
@@ -779,13 +773,13 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 - **Системный прокси**: если явный прокси не задан, используется прокси из настроек Windows (Node сам его не читает).
 - **DNS**: DNS-over-HTTPS или свои DNS-серверы, используемые собственным HTTP-клиентом приложения.
 - **Автопоиск** проверяет переменные окружения, настройки Windows и типовые локальные порты, только loopback-рукопожатиями.
-- **Намеренно не включено**: domain fronting, TLS-фрагментация, ECH-спуфинг. Свяжите приложение со своим туннелем и укажите его в поле прокси.
+- **Опциональный бесплатный авто-прокси (только Gemini Web)**: выключен по умолчанию (`geminiWeb.freeTunnel.enabled: false`). При явном включении пользователем локально скачивает проверенный по SHA-256 `XTLS/Xray-core` и поднимает локальный SOCKS5-туннель (`127.0.0.1`) только для `gemini.google.com` и браузера импорта cookie, не меняя системные настройки сети.
 - **Резервный хост**: если `daily-cloudcode-pa.googleapis.com` падает на сетевом уровне, запрос один раз повторяется на `cloudcode-pa.googleapis.com`. HTTP-статусы так не ретраятся.
 
 ## Данные и приватность
 
-- **Всё остаётся локально.** `auth.json`, `apikey.txt`, `config.json`, `usage.json` и `cookie.txt` лежат рядом с программой и перечислены в `.gitignore`.
-- **Исходящий трафик идёт только** на `daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` и `gemini.google.com` — либо через ваш прокси. Телеметрии нет.
+- **Всё остаётся локально.** `auth.json`, `apikey.txt`, `admin.key`, `config.json`, `usage.json`, `web_models.json` и `cookie.txt` лежат в `DATA_DIR` (`%LOCALAPPDATA%\AntigravityAPI` на Windows или рядом с программой на Linux/macOS) и перечислены в `.gitignore`.
+- **Исходящий трафик идёт только** на `daily-cloudcode-pa.googleapis.com`, `oauth2.googleapis.com` и `gemini.google.com` — либо через ваш прокси (а также GitHub-релизы/списки узлов, только если вы сами включили Бесплатный авто-прокси). Телеметрии нет.
 - **Куки нигде не печатаются и не логируются.** Они отправляются только на `gemini.google.com`. Панель вырезает ключи, токены и значения куки из диагностики и текста ошибок.
 - **Запись конфигов атомарная**, со скользящими копиями в `backups/`. Повреждённый файл восстанавливается из свежей целой копии, а испорченный сохраняется как `.corrupt`.
 - **API-ключ защищает только локальный доступ.** Любой, кто может прочитать `apikey.txt` на этой машине, получит доступ к шлюзу. Держите `host` на `127.0.0.1`.
@@ -797,7 +791,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 |---|---|---|
 | Панель висит на «Загрузка…» квот, `Offline (fetch failed)` | Хост Google недоступен — фильтрация DNS или DPI | Задайте прокси в **Network Transport** и нажмите **Проверить соединение** |
 | `region_not_supported` на `cloud/` | Выходной IP не из поддерживаемого региона | Прокси в поддерживаемом регионе; аккаунт и куки тут ни при чём |
-| `401` от Cloud Code | Сессия истекла или сменился аккаунт в IDE | Нажмите **Извлечь токен из Antigravity IDE** в панели или `npm run extract-token` |
+| `401` от Cloud Code | Сессия истекла или сменился аккаунт | Нажмите **Извлечь токен из Antigravity** в панели или `npm run extract-token` |
 | Веб-модели отдают пустой или битый текст | Куки истекли, не тот аккаунт или куки не привязана к этому браузеру | Используйте **Открыть Gemini в браузере** и **Импорт cookie (CDP)** на вкладке Gemini Web; проверьте `GET /_config` → `cookieSet` |
 | Веб-запрос уводит на страницу Google «sorry» | Google сработала проверка по выходному IP | Смените прокси/выход; мост сообщает `web_verification_required` |
 | Ответ обрывается на середине файла | Лимит длины ответа модели, а не шлюза | Просите писать частями: `write_file`, затем `append_file` |

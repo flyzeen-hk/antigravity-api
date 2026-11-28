@@ -11,6 +11,7 @@ const {
   parseVlessUri,
   parseTrojanUri,
   parseHy2Uri,
+  loadCandidateNodes,
   buildXrayOutbound,
   buildFragmentOutbound,
   convertTelegramSocksLink,
@@ -98,6 +99,10 @@ async function main() {
   const validHy2 = parseHy2Uri('hy2://authpass@198.51.100.47:443?sni=hy2.example.com&obfs=salamander&obfs-password=obfspw#NL');
   ok(validTrojan && validTrojan.proto === 'trojan' && validHy2 && validHy2.proto === 'hy2' && validHy2.obfs === 'salamander', 'parseTrojanUri & parseHy2Uri parse valid non-insecure URIs');
   ok(parseTrojanUri('trojan://pw@127.0.0.1:443?sni=example.com') === null && parseHy2Uri('hy2://pw@198.51.100.47:443?sni=example.com&insecure=1') === null, 'parseTrojanUri & parseHy2Uri enforce SSRF and TLS verification guards');
+
+  await assert.rejects(() => loadCandidateNodes({ customSource: 'http://example.com/sub.txt' }), /https:\/\//i);
+  await assert.rejects(() => loadCandidateNodes({ customSource: 'https://127.0.0.1/sub.txt' }), /private\/loopback/i);
+  ok(true, 'loadCandidateNodes rejects plain http:// and loopback SSRF custom subscription URLs');
 
   const realityOut = buildXrayOutbound(validVless, 'out-r');
   const tlsFragOut = buildXrayOutbound(validTlsVless, 'out-t', { useFragment: true });
@@ -241,6 +246,20 @@ async function main() {
       body: { action: 'select', nodeKey: '' },
     });
     ok(ftBadSelect.status === 400, 'POST /_web/free-tunnel select without nodeKey returns 400');
+
+    const offMtproto = await request(`${base}/_config`, {
+      method: 'POST',
+      headers,
+      body: { geminiWeb: { proxy: 'tg://proxy?server=1.2.3.4&port=443&secret=ee1234' } },
+    });
+    ok(offMtproto.status === 400 && offMtproto.json?.error?.code === 'mtproto_unsupported', 'offline POST /_config rejects Telegram MTProto tg://proxy with 400');
+
+    const offBadCustom = await request(`${base}/_models/custom`, {
+      method: 'POST',
+      headers,
+      body: { action: 'add', model: 'bad model id!!' },
+    });
+    ok(offBadCustom.status === 400, 'offline POST /_models/custom returns 400 on invalid model ID');
     const statusOff = await request(`${base}/_status`, { headers });
     ok(
       statusOff.json?.supervised === true
@@ -341,6 +360,20 @@ async function main() {
       body: { model: 'gemini-2.5-flash', prompt: '' },
     });
     ok(chatProxied.status === 400, 'proxied chat reaches live server validation instead of 503 server_stopped');
+
+    const liveMtproto = await request(`${base}/_config`, {
+      method: 'POST',
+      headers,
+      body: { geminiWeb: { proxy: 'tg://proxy?server=1.2.3.4&port=443&secret=ee1234' } },
+    });
+    ok(liveMtproto.status === 400 && liveMtproto.json?.error?.code === 'mtproto_unsupported', 'live gateway POST /_config rejects Telegram MTProto tg://proxy with 400');
+
+    const liveBadCustom = await request(`${base}/_models/custom`, {
+      method: 'POST',
+      headers,
+      body: { action: 'add', model: 'bad model id!!' },
+    });
+    ok(liveBadCustom.status === 400, 'live gateway POST /_models/custom returns 400 on invalid model ID');
 
     // Verify catalog.invalidate() works cleanly when reloading auth on a live gateway (CLOUD_DISABLED=0 subprocess check)
     const { ModelCatalog } = require('../lib/models');

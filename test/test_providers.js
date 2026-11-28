@@ -6,7 +6,7 @@
  */
 
 const providers = require('../lib/providers');
-const { GeminiWebBridge } = require('../lib/web_bridge');
+const { GeminiWebBridge, WEB_MODELS } = require('../lib/web_bridge');
 
 let passed = 0;
 let failed = 0;
@@ -34,6 +34,12 @@ ok(p.ok && p.baseId === 'gemini-4-argon-thinking' && p.agentRequested, 'web -age
 p = providers.parseModel('WEB/Gemini-4-Argon');
 ok(p.ok && p.namespace === 'web' && p.baseId === 'gemini-4-argon', 'case-insensitive alias');
 
+p = providers.parseModel('web/gemini-5-oxygen', {
+  isWebAlias: (id) => id === 'gemini-5-oxygen',
+  webAliases: () => ['gemini-4-hydrogen', 'gemini-5-oxygen'],
+});
+ok(p.ok && p.namespace === 'web' && p.baseId === 'gemini-5-oxygen', 'dynamic live web alias supported via opts');
+
 console.log('== 3. Ошибки namespace');
 ok(!providers.parseModel('gemini-3-flash').ok, 'плоское имя отклонено');
 ok(providers.parseModel('gemini-3-flash').code === 'model_namespace_required', 'code model_namespace_required');
@@ -53,7 +59,7 @@ let threw = false;
 try { bridge.getModelMeta('gemini-4-garbage'); } catch { threw = true; }
 ok(threw, 'getModelMeta бросает на неизвестный алиас');
 const list = bridge.getModelsList();
-ok(list.length === 6, 'каталог: 6 веб-моделей');
+ok(list.length === Object.keys(WEB_MODELS).length && list.some((m) => m.id === 'gemini-4-hydrogen') && list.some((m) => m.id === 'gemini-4-neon'), 'каталог содержит актуальные и legacy веб-модели');
 ok(list.every((m) => typeof m.display_name === 'string' && m.display_name), 'display_name заполнен');
 ok(list.every((m) => typeof m.displayName === 'string'), 'displayName сохранён');
 

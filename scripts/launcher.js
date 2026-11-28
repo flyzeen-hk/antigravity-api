@@ -134,6 +134,7 @@ function openUiWindow(url, { preferBrowser = false } = {}) {
         '--disable-features=TranslateUI',
         '--window-size=1320,880',
       ], { detached: true, stdio: 'ignore' });
+      child.on('error', () => { try { openExternalUrl(url); } catch {} });
       child.unref();
       return { mode: 'app', exe: browserExe };
     }

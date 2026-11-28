@@ -662,7 +662,7 @@ async function startSupervisor({ autoStart = null } = {}) {
     }
 
     if (pathname === '/v1/models') {
-      const wb = new GeminiWebBridge({ ...(cfg.geminiWeb || {}) });
+      const wb = new GeminiWebBridge({ ...(cfg.geminiWeb || {}), catalogCacheFile: path.join(DATA_DIR, 'web_models.json') });
       const data = wb.enabled ? wb.getModelsList().map((m) => ({ ...m, id: `web/${m.id}`, provider: 'web' })) : [];
       return sendJson(res, 200, { object: 'list', data, serverStopped: true });
     }
@@ -675,6 +675,23 @@ async function startSupervisor({ autoStart = null } = {}) {
       if (req.method === 'GET') return sendJson(res, 200, sanitizeConfig(cfg));
       if (req.method === 'POST') {
         const body = await readJsonBody(req);
+        try {
+          if (body.network && typeof body.network.proxy === 'string' && body.network.proxy.trim()) {
+            convertTelegramSocksLink(body.network.proxy);
+          }
+          if (body.geminiWeb && typeof body.geminiWeb.proxy === 'string' && body.geminiWeb.proxy.trim()) {
+            convertTelegramSocksLink(body.geminiWeb.proxy);
+          }
+          if (body.geminiWeb && Array.isArray(body.geminiWeb.accounts)) {
+            for (const acc of body.geminiWeb.accounts) {
+              if (acc && typeof acc.proxy === 'string' && acc.proxy.trim()) {
+                convertTelegramSocksLink(acc.proxy);
+              }
+            }
+          }
+        } catch (err) {
+          return sendJson(res, 400, { error: { code: err.code || 'invalid_proxy', message: err.message, type: 'invalid_request_error' } });
+        }
         const prevTheme = normalizeIconTheme(cfg.theme);
         const patch = configLib.patchConfig(cfg, body);
         saveConfigDirect(patch.config);
@@ -822,9 +839,9 @@ async function startSupervisor({ autoStart = null } = {}) {
       try {
         const targetAcc = body.accountName ? (cfg.geminiWeb.accounts || []).find((a) => a.name === body.accountName) : null;
         const rawProxy = resolveOfflineWebProxy(body.proxy, targetAcc);
-        return sendJson(res, 200, cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy }));
+        return sendJson(res, 200, await cdpCookies.openGeminiLoginWindow(cdpCookies.GEMINI_URL, { proxy: rawProxy }));
       } catch (e) {
-        return sendJson(res, e.code === 'mtproto_unsupported' ? 400 : 500, { error: { message: e.message, code: e.code || 'browser_open_failed' } });
+        return sendJson(res, (e.code === 'mtproto_unsupported' || e.code === 'browser_not_found') ? 400 : 500, { error: { message: e.message, code: e.code || 'browser_open_failed' } });
       }
     }
 
@@ -837,7 +854,13 @@ async function startSupervisor({ autoStart = null } = {}) {
       } catch (e) {
         return sendJson(res, 400, { error: { message: e.message, code: e.code || 'invalid_proxy' } });
       }
-      const resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true, proxy: rawProxy });
+      let resCdp;
+      try {
+        resCdp = await cdpCookies.importGeminiCookiesViaCdp({ extractAtToken: true, proxy: rawProxy });
+      } catch (e) {
+        const status = (e.code === 'profile_missing' || e.code === 'browser_not_found') ? 400 : 500;
+        return sendJson(res, status, { error: { message: e.message, code: e.code || 'cdp_import_failed' } });
+      }
       let saved = false;
       if (resCdp.cookie && body.saveTo === 'single') {
         const patch = configLib.patchConfig(cfg, {
@@ -967,17 +990,49 @@ async function startSupervisor({ autoStart = null } = {}) {
       const cat = new ModelCatalog(cfg.upstreamHost || 'https://daily-cloudcode-pa.googleapis.com', {
         registryFile: path.join(DATA_DIR, 'known_models.json'),
       });
-      const wb = new GeminiWebBridge({ ...(cfg.geminiWeb || {}) });
-      const web = wb.enabled ? wb.getModelsList().map((m) => ({
-        id: `web/${m.id}`,
-        rawId: m.id,
-        provider: 'web',
-        displayName: m.display_name || m.displayName || m.id,
-        inLiveCatalog: true,
-        health: cat.getHealth(`web/${m.id}`),
-      })) : [];
-      const snap = cat.getCatalogSnapshot();
-      return sendJson(res, 200, { ...snap, web, serverStopped: true, catalogError: null });
+      const force = /[?&]force=1(?:&|$)/.test(req.url || '');
+      const ftProxy = (cfg.geminiWeb && cfg.geminiWeb.freeTunnel && cfg.geminiWeb.freeTunnel.enabled)
+        ? freeTunnel.getActiveProxyUrlSync()
+        : '';
+      const effNetCfg = ftProxy
+        ? { ...cfg, network: { ...cfg.network, webProxy: cfg.geminiWeb?.proxy || ftProxy || cfg.network?.webProxy || '' } }
+        : cfg;
+      const net = force ? new NetworkManager(effNetCfg) : null;
+      const wb = new GeminiWebBridge({
+        ...(cfg.geminiWeb || {}),
+        ...(ftProxy && !cfg.geminiWeb?.proxy ? { proxy: ftProxy } : {}),
+        ...(net ? { network: net } : {}),
+        catalogCacheFile: path.join(DATA_DIR, 'web_models.json'),
+      });
+      try {
+        if (force && wb.enabled && (wb.getLoadedCookie().cookieStr || ftProxy || wb.proxy)) {
+          await wb.refreshModels({ force: true, lang: cfg.language || 'ru', timeoutMs: 8000 }).catch(() => null);
+        }
+        const web = wb.enabled ? wb.getModelsList().map((m) => ({
+          id: `web/${m.id}`,
+          rawId: m.id,
+          provider: 'web',
+          displayName: m.display_name || m.displayName || m.id,
+          description: m.description || '',
+          inLiveCatalog: !!m.inLiveCatalog,
+          isNew: !!m.isNew,
+          legacyAlias: !!m.legacyAlias,
+          lockedByPlan: !!m.lockedByPlan,
+          planTag: m.planTag || '',
+          supportsThinking: m.supportsThinking !== false,
+          health: cat.getHealth(`web/${m.id}`),
+        })) : [];
+        const snap = cat.getCatalogSnapshot();
+        return sendJson(res, 200, {
+          ...snap,
+          web,
+          webCatalogMeta: wb.getLiveMeta(),
+          serverStopped: true,
+          catalogError: null,
+        });
+      } finally {
+        try { if (net) net.destroyAll(); } catch {}
+      }
     }
 
     if (pathname === '/_models/custom' && req.method === 'POST') {
@@ -991,8 +1046,12 @@ async function startSupervisor({ autoStart = null } = {}) {
         const removed = cat.removeCustomModel(modelId);
         return sendJson(res, 200, { ok: true, removed, snapshot: cat.getCatalogSnapshot() });
       }
-      const added = cat.addCustomModel(modelId, body.displayName || '');
-      return sendJson(res, 200, { ok: true, model: added, snapshot: cat.getCatalogSnapshot() });
+      try {
+        const added = cat.addCustomModel(modelId, body.displayName || '');
+        return sendJson(res, 200, { ok: true, model: added, snapshot: cat.getCatalogSnapshot() });
+      } catch (err) {
+        return sendJson(res, 400, { error: { message: err.message, type: 'invalid_request_error' } });
+      }
     }
 
     if (pathname === '/_models/check' && req.method === 'POST') {

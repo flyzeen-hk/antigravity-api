@@ -11,7 +11,7 @@ const { Readable } = require('stream');
 process.env.AG_SIG_FILE = path.join(os.tmpdir(), `ag-test-sigs-${process.pid}.json`);
 process.on('exit', () => removeTree(process.env.AG_SIG_FILE));
 const { removeTree } = require('../lib/safe_files');
-const { GeminiWebBridge, WEB_MODELS } = require('../lib/web_bridge');
+const { GeminiWebBridge, WEB_MODELS, parseGetUserStatusModels } = require('../lib/web_bridge');
 
 // декодирование payload обратно в inner-массив: f.req=[null,str] -> inner=str
 function decodePayload(payloadStr) {
@@ -45,15 +45,22 @@ assert.strictEqual(bridge.isWebModelName('gemini-4'), true);
 
 // 2. Model catalog
 const models = bridge.getModelsList();
-assert.strictEqual(models.length, 6);
+assert.strictEqual(models.length, Object.keys(WEB_MODELS).length);
+assert.strictEqual(models.some(m => m.id === 'gemini-4-auto'), true);
+assert.strictEqual(models.some(m => m.id === 'gemini-4-hydrogen'), true);
+assert.strictEqual(models.some(m => m.id === 'gemini-4-neon'), true);
+assert.strictEqual(models.some(m => m.id === 'gemini-4-carbon'), true);
 assert.strictEqual(models.some(m => m.id === 'gemini-4-argon'), true);
 assert.strictEqual(models.some(m => m.id === 'gemini-4-argon-thinking'), true);
 assert.strictEqual(models.some(m => m.id === 'gemini-4-pro'), true);
 assert.strictEqual(models.find(m => m.id === 'gemini-4-argon').display_name, 'Gemini 4 Argon');
 assert.strictEqual(models.find(m => m.id === 'gemini-4-argon').displayName, 'Gemini 4 Argon');
-// все gemini-4* должны выбирать режим 8 (Argon) веб-протокола
-for (const m of models) {
-  assert.strictEqual(bridge.getModelMeta(m.id).modelId, 8, `${m.id} must use mode=8`);
+assert.strictEqual(bridge.getModelMeta('gemini-4-auto').modelId, 6);
+assert.strictEqual(bridge.getModelMeta('gemini-4-hydrogen').modelId, 1);
+assert.strictEqual(bridge.getModelMeta('gemini-4-neon').modelId, 3);
+assert.strictEqual(bridge.getModelMeta('gemini-4-carbon').modelId, 8);
+for (const leg of ['gemini-4-argon', 'gemini-4-argon-thinking', 'gemini-4', 'gemini-4-pro', 'gemini-4-flash', 'gemini-4-thinking']) {
+  assert.strictEqual(bridge.getModelMeta(leg).modelId, 8, `${leg} must use mode=8`);
 }
 assert.strictEqual(bridge.getModelMeta('gemini-4-argon-thinking').thinkMode, 0);
 
@@ -61,7 +68,7 @@ assert.strictEqual(bridge.getModelMeta('gemini-4-argon-thinking').thinkMode, 0);
 const s = bridge.summary();
 assert.strictEqual(s.enabled, true);
 assert.strictEqual(s.cookieSet, false);
-assert.strictEqual(s.models.length, 6);
+assert.strictEqual(s.models.length, Object.keys(WEB_MODELS).length);
 assert.strictEqual(s.generationAvailable, true);
 assert.match(s.bl, /^boq_[a-z0-9_-]+_\d{8}\.\d+_p\d+$/i);
 delete bridge.getLoadedCookie;
@@ -821,10 +828,70 @@ function dataDirCookieTests() {
   }
 }
 
+async function liveCatalogTests() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ag-web-catalog-'));
+  const cacheFile = path.join(dir, 'web_models.json');
+  try {
+    const b = new GeminiWebBridge({ enabled: true, cookie: 'SAPISID=test; __Secure-1PSID=p', catalogCacheFile: cacheFile });
+    // Escaped wrb.fr frame extraction (regression for upstream_model appearing blank on 4 Hydrogen responses)
+    const escapedFrame = '[[\\"wrb.fr\\",null,\\"[null,\\\\\\"cf41b0e0dd7d53e5\\\\\\",null,null,\\\\\\"4 Hydrogen\\\\\\",true]\\"]]';
+    const legacyEscaped = '[[\\"wrb.fr\\",null,\\"[null,\\\\"cf41b0e0dd7d53e5\\\\",null,null,\\\\"4 Hydrogen\\\\",true]\\"]]';
+    assert.strictEqual(b.extractUpstreamModel('["cf41b0e0dd7d53e5",null,null,"4 Hydrogen"]'), '4 Hydrogen');
+    assert.strictEqual(b.extractUpstreamModel('\\"cf41b0e0dd7d53e5\\",null,null,\\"4 Hydrogen\\"'), '4 Hydrogen');
+    assert.ok(escapedFrame.length > 0 && legacyEscaped.length > 0);
+
+    // Live GetUserStatus (otAQ7b) parser with current Google lineup + hypothetical future model "5 Oxygen"
+    const payload = new Array(25).fill(null);
+    payload[0] = 6;
+    payload[15] = [['cf41b0e0dd7d53e5', 'Авто', 'Адаптируется', [], 6]];
+    payload[24] = [
+      'neon_launch_signed_out_policy',
+      [
+        [['', 6, false, null, 'Авто', 'Адаптируется к вашим потребностям', null, false, null, null, false, null, 'Авто', [], null, 1], null, 1],
+        [['', 1, false, null, '4 Hydrogen', '4 Hydrogen', '4 Hydrogen', false, null, null, false, null, 'Повседневные дела', [], null, 2, 'Уровень рассуждений'], null, 1],
+        [['', 3, false, null, 'Neon', '4 Neon', null, true, 'Neon4p0', null, true, 'Neon4p0', 'Глубокий анализ', [], null, 2, 'Уровень рассуждений'], null, 1],
+        [['', 8, false, null, 'Carbon', '4 Carbon', null, false, null, null, false, null, 'Код и сложные задачи', [], null, 2, 'Уровень рассуждений'], null, 1],
+        [['', 9, false, 'ox-v1', 'Oxygen', '5 Oxygen', null, false, null, null, false, null, 'Future model', [], null, 2, 'Reasoning'], null, 1],
+      ],
+    ];
+    const rpcRaw = ")]}'\n\n" + JSON.stringify([['wrb.fr', 'otAQ7b', JSON.stringify(payload)]]);
+    const parsed = parseGetUserStatusModels(rpcRaw);
+    assert.strictEqual(parsed.ok, true);
+    assert.strictEqual(parsed.policy, 'neon_launch_signed_out_policy');
+    assert.ok(parsed.models.some((m) => m.id === 'gemini-4-auto' && m.modelId === 6 && m.name === 'Gemini 4 Auto (Авто)'));
+    assert.ok(parsed.models.some((m) => m.id === 'gemini-4-hydrogen' && m.modelId === 1));
+    assert.ok(parsed.models.some((m) => m.id === 'gemini-4-neon' && m.modelId === 3 && m.lockedByPlan === true && m.planTag === 'Neon4p0'));
+    assert.ok(parsed.models.some((m) => m.id === 'gemini-4-carbon' && m.modelId === 8));
+    assert.ok(parsed.models.some((m) => m.id === 'gemini-5-oxygen' && m.modelId === 9 && m.isNew === true));
+    assert.ok(parsed.models.some((m) => m.id === 'gemini-5-oxygen-thinking' && m.modelId === 9 && m.thinkMode === 0 && m.isNew === true));
+
+    b.ensureBlFresh = async () => {};
+    b.ensureSessionFresh = async () => false;
+    b.ensureXsrf = async () => 'xsrf_ok';
+    b._postBatchExecute = async () => ({ status: 200, text: rpcRaw, error: '' });
+    const ref = await b.refreshModels({ force: true, lang: 'ru' });
+    assert.strictEqual(ref.ok, true);
+    assert.strictEqual(b.isWebModelName('gemini-5-oxygen'), true);
+    assert.strictEqual(b.getModelMeta('gemini-5-oxygen').modeVariantId, 'ox-v1');
+    assert.ok(b.getLiveMeta().newIds.includes('gemini-5-oxygen'));
+    assert.strictEqual(fs.existsSync(cacheFile), true);
+
+    // Fresh bridge reloads discovered web_models.json cache even before live network
+    const bReloaded = new GeminiWebBridge({ enabled: true, catalogCacheFile: cacheFile });
+    assert.strictEqual(bReloaded.isWebModelName('gemini-5-oxygen'), true);
+    assert.strictEqual(bReloaded.isWebModelName('gemini-5-oxygen-thinking'), true);
+    assert.strictEqual(bReloaded.getModelMeta('gemini-5-oxygen').modelId, 9);
+    console.log('  ok  живое обновление web/* моделей (otAQ7b), новые модели, кэш web_models.json и extractUpstreamModel');
+  } finally {
+    try { removeTree(dir); } catch {}
+  }
+}
+
 runErrorRegressions().then(runRouteRegressions).then(async () => {
   await accountTests();
   languageTests();
   dataDirCookieTests();
+  await liveCatalogTests();
   console.log('ALL GEMINI 4 WEB BRIDGE UNIT TESTS PASSED!');
 }).catch(error => {
   console.error(error);

@@ -275,10 +275,25 @@
     }
     try {
       const headers = state.keys.apiKey ? { authorization: `Bearer ${state.keys.apiKey}` } : {};
-      const [modelsR, catR] = await Promise.allSettled([
-        api('GET', '/v1/models', undefined, headers),
-        api('GET', `/_models/catalog${force ? '?force=1' : ''}`),
-      ]);
+      let modelsR, catR;
+      if (force) {
+        // Refresh /_models/catalog first so both cloud and dynamic web/* lists update before /v1/models
+        const catRes = await api('GET', '/_models/catalog?force=1').then(
+          (value) => ({ status: 'fulfilled', value }),
+          (reason) => ({ status: 'rejected', reason })
+        );
+        const modRes = await api('GET', '/v1/models', undefined, headers).then(
+          (value) => ({ status: 'fulfilled', value }),
+          (reason) => ({ status: 'rejected', reason })
+        );
+        catR = catRes;
+        modelsR = modRes;
+      } else {
+        [modelsR, catR] = await Promise.allSettled([
+          api('GET', '/v1/models', undefined, headers),
+          api('GET', '/_models/catalog'),
+        ]);
+      }
       if (modelsR.status === 'fulfilled') {
         const res = modelsR.value;
         state.models = Array.isArray(res.data) ? res.data : [];
@@ -297,12 +312,14 @@
 
       if (force && state.catalogSnapshot) {
         const snap = state.catalogSnapshot;
-        const addedN = (snap.diff && snap.diff.added && snap.diff.added.length) || 0;
+        const webNewN = (snap.webCatalogMeta && Array.isArray(snap.webCatalogMeta.newIds) && snap.webCatalogMeta.newIds.length) || 0;
+        const addedN = ((snap.diff && snap.diff.added && snap.diff.added.length) || 0) + webNewN;
         const remN = (snap.diff && snap.diff.removed && snap.diff.removed.length) || 0;
         const lockedN = (snap.planLocked && snap.planLocked.length) || 0;
         const liveCloud = (snap.active && snap.active.length) || 0;
+        const liveWeb = (snap.web && snap.web.filter((m) => m && !m.legacyAlias).length) || (snap.web && snap.web.length) || 0;
         showToast(
-          t('toast.catalogUpdated', { cloud: liveCloud, added: addedN, removed: remN, locked: lockedN }),
+          t('toast.catalogUpdated', { cloud: liveCloud, web: liveWeb, added: addedN, removed: remN, locked: lockedN }),
           addedN > 0 ? 'ok' : 'info'
         );
       }
@@ -999,6 +1016,9 @@
       if (m.custom) capBadges.push(`<span class="badge badge-accent">${esc(t('models.badgeCustom'))}</span>`);
       if (m.disabled) capBadges.push(`<span class="badge badge-warn" title="${esc(m.tagDescription || '')}">🔒 ${esc(m.tagTitle || 'Plan')}</span>`);
       if (m.removedFromCatalog) capBadges.push(`<span class="badge badge-err">${esc(t('models.badgeRemoved'))}</span>`);
+      if (isWeb && m.legacyAlias) capBadges.push(`<span class="badge badge-neutral" title="${esc(t('models.legacyTip'))}">legacy</span>`);
+      else if (isWeb && m.inLiveCatalog) capBadges.push(`<span class="badge badge-ok" title="${esc(t('models.liveTip'))}">live</span>`);
+      if (isWeb && m.planTag) capBadges.push(`<span class="badge badge-warn" title="${esc(t('models.planTagTip'))}">🔒 ${esc(m.planTag)}</span>`);
       if (!m.disabled) {
         if (caps.tools === 'emulated') capBadges.push('<span class="badge badge-warn">tools: emulated</span>');
         else if (caps.tools) capBadges.push('<span class="badge badge-ok">tools</span>');
@@ -1015,7 +1035,7 @@
             </div>
             <div class="model-id">${esc(m.id)}</div>
             <div class="muted">${esc(m.displayName || m.display_name || m.id)}</div>
-            ${m.disabled && m.tagDescription ? `<div class="hint">${esc(m.tagDescription)}</div>` : ''}
+            ${m.disabled && m.tagDescription ? `<div class="hint">${esc(m.tagDescription)}</div>` : (isWeb && m.description ? `<div class="hint">${esc(m.description)}</div>` : '')}
             ${healthHtml ? `<div class="badge-row">${healthHtml}</div>` : ''}
             <div class="muted mono-num">
               ${m.context_length ? `${esc(t('models.context'))}: ${esc(fmtCompact(m.context_length))}` : ''}
@@ -1815,7 +1835,15 @@
 
     $('btn-refresh-all').addEventListener('click', () => loadAllData().then(() => showToast('Refreshed', 'ok')));
     $('btn-refresh-limits').addEventListener('click', () => refreshLimits({ force: true }));
-    $('btn-refresh-models').addEventListener('click', () => Promise.all([refreshModels({ force: true }), refreshLimits({ force: true })]));
+    $('btn-refresh-models').addEventListener('click', async () => {
+      const btn = $('btn-refresh-models');
+      btn.disabled = true;
+      try {
+        await Promise.all([refreshModels({ force: true }), refreshLimits({ force: true })]);
+      } finally {
+        btn.disabled = false;
+      }
+    });
     $('btn-check-all-models').addEventListener('click', checkAllModels);
     $('btn-toggle-add-model').addEventListener('click', () => {
       const bar = $('add-custom-model-bar');
@@ -2092,6 +2120,8 @@
     });
 
     $('btn-web-open-browser').addEventListener('click', async () => {
+      const btn = $('btn-web-open-browser');
+      btn.disabled = true;
       try {
         const proxy = $('web-proxy-input').value.trim();
         const res = await api('POST', '/_web/browser/open', { proxy });
@@ -2102,10 +2132,14 @@
         }), 'ok');
       } catch (e) {
         showToast(e.message, 'err');
+      } finally {
+        btn.disabled = false;
       }
     });
 
     $('btn-web-import-cdp').addEventListener('click', async () => {
+      const btn = $('btn-web-import-cdp');
+      btn.disabled = true;
       try {
         const proxy = $('web-proxy-input').value.trim();
         const res = await api('POST', '/_web/browser/import-cookies', { saveTo: 'single', proxy });
@@ -2115,13 +2149,15 @@
         renderOverviewKpis();
       } catch (e) {
         showToast(e.message, 'err');
+      } finally {
+        btn.disabled = false;
       }
     });
 
     $('btn-web-save').addEventListener('click', async () => {
       const manualProxyVal = $('web-proxy-input').value.trim();
       if (/^(?:tg:\/\/proxy|https?:\/\/t\.me\/proxy)\b/i.test(manualProxyVal)) {
-        showToast('MTProto-прокси (tg://proxy) подходят только для Telegram. Включите «Бесплатный авто-прокси для Gemini» выше или укажите SOCKS5.', 'err');
+        showToast(t('toast.mtprotoUnsupported'), 'err');
         return;
       }
       const geminiWeb = {
@@ -2206,6 +2242,8 @@
     $('btn-acc-import-cdp').addEventListener('click', async () => {
       const accountName = $('acc-name-input').value.trim();
       if (!accountName) { showToast('Enter Account Name first', 'warn'); return; }
+      const btn = $('btn-acc-import-cdp');
+      btn.disabled = true;
       try {
         const proxy = $('acc-proxy-input').value.trim() || $('web-proxy-input').value.trim();
         const res = await api('POST', '/_web/browser/import-cookies', { saveTo: 'account', accountName, proxy });
@@ -2215,6 +2253,8 @@
         renderWebSection();
       } catch (e) {
         showToast(e.message, 'err');
+      } finally {
+        btn.disabled = false;
       }
     });
 

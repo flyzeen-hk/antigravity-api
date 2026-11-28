@@ -1031,7 +1031,11 @@ async function main() {
 
       const chkScopeWeb = await ADM('/_models/check', 'POST', { scope: 'web' });
       assert.strictEqual(chkScopeWeb.status, 200, chkScopeWeb.text);
-      assert.strictEqual(JSON.parse(chkScopeWeb.text).results['web/gemini-4']?.status, 'working');
+      const scopeRes = JSON.parse(chkScopeWeb.text).results;
+      assert.strictEqual(scopeRes['web/gemini-4']?.status, 'working');
+      assert.strictEqual(scopeRes['web/gemini-4-hydrogen']?.status, 'working');
+      assert.strictEqual(scopeRes['web/gemini-4-neon']?.status, 'working');
+      assert.strictEqual(scopeRes['web/gemini-4-auto']?.status, 'working');
 
       await ADM('/_config', 'POST', { geminiWeb: { cookie: '', cookie_file: '' } });
     } finally {

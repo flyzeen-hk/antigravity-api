@@ -276,10 +276,10 @@ function setAutostart(enabled, { rootDir = ROOT_DIR, dataDir = resolveDataDir({ 
  * Updates existing Desktop / Start Menu / Autostart shortcuts owned by `rootDir`
  * to match the selected theme icon (`#7` light or `#8` dark) without blocking HTTP replies.
  */
-function syncShortcutTheme({ rootDir = ROOT_DIR, dataDir = process.env.AG_DATA_DIR || rootDir, theme } = {}) {
+function syncShortcutTheme({ rootDir = ROOT_DIR, dataDir = resolveDataDir({ rootDir }), theme } = {}) {
   rootDir = path.resolve(rootDir);
   if (process.env.AG_NO_SHORTCUT_SYNC === '1') return { skipped: true };
-  if (dataDir && path.resolve(dataDir) !== rootDir) return { skipped: true };
+  if (String(process.env.AG_DATA_DIR || '').trim()) return { skipped: true };
 
   const effectiveTheme = normalizeIconTheme(theme, { dataDir });
   const { ico: icoPath, png512 } = getThemeAssetPaths(rootDir, effectiveTheme);
