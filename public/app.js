@@ -1150,8 +1150,11 @@
     const badge = $('free-tunnel-badge');
     const desc = $('free-tunnel-desc');
     const rotBtn = $('btn-free-tunnel-rotate');
+    const scanBtn = $('btn-free-tunnel-scan');
     const progWrap = $('free-tunnel-progress-wrap');
     const progFill = $('free-tunnel-progress-fill');
+    const nodesRow = $('free-tunnel-nodes-row');
+    const nodeSel = $('free-tunnel-node-select');
     const customInp = $('free-tunnel-custom-input');
     if (!box || !toggle || !badge) return;
 
@@ -1167,6 +1170,34 @@
     box.classList.toggle('is-running', !!ft.running);
     rotBtn.classList.toggle('hidden', !ft.running && !ft.enabled);
     rotBtn.disabled = busy;
+    if (scanBtn) {
+      scanBtn.classList.toggle('hidden', !ft.running && !ft.enabled);
+      scanBtn.disabled = busy;
+    }
+
+    if (nodesRow && nodeSel) {
+      const list = Array.isArray(ft.availableNodes) ? ft.availableNodes : [];
+      const showList = list.length > 0 && (ft.running || ft.enabled);
+      nodesRow.classList.toggle('hidden', !showList);
+      nodeSel.disabled = busy;
+      if (showList) {
+        const sig = list.map((n) => `${n.key}:${n.latencyMs || ''}:${n.active ? 1 : 0}`).join('|');
+        if (nodeSel.dataset.sig !== sig) {
+          nodeSel.dataset.sig = sig;
+          nodeSel.textContent = '';
+          for (const n of list) {
+            const opt = document.createElement('option');
+            opt.value = n.key;
+            const msPart = n.latencyMs ? ` · ${n.latencyMs} ${getLang() === 'en' ? 'ms' : 'мс'}` : '';
+            const kind = n.security === 'reality' ? 'Reality' : (n.proto === 'hy2' ? 'Hysteria2' : `${n.proto || 'vless'}/${n.transport || 'tls'}`);
+            opt.textContent = `${n.label} · ${kind}${msPart}`;
+            if (n.active || n.key === ft.nodeKey) opt.selected = true;
+            nodeSel.appendChild(opt);
+          }
+        }
+        if (ft.nodeKey) nodeSel.value = ft.nodeKey;
+      }
+    }
 
     if (busy) {
       progWrap.classList.remove('hidden');
@@ -1941,6 +1972,43 @@
       });
     }
 
+    if ($('btn-free-tunnel-scan')) {
+      $('btn-free-tunnel-scan').addEventListener('click', async () => {
+        const customSource = ($('free-tunnel-custom-input') && $('free-tunnel-custom-input').value.trim()) || '';
+        try {
+          state.freeTunnel = await api('POST', '/_web/free-tunnel', {
+            action: 'scan',
+            customSource,
+            async: true,
+          });
+          renderFreeTunnel();
+          ensureFreeTunnelPolling(true);
+        } catch (err) {
+          showToast(err.message, 'err');
+        }
+      });
+    }
+
+    if ($('free-tunnel-node-select')) {
+      $('free-tunnel-node-select').addEventListener('change', async (e) => {
+        const nodeKey = String(e.target.value || '').trim();
+        if (!nodeKey) return;
+        const customSource = ($('free-tunnel-custom-input') && $('free-tunnel-custom-input').value.trim()) || '';
+        try {
+          state.freeTunnel = await api('POST', '/_web/free-tunnel', {
+            action: 'select',
+            nodeKey,
+            customSource,
+            async: true,
+          });
+          renderFreeTunnel();
+          ensureFreeTunnelPolling(true);
+        } catch (err) {
+          showToast(err.message, 'err');
+        }
+      });
+    }
+
     if ($('btn-free-tunnel-apply-custom')) {
       $('btn-free-tunnel-apply-custom').addEventListener('click', async () => {
         const customSource = $('free-tunnel-custom-input').value.trim();
@@ -1948,7 +2016,7 @@
         try {
           if (isEnabled) {
             state.freeTunnel = await api('POST', '/_web/free-tunnel', {
-              action: 'rotate',
+              action: 'scan',
               customSource,
               async: true,
             });

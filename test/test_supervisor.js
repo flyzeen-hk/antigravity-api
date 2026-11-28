@@ -16,6 +16,9 @@ const {
   convertTelegramSocksLink,
   extractProxyLinesFromText,
   extractVlessLinesFromText,
+  computeNodeRankMs,
+  isDistantOrAnycastNode,
+  NEARBY_COUNTRY_REMARK_RE,
 } = require('../lib/free_tunnel');
 const configLib = require('../lib/config');
 
@@ -113,8 +116,20 @@ async function main() {
     && trojanFragOut.streamSettings.sockopt?.dialerProxy === 'frag'
     && !realityOut.streamSettings.sockopt
     && !hy2Out.streamSettings.sockopt
-    && fragOut.settings?.fragment?.packets === 'tlshello',
-    'buildXrayOutbound attaches tlshello fragment dialerProxy only to TLS TCP/WS/gRPC transports'
+    && fragOut.settings?.fragment?.packets === 'tlshello'
+    && fragOut.settings?.fragment?.interval === '3-5',
+    'buildXrayOutbound attaches fast 3-5ms tlshello fragment dialerProxy only to TLS TCP/WS/gRPC transports'
+  );
+  ok(
+    NEARBY_COUNTRY_REMARK_RE.test('05 польша #2')
+    && NEARBY_COUNTRY_REMARK_RE.test('🇩🇪 Germany')
+    && NEARBY_COUNTRY_REMARK_RE.test('🇰🇿 Kazakhstan')
+    && NEARBY_COUNTRY_REMARK_RE.test('🇸🇬 Singapore')
+    && isDistantOrAnycastNode({ label: '🇨🇦 Canada, Toronto | [BL]' }) === true
+    && isDistantOrAnycastNode({ label: '🇵🇱 Poland #2' }) === false
+    && computeNodeRankMs({ security: 'reality', proto: 'vless', label: '🇵🇱 Poland #2' }, 750)
+       < computeNodeRankMs({ security: 'tls', proto: 'vless', label: '🇨🇦 Canada, Toronto' }, 600),
+    'node ranking prefers fast direct EU/CIS/Asia Reality servers ahead of distant/fragmented tunnels'
   );
 
   // Verify Windows LocalAppData default resolution & read-only legacy state migration
@@ -214,7 +229,18 @@ async function main() {
       ok(r.status === 200, `offline ${p} returns 200 while gateway stopped`);
     }
     const ftOff = await request(`${base}/_web/free-tunnel/status`, { headers });
-    ok(ftOff.json?.enabled === false && ftOff.json?.running === false, '/_web/free-tunnel/status is disabled and stopped by default');
+    ok(
+      ftOff.json?.enabled === false
+      && ftOff.json?.running === false
+      && Array.isArray(ftOff.json?.availableNodes),
+      '/_web/free-tunnel/status is disabled by default and exposes availableNodes array'
+    );
+    const ftBadSelect = await request(`${base}/_web/free-tunnel`, {
+      method: 'POST',
+      headers,
+      body: { action: 'select', nodeKey: '' },
+    });
+    ok(ftBadSelect.status === 400, 'POST /_web/free-tunnel select without nodeKey returns 400');
     const statusOff = await request(`${base}/_status`, { headers });
     ok(
       statusOff.json?.supervised === true

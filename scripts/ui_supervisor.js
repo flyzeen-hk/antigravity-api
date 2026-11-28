@@ -766,7 +766,7 @@ async function startSupervisor({ autoStart = null } = {}) {
 
     if (pathname === '/_web/free-tunnel/status' && req.method === 'GET') {
       const ftCfg = (cfg.geminiWeb && cfg.geminiWeb.freeTunnel) || { enabled: false, customSource: '' };
-      const st = await freeTunnel.getStatus();
+      const st = await freeTunnel.getStatus(ftCfg.customSource || '');
       return sendJson(res, 200, {
         ok: true,
         enabled: ftCfg.enabled === true,
@@ -788,16 +788,25 @@ async function startSupervisor({ autoStart = null } = {}) {
         const st = await freeTunnel.stop();
         return sendJson(res, 200, { ok: true, enabled: false, customSource, ...st });
       }
-      if (action !== 'start' && action !== 'rotate') {
-        return sendJson(res, 400, { error: { message: 'Unknown action' } });
+      if (!['start', 'rotate', 'scan', 'select'].includes(action)) {
+        return sendJson(res, 400, { error: { message: 'Unknown action (use start, stop, rotate, scan, or select)' } });
+      }
+      const selectKey = action === 'select' ? String(body.nodeKey || '').trim() : '';
+      if (action === 'select' && !selectKey) {
+        return sendJson(res, 400, { error: { message: 'nodeKey is required for select action' } });
       }
 
       const patch = configLib.patchConfig(cfg, { geminiWeb: { freeTunnel: { enabled: true, customSource } } });
       saveConfigDirect(patch.config);
-      const runPromise = freeTunnel.start({ customSource, rotate: action === 'rotate' });
+      const runPromise = freeTunnel.start({
+        customSource,
+        rotate: action === 'rotate',
+        forceScan: action === 'scan',
+        selectKey,
+      });
       if (body.async === true) {
         runPromise.catch(() => {});
-        const st = await freeTunnel.getStatus();
+        const st = await freeTunnel.getStatus(customSource);
         return sendJson(res, 200, { ok: true, enabled: true, customSource, ...st });
       }
       try {

@@ -2723,7 +2723,7 @@ function start(config) {
       if (p === '/_web/free-tunnel/status' && req.method === 'GET') {
         if (!requireAdmin()) return;
         const ftCfg = (config.geminiWeb && config.geminiWeb.freeTunnel) || { enabled: false, customSource: '' };
-        const st = await freeTunnel.getStatus();
+        const st = await freeTunnel.getStatus(ftCfg.customSource || '');
         return sendJson(res, 200, {
           ok: true,
           enabled: ftCfg.enabled === true,
@@ -2750,20 +2750,28 @@ function start(config) {
           return sendJson(res, 200, { ok: true, enabled: false, customSource, ...st });
         }
 
-        if (action !== 'start' && action !== 'rotate') {
-          return sendJson(res, 400, { error: { message: 'Unknown action (use start, stop, or rotate)' } });
+        if (!['start', 'rotate', 'scan', 'select'].includes(action)) {
+          return sendJson(res, 400, { error: { message: 'Unknown action (use start, stop, rotate, scan, or select)' } });
+        }
+        const selectKey = action === 'select' ? String(body.nodeKey || '').trim() : '';
+        if (action === 'select' && !selectKey) {
+          return sendJson(res, 400, { error: { message: 'nodeKey is required for select action' } });
         }
 
         const patch = configLib.patchConfig(config, { geminiWeb: { freeTunnel: { enabled: true, customSource } } });
         Object.assign(config, patch.config);
         saveConfigFile();
 
-        const runPromise = freeTunnel.start({ customSource, rotate: action === 'rotate' })
-          .then((st) => { syncRuntimeTunnelToBridge(); return st; });
+        const runPromise = freeTunnel.start({
+          customSource,
+          rotate: action === 'rotate',
+          forceScan: action === 'scan',
+          selectKey,
+        }).then((st) => { syncRuntimeTunnelToBridge(); return st; });
 
         if (body.async === true) {
           runPromise.catch(() => {});
-          const st = await freeTunnel.getStatus();
+          const st = await freeTunnel.getStatus(customSource);
           return sendJson(res, 200, { ok: true, enabled: true, customSource, ...st });
         }
 

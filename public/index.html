@@ -395,7 +395,8 @@
                       <p id="free-tunnel-desc" class="hint mt-xs" data-i18n="web.freeTunnelDesc">Включается только по вашему желанию: автоматически подбирает бесплатный зарубежный узел VLESS Reality (через локальный Xray-core) для разблокировки сайта Gemini и моделей web/* без системного VPN.</p>
                     </div>
                     <div class="btn-group">
-                      <button id="btn-free-tunnel-rotate" type="button" class="btn btn-secondary btn-xs hidden" data-i18n="web.freeTunnelRotate">Сменить узел</button>
+                      <button id="btn-free-tunnel-rotate" type="button" class="btn btn-secondary btn-xs hidden" data-i18n="web.freeTunnelRotate">Следующий</button>
+                      <button id="btn-free-tunnel-scan" type="button" class="btn btn-ghost btn-xs hidden" data-i18n="web.freeTunnelRescan">Найти ещё</button>
                       <label class="switch" title="Free Auto-Proxy">
                         <input id="free-tunnel-toggle" type="checkbox">
                         <span class="slider"></span>
@@ -404,6 +405,10 @@
                   </div>
                   <div id="free-tunnel-progress-wrap" class="ft-progress-wrap hidden">
                     <div class="ft-progress-bar"><div id="free-tunnel-progress-fill" class="ft-progress-fill" style="width: 0%"></div></div>
+                  </div>
+                  <div id="free-tunnel-nodes-row" class="ft-nodes-row hidden">
+                    <span class="ft-nodes-label" data-i18n="web.ftSelectNode">Выбор страны / узла:</span>
+                    <select id="free-tunnel-node-select" class="ft-node-select"></select>
                   </div>
                   <details class="adv-details ft-custom-details">
                     <summary data-i18n="web.freeTunnelCustomSummary">Свой бесплатный ключ vless:// или ссылка подписки (необязательно)</summary>
