@@ -1,8 +1,16 @@
-# Antigravity API
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/antigravity_icon_dark_512.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/antigravity_icon_light_512.png">
+    <img alt="Antigravity API" src="assets/antigravity_icon_dark_512.png" width="180">
+  </picture>
+</p>
 
-Expose Google Antigravity's models — Gemini, Claude, GPT-OSS — as a local **OpenAI-compatible** and **Gemini-native** HTTP API, with a desktop panel, live quota meters and server-side file tools for clients that cannot run tool calls.
+<h1 align="center">Antigravity API</h1>
 
-![Antigravity API](assets/antigravity_logo.png)
+<p align="center">
+  Expose Google Antigravity's models — Gemini, Claude, GPT-OSS — as a local <strong>OpenAI-</strong>, <strong>Anthropic-</strong>, and <strong>Gemini-compatible</strong> HTTP API, with an offline Web Control Panel, live quota meters, and server-side agent file tools (pure Node.js).
+</p>
 
 ---
 
@@ -500,7 +508,7 @@ node test/test_supervisor.js        # UI supervisor lifecycle, theme icons & sec
 
 # Русская версия
 
-Шлюз, который открывает модели **Google Antigravity** — Gemini, Claude, GPT-OSS — как обычный **OpenAI-совместимый** и **Gemini-native** HTTP API, с панелью на рабочем столе, живыми квотами и файловыми инструментами на стороне сервера.
+Шлюз на чистом Node.js, который открывает модели **Google Antigravity** — Gemini, Claude, GPT-OSS — как локальный **OpenAI-**, **Anthropic-** и **Gemini-совместимый** HTTP API, с оффлайн веб-панелью управления, живыми квотами и файловыми инструментами на стороне сервера.
 
 ## Что это и что это не
 
